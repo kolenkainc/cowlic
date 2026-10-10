@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Read-only check that this machine can run the local ingest. No network, installs nothing,
+# never prints or reads values of .env (only whether each required KEY NAME is defined there).
+# One line per check: "ok" or "MISSING" with a fix hint. Exit 1 if anything is missing.
+#
+# Install hints (Debian/Ubuntu | macOS with Homebrew):
+#   ffmpeg   sudo apt install ffmpeg                    | brew install ffmpeg
+#   deno     >= 2.3.0, yt-dlp's JavaScript runtime. The old workflow pinned 2.9.5:
+#            https://github.com/denoland/deno/releases (verify the checksum) | brew install deno
+#   python   sudo apt install python3 python3-venv      | brew install python@3.12   (3.10+)
+#   venv     python3 -m venv ingest/.venv && ingest/.venv/bin/pip install -r ingest/requirements.txt
+#   flock    sudo apt install util-linux                | brew install flock (not part of macOS)
+#   bash     >= 4: already true on Debian/Ubuntu         | brew install bash (macOS ships 3.2)
+#   .env     copy the template from the repo docs and fill it in (see the runbook); this script
+#            only checks the key names, never the values.
+# Test: scripts/test-check-local-prereqs.sh
+set -u
+
+ROOT="${CHECK_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+ENV_FILE="$ROOT/.env"
+VENV_PY="$ROOT/ingest/.venv/bin/python"
+MIN_DENO="2.3.0"
+# Keep in sync with REQUIRED_ENV in ingest/ingest.py.
+REQUIRED_ENV=(TG_BOT_TOKEN TG_CHANNEL_ID SPOTIFY_CLIENT_ID SPOTIFY_CLIENT_SECRET
+              CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID D1_DATABASE_ID)
+
+fail=0
+ok() { printf 'ok       %s\n' "$1"; }
+missing() { printf 'MISSING  %s: %s\n' "$1" "$2"; fail=1; }
+
+# version_ge A B: true when dotted version A >= B (numeric per component, so 2.10.0 > 2.3.0).
+version_ge() {
+  local IFS=. i
+  local -a a=($1) b=($2)
+  for i in 0 1 2; do
+    local x=$((10#${a[i]:-0})) y=$((10#${b[i]:-0}))
+    ((x > y)) && return 0
+    ((x < y)) && return 1
+  done
+  return 0
+}
+
+if command -v ffmpeg >/dev/null 2>&1; then ok "ffmpeg"
+else missing "ffmpeg" "not on PATH. Debian/Ubuntu: sudo apt install ffmpeg; macOS: brew install ffmpeg"; fi
+
+if ! command -v deno >/dev/null 2>&1; then
+  missing "deno" "not on PATH, need >= $MIN_DENO. macOS: brew install deno; Linux: release from https://github.com/denoland/deno/releases"
+else
+  dv="$(deno --version 2>/dev/null | head -n 1)"
+  if [[ "$dv" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+    if version_ge "${BASH_REMATCH[1]}" "$MIN_DENO"; then ok "deno ${BASH_REMATCH[1]} (>= $MIN_DENO)"
+    else missing "deno" "version ${BASH_REMATCH[1]} is older than $MIN_DENO. Upgrade: deno upgrade, or brew upgrade deno"; fi
+  else
+    missing "deno" "cannot parse 'deno --version' output; need >= $MIN_DENO"
+  fi
+fi
+
+if [ -x "$VENV_PY" ]; then
+  ok "ingest/.venv"
+  if "$VENV_PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then ok "python >= 3.10 (venv)"
+  else missing "python" "venv python is older than 3.10. Recreate: rm -rf ingest/.venv; python3 -m venv ingest/.venv (with a newer python3)"; fi
+  for mod in spotdl ytmusicapi; do
+    if "$VENV_PY" -c "import $mod" >/dev/null 2>&1; then ok "python module $mod"
+    else missing "python module $mod" "not importable in ingest/.venv. Run: ingest/.venv/bin/pip install -r ingest/requirements.txt"; fi
+  done
+else
+  missing "ingest/.venv" "not found. Run: python3 -m venv ingest/.venv && ingest/.venv/bin/pip install -r ingest/requirements.txt (Debian/Ubuntu: sudo apt install python3-venv first)"
+  if command -v python3 >/dev/null 2>&1; then
+    if python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then ok "python3 >= 3.10"
+    else missing "python3" "older than 3.10. Debian/Ubuntu: sudo apt install python3; macOS: brew install python@3.12"; fi
+  else
+    missing "python3" "not on PATH. Debian/Ubuntu: sudo apt install python3 python3-venv; macOS: brew install python@3.12"
+  fi
+fi
+
+if command -v flock >/dev/null 2>&1; then ok "flock"
+else missing "flock" "not on PATH. Debian/Ubuntu: sudo apt install util-linux; macOS: brew install flock"; fi
+
+if ((BASH_VERSINFO[0] >= 4)); then ok "bash ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]} (>= 4)"
+else missing "bash" "version ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]} is older than 4. macOS: brew install bash and use it for the wrapper"; fi
+
+if [ -f "$ENV_FILE" ] && [ -r "$ENV_FILE" ]; then
+  absent=()
+  for k in "${REQUIRED_ENV[@]}"; do
+    grep -Eq "^(export[[:space:]]+)?$k=" "$ENV_FILE" >/dev/null 2>&1 || absent+=("$k")
+  done
+  if ((${#absent[@]} == 0)); then ok ".env has all required keys"
+  else missing ".env" "no definition for: ${absent[*]} (names only checked; fill them in, see the runbook)"; fi
+else
+  missing ".env" "not found or unreadable at the repo root. Create it with the required keys: ${REQUIRED_ENV[*]}"
+fi
+
+if ((fail)); then echo "Some prerequisites are missing; nothing was installed."; exit 1; fi
+echo "All prerequisites present."
