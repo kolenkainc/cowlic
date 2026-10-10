@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <rect width="512" height="512" fill="#4A2377"/>
+  <!-- one bold curl: rises from the bottom, sweeps right, curls back over itself -->
+  <path transform="translate(18 -14)" d="M200 420 C270 380 330 330 330 250 C330 170 270 110 200 130 C135 150 130 235 190 250 C235 260 262 232 248 205"
+        fill="none" stroke="#3DAA57" stroke-width="46" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
