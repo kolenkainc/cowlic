@@ -96,7 +96,7 @@ Worker только передаёт поток и не буферизует е�
 | 5 | Лимиты бесплатных тарифов: Worker ~100k запросов/день, D1 ~5M чтений строк/день | Для одного пользователя с большим запасом | Мониторить. Кеш Symfonium снижает нагрузку |
 | 6 | Юридическое и ToS: получение аудио с YouTube через spotdl, хранение в Telegram | Нарушение условий сервисов, риск бана бота/аккаунта | Только личное использование, приватный канал, без публичного доступа. Решение принимает владелец проекта |
 | 7 | Безопасность: бот-токен и пароль Subsonic | Утечка = доступ к библиотеке | Секреты только в локальном `.env` и Worker secrets, не логировать, не отдавать клиенту |
-| 8 | Одно измерение здоровья: тихие поломки ночного job | Библиотека перестаёт обновляться | Статус job + уведомление в Telegram о падении |
+| 8 | Одно измерение здоровья: тихие поломки ночного запуска | Библиотека перестаёт обновляться | Planned (not yet implemented; #30, #31 and #66 are open): ingest will run locally on a schedule (systemd timer, #30), not as a CI job. Each run will send the owner a Telegram message: summary on success, alert on failure, including a YouTube sign-in failure, which will be reported and not retried or bypassed (#31, #66). The run log will stay on the owner's machine |
 
 ## 4. Конфигурация и секреты
 
