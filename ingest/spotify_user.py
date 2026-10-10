@@ -16,6 +16,7 @@ Spotify docs relied on (read 2026-10-10):
 """
 import base64
 import hashlib
+import http.client
 import hmac
 import json
 import os
@@ -207,7 +208,7 @@ def default_post(url: str, form: dict, timeout: float) -> tuple[int, dict]:
             status, raw = r.status, r.read()
     except urllib.error.HTTPError as e:
         status, raw = e.code, e.read()
-    except (urllib.error.URLError, OSError) as e:  # includes timeouts; the class name only, no request details
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as e:  # includes timeouts; the class name only, no request details
         raise UserAuthError(f"network error talking to Spotify ({type(e).__name__})") from None
     try:
         body = json.loads(raw)
@@ -338,7 +339,7 @@ def default_get(url: str, headers: dict, timeout: float) -> tuple[int, dict, dic
             status, raw, hdrs = r.status, r.read(), r.headers
     except urllib.error.HTTPError as e:
         status, raw, hdrs = e.code, e.read(), e.headers
-    except (urllib.error.URLError, OSError) as e:  # includes timeouts; the class name only, no request details
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as e:  # includes timeouts; the class name only, no request details
         raise UserAuthError(f"network error talking to Spotify ({type(e).__name__})") from None
     try:
         body = json.loads(raw)

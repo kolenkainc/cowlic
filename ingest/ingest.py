@@ -5,6 +5,9 @@ Usage: python ingest/ingest.py (PLAYLIST_URL | --sources sources.yml) [--dry-run
                                [--retry-no-match-days D] [--retry-failed-days D]
                                [--pace-seconds S] [--pace-jitter-seconds J] [--retry-attempts N]
 One playlist failing does not stop the others; the exit code is 1 if any playlist or track failed.
+sources.yml may also have a `followed_artists:` section (#121): the tracks of every artist the owner follows on
+Spotify are ingested too, no playlist is created. Needs SPOTIFY_USER_REFRESH_TOKEN (python ingest/spotify_user.py
+login); without a usable login the run ends with exit code 2 before doing any work.
 Limits (off unless given) and the local state file (cooldown for no_match/failed tracks): docs/local-ingest.md.
 
 Env (or ./.env): TG_BOT_TOKEN, TG_CHANNEL_ID, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET,
@@ -28,7 +31,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -65,6 +68,7 @@ class YouTubeSignInRequired(IngestError):
 
 # Distinct process exit code and failure class for this outcome (1 = other failures, 2 = bad usage).
 EXIT_YOUTUBE_SIGN_IN = 3
+EXIT_CONFIG = 2  # the followed_artists source cannot run: no or invalid Spotify user login (#121); nothing ran
 FAILURE_YOUTUBE_SIGN_IN = "youtube-sign-in"
 # Owner decision (#62): the bot check is only DETECTED and reported. No cookies, proxies, PO-token tricks or client
 # rotation are added or planned; the owner waits and re-runs later.
@@ -219,24 +223,131 @@ def validate_playlist_url(url: str) -> str:
     return url
 
 
-def parse_sources(text: str) -> list[str]:
-    """Strict parser for sources.yml: a flat list, one `- <url>` per line; blank lines and whole-line `#` comments
-    are ignored, anything else is an error (no silent skip). Every URL passes validate_playlist_url."""
-    urls = []
+@dataclass(frozen=True)
+class FollowedConfig:
+    """The `followed_artists:` section of sources.yml (see docs/local-ingest.md). Defaults apply to absent keys."""
+    enabled: bool = True
+    max_artists: int | None = None      # artists started per run; None = no limit
+    rescan_days: int = 7                # a fully scanned artist is looked at again after this many days (0 = every run)
+    groups: tuple[str, ...] = ("album", "single")
+    market: str = "US"
+    exclude: tuple[str, ...] = ()       # artist ids that are never ingested
+
+
+@dataclass(frozen=True)
+class SourceConfig:
+    urls: list[str]
+    followed: FollowedConfig | None     # None: no section (a plain playlist file)
+
+
+FOLLOWED_HEADER = "followed_artists:"
+FOLLOWED_KEY = re.compile(r"  ([a-z_]+):(?: (\S.*))?")  # exactly two spaces of indent
+FOLLOWED_ITEM = re.compile(r"    - (\S+)")              # exactly four spaces, under `exclude:`
+FOLLOWED_KEYS = ("enabled", "max_artists", "rescan_days", "groups", "market", "exclude")
+ARTIST_ID = re.compile(r"[A-Za-z0-9]{22}")
+FOLLOWED_GROUPS = ("album", "single", "compilation", "appears_on")  # ingest/artist_tracks.py ALL_GROUPS (tested)
+INT_VALUE = re.compile(r"[0-9]{1,5}")
+
+
+def _followed_value(key: str, value: str):
+    """Typed value of one `key: value` line of the followed_artists section; rejects, never rewrites."""
+    if key == "enabled":
+        if value not in ("true", "false"):
+            raise ValueError("enabled must be true or false")
+        return value == "true"
+    if key in ("max_artists", "rescan_days"):
+        low, high = (1, 10000) if key == "max_artists" else (0, 3650)
+        if not INT_VALUE.fullmatch(value) or not low <= int(value) <= high:
+            raise ValueError(f"{key} must be a whole number from {low} to {high}")
+        return int(value)
+    if key == "groups":
+        items = value.split(",")
+        if any(g not in FOLLOWED_GROUPS for g in items) or len(set(items)) != len(items):
+            raise ValueError(f"groups must be a comma-separated list without repeats from {','.join(FOLLOWED_GROUPS)}")
+        return tuple(items)
+    if not re.fullmatch(r"[A-Z]{2}", value):  # market
+        raise ValueError("market must be an upper-case ISO 3166-1 alpha-2 code such as US")
+    return value
+
+
+def parse_source_config(text: str) -> SourceConfig:
+    """Strict parser for sources.yml. Playlist part: a flat list, one `- <url>` per line (a leading indent is
+    tolerated outside the section); blank lines and whole-line `#` comments are ignored, anything else is an error
+    (no silent skip). Every URL passes validate_playlist_url. Optional section, at most once, header at column 0:
+
+        followed_artists:
+          enabled: true          (two-space indent; keys: enabled max_artists rescan_days groups market exclude)
+          max_artists: 20
+          exclude:
+            - <22-char artist id>    (four-space indent)
+
+    The section ends at the next line without indent. Unknown or repeated keys, a malformed value, a repeated
+    excluded id and anything else is an error. A file without the section behaves exactly as before."""
+    urls: list[str] = []
+    fields: dict = {}
+    exclude: list[str] = []
+    seen_section = in_section = in_exclude = False
     for no, raw in enumerate(text.splitlines(), 1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
+        line = raw.rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
             continue
-        m = SOURCES_ITEM.fullmatch(line)
+        if in_section and line[0] in " \t":
+            where = f"sources line {no} (followed_artists)"
+            if m := FOLLOWED_ITEM.fullmatch(line):
+                if not in_exclude:
+                    raise IngestError(f"{where}: a list item is only allowed under 'exclude:'")
+                if not ARTIST_ID.fullmatch(m[1]):
+                    raise IngestError(f"{where}: not a Spotify artist id (22 letters/digits): {m[1][:40]!r}")
+                if m[1] in exclude:
+                    raise IngestError(f"{where}: artist id listed twice")
+                exclude.append(m[1])
+                continue
+            m = FOLLOWED_KEY.fullmatch(line)
+            if not m:
+                raise IngestError(f"{where}: expected '  <key>: <value>' (two spaces) or '    - <artist id>'")
+            key, value = m[1], m[2]
+            if key not in FOLLOWED_KEYS:
+                raise IngestError(f"{where}: unknown key {key!r} (allowed: {', '.join(FOLLOWED_KEYS)})")
+            if key in fields:
+                raise IngestError(f"{where}: key {key!r} given twice")
+            in_exclude = key == "exclude"
+            if in_exclude:
+                if value is not None:
+                    raise IngestError(f"{where}: 'exclude:' takes a list on the following lines ('    - <artist id>')")
+                fields[key] = ()
+            elif value is None:
+                raise IngestError(f"{where}: key {key!r} has no value")
+            else:
+                try:
+                    fields[key] = _followed_value(key, value)
+                except ValueError as e:
+                    raise IngestError(f"{where}: {e}") from None
+            continue
+        in_section = in_exclude = False
+        if line == FOLLOWED_HEADER:
+            if seen_section:
+                raise IngestError(f"sources line {no}: section 'followed_artists' given twice")
+            seen_section = in_section = True
+            continue
+        m = SOURCES_ITEM.fullmatch(line.strip())
         if not m:
             raise IngestError(f"sources line {no}: expected '- <playlist url>'")
         try:
             urls.append(validate_playlist_url(m[1]))
         except IngestError as e:
             raise IngestError(f"sources line {no}: {e}") from None
-    if not urls:
-        raise IngestError("sources file lists no playlists")
-    return list(dict.fromkeys(urls))
+    followed = None
+    if seen_section:
+        fields["exclude"] = tuple(exclude)
+        followed = FollowedConfig(**fields)
+    if not urls and not (followed and followed.enabled):
+        raise IngestError("sources file lists no playlists" + (" and followed_artists is not enabled" if followed else ""))
+    return SourceConfig(list(dict.fromkeys(urls)), followed)
+
+
+def parse_sources(text: str) -> list[str]:
+    """The playlist URLs of sources.yml (see parse_source_config)."""
+    return parse_source_config(text).urls
 
 
 def stable_id(*parts: str) -> str:
@@ -607,10 +718,10 @@ def utc_today() -> datetime.date:
 
 
 class RunState:
-    """Local, gitignored memory of tracks not to retry yet: {spotify_id: {status, retry_after}}. Only ids, a status
-    word and a date are stored (no titles). Never raises: a missing or corrupted file starts empty (WARN), a failed
-    write is logged once and the previous file stays (atomic_write_json). Written after every change, so a killed
-    run keeps what it learned."""
+    """Local, gitignored memory of tracks not to retry yet: {spotify_id: {status, retry_after}}, plus (#121) the
+    day each followed artist was last scanned to the end. Only ids, a status word and dates are stored (no titles).
+    Never raises: a missing or corrupted file starts empty (WARN), a failed write is logged once and
+    the previous file stays (atomic_write_json). Written after every change, so a killed run keeps what it learned."""
 
     def __init__(self, path: Path | None = None, retry_days: dict | None = None,
                  today: Callable[[], datetime.date] = utc_today):
@@ -620,6 +731,7 @@ class RunState:
                            "failed": days.get("failed", DEFAULT_RETRY_FAILED_DAYS)}
         self.today = today
         self.entries: dict[str, dict] = {}
+        self.artists: dict[str, datetime.date] = {}  # followed artist id -> day of its last completed scan (#121)
         self._write_warned = False
 
     @classmethod
@@ -655,6 +767,16 @@ class RunState:
                 dropped += 1
             elif due > st.today():  # expired entries are dropped: the track is tried again
                 st.entries[sid] = {"status": e["status"], "retry_after": due.isoformat()}
+        raw_artists = data.get("artists", {})
+        if not isinstance(raw_artists, dict):
+            raw_artists, dropped = {}, dropped + 1
+        for aid, day in raw_artists.items():
+            try:
+                if not ARTIST_ID.fullmatch(aid):
+                    raise ValueError("id")
+                st.artists[aid] = datetime.date.fromisoformat(day)
+            except (TypeError, ValueError):
+                dropped += 1
         if dropped:
             log(f"WARN state file: ignored {dropped} malformed entr{'y' if dropped == 1 else 'ies'}")
         return st
@@ -675,11 +797,25 @@ class RunState:
         if self.entries.pop(sid, None) is not None:
             self.save()
 
+    def artist_due(self, aid: str, rescan_days: int) -> bool:
+        """True when the artist was never fully scanned, or its last scan is rescan_days or more days ago (a scan
+        dated in the future, after a clock change, counts as due)."""
+        done = self.artists.get(aid)
+        return done is None or done > self.today() or (self.today() - done).days >= rescan_days
+
+    def record_artist(self, aid: str) -> None:
+        """Remember that the artist was scanned to the end today."""
+        self.artists[aid] = self.today()
+        self.save()
+
     def save(self) -> None:
         if self.path is None:
             return
         try:
-            atomic_write_json(self.path, {"version": STATE_VERSION, "tracks": self.entries})
+            data: dict = {"version": STATE_VERSION, "tracks": self.entries}
+            if self.artists:  # absent for a playlist-only run, so its file is unchanged
+                data["artists"] = {aid: d.isoformat() for aid, d in self.artists.items()}
+            atomic_write_json(self.path, data)
         except OSError as e:
             if not self._write_warned:  # once per run; the in-memory state still applies to this run
                 log(f"WARN could not write the state file ({type(e).__name__}); cooldowns may be lost")
@@ -821,6 +957,132 @@ def log_interrupted(url: str, results: dict, e: YouTubeSignInRequired) -> None:
         f"playlist (plus the track that was challenged), {e.playlists_not_attempted} playlist(s) not started")
 
 
+# ---- followed artists source (#121) ----
+# The owner's followed artists (read scope only, no playlist is created or changed anywhere) -> each artist's tracks
+# (Client Credentials catalog, ingest/artist_tracks.py) -> cross-release dedupe (ingest/dedupe.py) -> the same run()
+# as a playlist, so the cap, cooldown, pacing, backoff and the sign-in stop apply unchanged. Progress lives in the
+# state file: an artist scanned to the end is recorded with the day and looked at again after rescan_days.
+
+@dataclass
+class FollowedRun:
+    """What the followed-artists phase did; filled while it runs, so it is complete after a sign-in stop too."""
+    counts: dict = field(default_factory=lambda: {"new": 0, "exists": 0, "no_match": 0, "too_big": 0, "dry_run": 0,
+                                                  "failed": 0, "cooldown": 0})
+    listed: int = 0             # distinct followed artists
+    excluded: int = 0           # skipped: on the exclude list
+    recent: int = 0             # skipped: scanned to the end less than rescan_days ago
+    deferred: int = 0           # not started: max_artists reached
+    scanned: int = 0            # scanned to the end in this run
+    failed: int = 0             # enumeration failed (the others went on)
+    not_started: int = 0        # not started: cap, time limit or sign-in stop
+    not_attempted: int = 0      # tracks of the artist in progress that were not looked at
+    status: str = "done"        # done | stopped | interrupted
+
+    def add(self, counts: dict) -> None:
+        for k, v in counts.items():
+            self.counts[k] = self.counts.get(k, 0) + v
+
+
+def printable(text: str, limit: int = 80) -> str:
+    """A name from an API for a log line: control characters become '?', length bounded."""
+    return "".join(c if c.isprintable() else "?" for c in str(text)[:limit])
+
+
+def real_enumerator(cid: str, secret: str) -> Callable[[str, tuple, str], list[dict]]:
+    """artist id, groups, market -> song records. A fresh Catalog (own call budget) and token per artist."""
+    import artist_tracks
+
+    def enumerate_artist(artist: str, groups: tuple, market: str) -> list[dict]:
+        cat = artist_tracks.Catalog(lambda: artist_tracks.client_credentials_token(cid, secret), [cid, secret], out=log)
+        return artist_tracks.artist_tracks(cat, artist, groups, market, out=lambda _line: None)
+    return enumerate_artist
+
+
+def run_followed(fr: FollowedRun, cfg: FollowedConfig, artists: list[dict],
+                 enumerate_artist: Callable[[str, tuple, str], list[dict]], deps: Deps, existing: set, covers: dict,
+                 work: Path, dry: bool, limits: RunLimits | None, state: RunState) -> None:
+    """Works through `artists` ([{"id", "name"}, ...] in the order Spotify gives them) and records in `fr`.
+    Duplicate ids (paging can repeat an artist) and excluded ids are dropped, artists scanned less than
+    cfg.rescan_days ago are skipped, at most cfg.max_artists are started. An artist whose enumeration fails is
+    logged and counted, the others go on. A sign-in challenge ends the run (raised after `fr` is updated); a limit
+    ends the phase. A scan is recorded only when it reached the last track (never in a dry run). A track that
+    failed in an otherwise complete scan is retried through the cooldown of the state file, not by the artist."""
+    import artist_tracks
+    import dedupe as dedupe_mod
+    first: dict[str, dict] = {}
+    for a in artists:
+        first.setdefault(a["id"], a)  # first occurrence wins, order kept
+    unique = list(first.values())
+    fr.listed = len(unique)
+    excluded = set(cfg.exclude)
+    wanted = [a for a in unique if a["id"] not in excluded]
+    fr.excluded = len(unique) - len(wanted)
+    due = [a for a in wanted if state.artist_due(a["id"], cfg.rescan_days)]
+    fr.recent = len(wanted) - len(due)
+    for n, a in enumerate(due):
+        left = len(due) - n
+        if cfg.max_artists is not None and n >= cfg.max_artists:
+            fr.deferred = left
+            log(f"stopped: max_artists {cfg.max_artists} reached; {left} artist(s) not started; the next run continues")
+            return
+        if limits and not limits.stop_reason and (reason := limits.exhausted()):
+            limits.stop(reason)
+        if limits and limits.stop_reason:
+            fr.status, fr.not_started = "stopped", left
+            log(f"stopped: {limits.stop_reason}: limit reached; {left} artist(s) not started; the next run continues")
+            return
+        label = printable(a["name"])
+        try:
+            songs = enumerate_artist(a["id"], cfg.groups, cfg.market)
+            result = dedupe_mod.collapse(songs, collect_pairs=True)
+        except (artist_tracks.ArtistTracksError, IngestError, OSError, ValueError, TypeError) as e:
+            detail = f": {e}" if isinstance(e, (artist_tracks.ArtistTracksError, IngestError)) else ""
+            log(f"ERROR artist {label}: enumeration failed: {type(e).__name__}{detail}")
+            fr.failed += 1
+            continue
+        # a recording already stored under another release (its id is in `existing` and was collapsed into the kept
+        # record of this scan) must not be downloaded again under the kept record's id
+        present = {kept for gone, kept in result.pairs if gone in existing}
+        feed = [r for r in result.kept if r["song_id"] not in present]
+        log(f"artist {label}: {dedupe_mod.summary(result)}"
+            + (f", {len(result.kept) - len(feed)} already stored under another release" if len(feed) != len(result.kept) else ""))
+        try:
+            counts = run(feed, deps, existing, covers, work, dry, limits, state)
+        except YouTubeSignInRequired as e:
+            fr.add(e.counts or {})
+            fr.status, fr.not_started, fr.not_attempted = "interrupted", left - 1, e.tracks_not_attempted + 1
+            log(f"artist {label}: interrupted by youtube-sign-in: {summary(e.counts or {k: 0 for k in COUNT_KEYS})}; "
+                f"{left - 1} artist(s) not started")
+            raise
+        counts["exists"] += len(result.kept) - len(feed)
+        fr.add(counts)
+        log(f"artist {label}: {summary(counts)}")
+        if limits and limits.stop_reason:  # a limit ended the artist early: not recorded, the next run resumes here
+            fr.status, fr.not_started, fr.not_attempted = "stopped", left - 1, limits.not_attempted
+            log_limit_stop_artists(limits, left - 1)
+            return
+        fr.scanned += 1
+        if not dry:
+            state.record_artist(a["id"])
+
+
+def log_limit_stop_artists(limits: RunLimits, artists_not_started: int) -> None:
+    """Counts only: why the run stopped inside an artist and how much was left."""
+    what = (f"--max-new {limits.max_new} reached ({limits.attempted} attempted)" if limits.stop_reason == "cap"
+            else "--max-minutes limit reached")
+    log(f"stopped: {limits.stop_reason}: {what}; {limits.not_attempted} track(s) of the current artist and "
+        f"{artists_not_started} artist(s) not started; the next run continues")
+
+
+def followed_summary(fr: FollowedRun) -> str:
+    """One line of counts for the log."""
+    parts = [f"{fr.listed} followed", f"{fr.scanned} scanned", f"{fr.recent} scanned recently", f"{fr.excluded} excluded"]
+    for n, what in ((fr.deferred, "deferred by max_artists"), (fr.not_started, "not started"), (fr.failed, "failed")):
+        if n:
+            parts.append(f"{n} {what}")
+    return f"followed artists: {', '.join(parts)}; tracks: {summary(fr.counts)}"
+
+
 # ---- structured result (--result-json, read by scripts/run-ingest-local.sh into last-run.json) ----
 # Only counts, class names, status words and playlist URLs WITHOUT query (already validated); never an id, token or
 # a message text. failure_class: none | partial (some track/playlist failed) | config (bad sources/env, nothing
@@ -828,6 +1090,9 @@ def log_interrupted(url: str, results: dict, e: YouTubeSignInRequired) -> None:
 # Added in #119 (additive): `stop_reason` (cap | time | sign-in | done; null when nothing ran), per-playlist status
 # `stopped` (a --max-new/--max-minutes limit ended the run inside it) and the count `cooldown` (tracks skipped
 # because the state file says retry later).
+# Added in #121 (additive, only when sources.yml has an enabled followed_artists section): `followed_artists` =
+# {status: done | stopped | interrupted, the track counts of the artist phase, artists: {listed, excluded,
+# skipped_recent, deferred, scanned, failed, not_started}}; its track counts are also part of `counts`.
 RESULT_COUNT_KEYS = ("added", "skipped", "no_match", "too_big", "failed", "not_attempted", "cooldown")
 
 
@@ -848,7 +1113,7 @@ def stop_reason(results: dict | None, interrupted: YouTubeSignInRequired | None,
 
 
 def build_result(urls: list[str], results: dict | None, interrupted: YouTubeSignInRequired | None,
-                 exit_code: int, limits: RunLimits | None = None) -> dict:
+                 exit_code: int, limits: RunLimits | None = None, followed: FollowedRun | None = None) -> dict:
     """Result dict for --result-json. `results` is url -> counts (None = unreadable playlist); with `interrupted`
     the finished playlists come from interrupted.results, the one after them is the interrupted one."""
     done = interrupted.results if interrupted else (results or {})
@@ -868,6 +1133,14 @@ def build_result(urls: list[str], results: dict | None, interrupted: YouTubeSign
             item.update(status="not_attempted", **_result_counts(None))
         playlists.append(item)
     counts = {k: sum(p[k] for p in playlists) for k in RESULT_COUNT_KEYS}
+    section = None
+    if followed:  # additive (#121): only counts, never an artist id or name
+        section = {"status": followed.status, **_result_counts(followed.counts, followed.not_attempted),
+                   "artists": {"listed": followed.listed, "excluded": followed.excluded,
+                               "skipped_recent": followed.recent, "deferred": followed.deferred,
+                               "scanned": followed.scanned, "failed": followed.failed,
+                               "not_started": followed.not_started}}
+        counts = {k: counts[k] + section[k] for k in RESULT_COUNT_KEYS}
     counts["playlists_unreadable"] = sum(p["status"] == "unreadable" for p in playlists)
     counts["playlists_not_attempted"] = sum(p["status"] == "not_attempted" for p in playlists)
     if exit_code == 0:
@@ -878,8 +1151,11 @@ def build_result(urls: list[str], results: dict | None, interrupted: YouTubeSign
         cls = "partial"
     else:
         cls = "config"
-    return {"failure_class": cls, "exit_code": exit_code, "stop_reason": stop_reason(results, interrupted, limits),
-            "playlists": playlists, "counts": counts}
+    result = {"failure_class": cls, "exit_code": exit_code, "stop_reason": stop_reason(results, interrupted, limits),
+              "playlists": playlists, "counts": counts}
+    if section:
+        result["followed_artists"] = section
+    return result
 
 
 def write_result(path: Path, result: dict) -> None:
@@ -921,11 +1197,11 @@ def main() -> int:
     args = ap.parse_args()
     if bool(args.playlist_url) == bool(args.sources):
         ap.error("give exactly one of PLAYLIST_URL or --sources FILE")
-    state: dict = {"urls": [], "results": None, "interrupted": None, "limits": None}
+    state: dict = {"urls": [], "results": None, "interrupted": None, "limits": None, "followed": None}
     code = execute(args, state)
     if args.result_json:
         write_result(args.result_json, build_result(state["urls"], state["results"], state["interrupted"], code,
-                                                    state["limits"]))
+                                                    state["limits"], state["followed"]))
     return code
 
 
@@ -962,9 +1238,10 @@ def execute(args: argparse.Namespace, state: dict) -> int:
     """The run itself. Records what the structured result needs in `state` (urls, results, interrupted)."""
     try:
         if args.sources:
-            urls = parse_sources(args.sources.read_text(encoding="utf-8-sig"))
+            config = parse_source_config(args.sources.read_text(encoding="utf-8-sig"))
         else:
-            urls = [validate_playlist_url(args.playlist_url)]
+            config = SourceConfig([validate_playlist_url(args.playlist_url)], None)
+        urls = config.urls
     except (IngestError, OSError, UnicodeDecodeError) as e:
         log(f"ERROR {e}")
         return 1
@@ -982,6 +1259,22 @@ def execute(args: argparse.Namespace, state: dict) -> int:
     problem = js_runtime_problem()
     if problem:
         log(f"WARN js runtime: {problem}; yt-dlp needs Deno >= {'.'.join(map(str, MIN_DENO))} for YouTube")
+
+    followed_cfg = config.followed if config.followed and config.followed.enabled else None
+    followed_artists_list: list[dict] = []
+    if followed_cfg:  # before any work: a missing or invalid user login is a config error, nothing runs
+        import spotify_user
+        if not os.environ.get(spotify_user.REFRESH_KEY):
+            log(f"ERROR followed_artists is enabled in {args.sources} but {spotify_user.REFRESH_KEY} is not set in "
+                f".env: run `python ingest/spotify_user.py login` once (docs/local-ingest.md), or set "
+                f"`enabled: false` in the followed_artists section; exit code {EXIT_CONFIG}")
+            return EXIT_CONFIG
+        try:
+            followed_artists_list = spotify_user.followed_artists(spotify_user.get_access_token())
+        except (spotify_user.UserAuthError, tg_check.EnvSyntaxError) as e:  # redacted, never holds a token
+            log(f"ERROR cannot read the followed artists: {e}; exit code {EXIT_CONFIG}")
+            return EXIT_CONFIG
+        log(f"followed artists: {len(followed_artists_list)} listed by Spotify")
 
     from ytmusicapi import YTMusic
     existing = {r["spotify_id"] for r in d1_query("SELECT spotify_id FROM tracks")}
@@ -1003,8 +1296,17 @@ def execute(args: argparse.Namespace, state: dict) -> int:
         track_state = RunState.load(args.state_file or default_state_path(),
                                     {"no_match": args.retry_no_match_days, "failed": args.retry_failed_days})
         try:
-            results = run_playlists(urls, fetch_songs, real_deps(YTMusic(), throttle), existing, covers, work, args.dry_run,
-                                    limits, track_state)
+            deps = real_deps(YTMusic(), throttle)
+            results = run_playlists(urls, fetch_songs, deps, existing, covers, work, args.dry_run, limits, track_state)
+            if followed_cfg:
+                fr = state["followed"] = FollowedRun()
+                try:
+                    run_followed(fr, followed_cfg, followed_artists_list,
+                                 real_enumerator(os.environ["SPOTIFY_CLIENT_ID"], os.environ["SPOTIFY_CLIENT_SECRET"]),
+                                 deps, existing, covers, work, args.dry_run, limits, track_state)
+                except YouTubeSignInRequired as e:
+                    e.results, e.playlists_not_attempted = results, 0  # every playlist was finished before
+                    raise
         except YouTubeSignInRequired as e:
             state["interrupted"] = e
             log(f"ERROR {FAILURE_YOUTUBE_SIGN_IN}: YouTube asks to sign in (bot check); skipping the rest of the "
@@ -1014,11 +1316,15 @@ def execute(args: argparse.Namespace, state: dict) -> int:
             return EXIT_YOUTUBE_SIGN_IN
     state["results"] = results
     ok = [c for c in results.values() if c is not None]
-    total = {k: sum(c.get(k, 0) for c in ok) for k in (*COUNT_KEYS, "cooldown")}
+    fr = state["followed"]
+    total = {k: sum(c.get(k, 0) for c in [*ok, *([fr.counts] if fr else [])]) for k in (*COUNT_KEYS, "cooldown")}
     broken = len(results) - len(ok)
-    log(f"done: {summary(total)}" + (f"; {broken} playlist(s) could not be read" if broken else ""))
+    if fr:
+        log(followed_summary(fr))
+    log(f"done: {summary(total)}" + (f"; {broken} playlist(s) could not be read" if broken else "")
+        + (f"; {fr.failed} artist(s) could not be enumerated" if fr and fr.failed else ""))
     log(f"stop reason: {stop_reason(results, None, limits)}")
-    return 1 if broken or total["failed"] else 0
+    return 1 if broken or total["failed"] or (fr and fr.failed) else 0
 
 
 if __name__ == "__main__":
