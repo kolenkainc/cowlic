@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Read-only check that this machine can run the local ingest. No network, installs nothing,
-# never prints or reads values of .env (only whether each required KEY NAME is defined there).
+# never prints values of .env (it greps the file to see which required keys are defined with a non-empty value).
 # One line per check: "ok" or "MISSING" with a fix hint. Exit 1 if anything is missing.
 #
 # Install hints (Debian/Ubuntu | macOS with Homebrew):
@@ -14,6 +14,7 @@
 #   .env     copy the template from the repo docs and fill it in (see the runbook); this script
 #            only checks the key names, never the values.
 # Test: scripts/test-check-local-prereqs.sh
+set +x   # never trace: xtrace would expose values of .env that grep reads
 set -u
 
 ROOT="${CHECK_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -22,7 +23,7 @@ VENV_PY="$ROOT/ingest/.venv/bin/python"
 MIN_DENO="2.3.0"
 # Copies of REQUIRED_ENV and MIN_DENO in ingest/ingest.py; scripts/test-check-local-prereqs.sh fails on drift.
 REQUIRED_ENV=(TG_BOT_TOKEN TG_CHANNEL_ID SPOTIFY_CLIENT_ID SPOTIFY_CLIENT_SECRET
-              CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID D1_DATABASE_ID)
+              INGEST_CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID D1_DATABASE_ID)
 TIMEOUT_S=30  # as in ingest.py for deno; skipped when `timeout` is not installed (stock macOS)
 
 fail=0

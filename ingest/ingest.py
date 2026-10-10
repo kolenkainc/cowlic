@@ -3,7 +3,9 @@
 Usage: python ingest/ingest.py PLAYLIST_URL [--dry-run]
 
 Env (or ./.env): TG_BOT_TOKEN, TG_CHANNEL_ID, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET,
-CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, D1_DATABASE_ID. Secrets are never printed.
+INGEST_CLOUDFLARE_API_TOKEN (narrow, D1:Edit only), CLOUDFLARE_ACCOUNT_ID, D1_DATABASE_ID. Secrets are never
+printed. Ingest never reads the broad CLOUDFLARE_API_TOKEN (that one is for wrangler/ad-hoc use, outside ingest).
+The .env syntax is documented in docs/architecture.md section 4.
 Tracks whose spotify_id is already in D1 are skipped, so re-running adds nothing.
 """
 import argparse
@@ -28,7 +30,7 @@ from match import find_match
 MAX_BYTES = 20 * 1024 * 1024  # Telegram Bot API getFile limit
 BITRATE = "256k"
 REQUIRED_ENV = ["TG_BOT_TOKEN", "TG_CHANNEL_ID", "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET",
-                "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "D1_DATABASE_ID"]
+                "INGEST_CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "D1_DATABASE_ID"]
 
 
 SPOTIFY_ID = re.compile(r"[A-Za-z0-9]{22}")
@@ -228,7 +230,7 @@ def d1_batch(statements: list[tuple[str, list]]) -> list[dict]:
            f"/d1/database/{os.environ['D1_DATABASE_ID']}/query")
     payload = {"batch": [{"sql": sql, "params": params} for sql, params in statements]}
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={
-        "content-type": "application/json", "authorization": f"Bearer {os.environ['CLOUDFLARE_API_TOKEN']}"})
+        "content-type": "application/json", "authorization": f"Bearer {os.environ['INGEST_CLOUDFLARE_API_TOKEN']}"})
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             body = json.load(r)
@@ -261,8 +263,8 @@ def tg_delete(message_id: int) -> None:
                                  headers={"content-type": "application/json"})
     tg_check._send(req)
 
-SPOTDL_HIDDEN_ENV = {"TG_BOT_TOKEN", "TG_CHANNEL_ID", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID",
-                     "D1_DATABASE_ID"}
+SPOTDL_HIDDEN_ENV = {"TG_BOT_TOKEN", "TG_CHANNEL_ID", "INGEST_CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_TOKEN",
+                     "CLOUDFLARE_ACCOUNT_ID", "D1_DATABASE_ID"}
 TAIL_LINES = 15  # lines of spotdl output kept in an error, so a YouTube block stays diagnosable
 LINE_MAX = 400
 # spotdl hides the real yt-dlp error (logger.debug(exception)) below DEBUG, and always prints its "Some YouTube
@@ -430,7 +432,11 @@ def main() -> int:
     ap.add_argument("playlist_url")
     ap.add_argument("--dry-run", action="store_true", help="match only; download and upload nothing")
     args = ap.parse_args()
-    tg_check.load_env()
+    try:
+        tg_check.load_env()
+    except tg_check.EnvSyntaxError as e:
+        log(f"ERROR {e}")
+        return 1
     missing = [k for k in REQUIRED_ENV if not os.environ.get(k)]
     if missing:
         log(f"ERROR missing env vars: {', '.join(missing)}")
