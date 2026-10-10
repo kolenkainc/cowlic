@@ -1,4 +1,5 @@
 import { authenticate, type AuthEnv } from "./auth";
+import { coverFileId, getAlbum, getAlbumList2, getArtist, getArtists, getSong, search3 } from "./library";
 import { fail, ok } from "./subsonic";
 import { proxyTelegramFile, type TgEnv } from "./telegram";
 
@@ -41,6 +42,20 @@ export default {
         return ok(params, { openSubsonicExtensions: [] });
       case "getMusicFolders":
         return ok(params, { musicFolders: { musicFolder: [{ id: 1, name: "Music" }] } });
+      case "getArtists":
+        return getArtists(env.DB, params);
+      case "getArtist":
+        return getArtist(env.DB, params);
+      case "getAlbum":
+        return getAlbum(env.DB, params);
+      case "getSong":
+        return getSong(env.DB, params);
+      case "getAlbumList2":
+        return getAlbumList2(env.DB, params);
+      case "search3":
+        return search3(env.DB, params);
+      case "getCoverArt":
+        return cover(request, params, env);
       case "stream":
       case "download":
         return stream(request, params, env);
@@ -59,5 +74,14 @@ async function stream(request: Request, params: URLSearchParams, env: Env): Prom
   if (!track) return fail(params, 70, "Song not found");
 
   const res = await proxyTelegramFile(request, track.tg_file_id, track.content_type, env);
+  return res ?? fail(params, 0, "Upstream storage error", 502);
+}
+
+async function cover(request: Request, params: URLSearchParams, env: Env): Promise<Response> {
+  const id = params.get("id");
+  if (!id) return fail(params, 10, "Required parameter is missing: id");
+  const fileId = await coverFileId(env.DB, id);
+  if (!fileId) return fail(params, 70, "Cover art not found", 404);
+  const res = await proxyTelegramFile(request, fileId, "image/jpeg", env);
   return res ?? fail(params, 0, "Upstream storage error", 502);
 }

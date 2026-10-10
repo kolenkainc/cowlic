@@ -40,6 +40,32 @@ try {
   const full = await r.arrayBuffer();
   check("stream full -> 200 with full size", r.status === 200 && full.byteLength === 7682132, `status=${r.status} len=${full.byteLength}`);
 
+  const j = async (call) => {
+    const [name, query = ""] = call.split(/&(.*)/s);
+    return (await (await worker.fetch(`/rest/${name}?${auth}&${query}`)).json())["subsonic-response"];
+  };
+
+  let x = await j("getArtists");
+  check("getArtists", x.artists?.index?.[0]?.artist?.[0]?.id === "ar1");
+  x = await j("getArtist&id=ar1");
+  check("getArtist lists albums", x.artist?.album?.[0]?.id === "al1");
+  x = await j("getAlbum&id=al1");
+  check("getAlbum lists songs", x.album?.song?.[0]?.id === "t1" && x.album.song[0].suffix === "mp3");
+  x = await j("getSong&id=t1");
+  check("getSong", x.song?.title === "Sine 440");
+  x = await j("getAlbumList2&type=newest&size=5");
+  check("getAlbumList2", x.albumList2?.album?.length === 1);
+  x = await j("search3&query=");
+  check("search3 empty query returns all", x.searchResult3?.song?.length === 1 && x.searchResult3?.artist?.length === 1);
+  x = await j("search3&query=sine");
+  check("search3 matches title", x.searchResult3?.song?.[0]?.id === "t1");
+  x = await j("search3&query=%25");
+  check("search3 escapes LIKE wildcard", !x.searchResult3?.song?.length);
+
+  r = await worker.fetch(`/rest/getArtists?${auth.replace("&f=json", "")}`);
+  const xml = await r.text();
+  check("XML response by default", r.headers.get("content-type")?.startsWith("text/xml") && xml.includes('<artist id="ar1"'), xml.slice(0, 80));
+
   r = await worker.fetch(`/rest/stream?${auth}&id=nope`);
   check("unknown id -> Subsonic error 70", (await r.json())["subsonic-response"].error?.code === 70);
 } finally {
