@@ -1,7 +1,8 @@
 # User unit: one local ingest run. Started by cowlic-ingest.timer.
-# Install and enable instructions live in the runbook (docs/local-ingest.md, #67).
+# Install and enable instructions live in the runbook (docs/local-ingest.md).
 #
-# - Secrets are NOT set here: the wrapper reads .env itself (no EnvironmentFile=).
+# - Secrets are NOT set here (no EnvironmentFile=): the wrapper does not read .env,
+#   ingest's Python loader reads it from the repo root.
 # - No Restart= and no OnFailure=: a failed run is not retried and sends no
 #   notification; see the log and the last-run status file instead.
 # - Overlap protection is the wrapper's flock (#64); no second locking here.
