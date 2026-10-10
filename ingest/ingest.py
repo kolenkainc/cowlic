@@ -8,6 +8,8 @@ One playlist failing does not stop the others; the exit code is 1 if any playlis
 sources.yml may also have a `followed_artists:` section (#121): the tracks of every artist the owner follows on
 Spotify are ingested too, no playlist is created. Needs SPOTIFY_USER_REFRESH_TOKEN (python ingest/spotify_user.py
 login); without a usable login the run ends with exit code 2 before doing any work.
+sources.yml may also have a `lastfm_artists:` section (#152): the tracks of your top Last.fm artists of the last years are
+ingested too. Needs LASTFM_API_KEY in the environment; without a usable key or profile the run ends with exit code 2.
 Limits (off unless given) and the local state file (cooldown for no_match/failed tracks): docs/local-ingest.md.
 
 Env (or ./.env): TG_BOT_TOKEN, TG_CHANNEL_ID, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET,
@@ -36,7 +38,7 @@ from pathlib import Path
 from typing import Callable
 
 import tg_check
-from match import MODE_TITLE_ONLY, find_match
+from match import MODE_TITLE_ONLY, find_match, normalize
 
 MAX_BYTES = 20 * 1024 * 1024  # Telegram Bot API getFile limit
 BITRATE = "256k"
@@ -268,9 +270,21 @@ class FollowedConfig:
 
 
 @dataclass(frozen=True)
+class LastfmConfig:
+    """The `lastfm_artists:` section of sources.yml (#152). The API key is never a key here: env LASTFM_API_KEY only."""
+    enabled: bool = True
+    user: str = ""                      # Last.fm user name; required when enabled
+    years: int = 5                      # listening window of the ranking, in years
+    max_artists: int = 100              # size of the ranking (the top N artists by playcount)
+    rescan_days: int = 7                # a fully scanned artist is looked at again after this many days (0 = every run)
+    exclude: tuple[str, ...] = ()       # artist names, compared by match.normalize
+
+
+@dataclass(frozen=True)
 class SourceConfig:
     urls: list[str]
     followed: FollowedConfig | None     # None: no section (a plain playlist file)
+    lastfm: LastfmConfig | None = None  # None: no lastfm_artists section
 
 
 FOLLOWED_HEADER = "followed_artists:"
@@ -278,8 +292,47 @@ FOLLOWED_KEY = re.compile(r"  ([a-z_]+):(?: (\S.*))?")  # exactly two spaces of 
 FOLLOWED_ITEM = re.compile(r"    - (\S+)")              # exactly four spaces, under `exclude:`
 FOLLOWED_KEYS = ("enabled", "max_artists", "rescan_days", "groups", "market", "exclude")
 ARTIST_ID = re.compile(r"[A-Za-z0-9]{22}")
+LASTFM_ARTIST_KEY = re.compile(r"lfm:[0-9a-f]{16}")   # state key of a Last.fm artist (#152), see lastfm_artist_key
 FOLLOWED_GROUPS = ("album", "single", "compilation", "appears_on")  # ingest/artist_tracks.py ALL_GROUPS (tested)
 INT_VALUE = re.compile(r"[0-9]{1,5}")
+
+
+LASTFM_HEADER = "lastfm_artists:"
+LASTFM_ITEM = re.compile(r"    - (\S.*)")                # exactly four spaces, under `exclude:`; the rest is the name
+LASTFM_KEYS = ("enabled", "user", "years", "max_artists", "rescan_days", "exclude")
+LASTFM_USER = re.compile(r"[A-Za-z0-9_-]{2,15}")        # same as lastfm._USER (tested): the client is not imported here
+LASTFM_EXCLUDE_MAX = 500                                # names in the exclude list
+LASTFM_NAME_MAX = 200                                   # characters of one excluded name (lastfm.NAME_MAX, tested)
+
+
+def _lastfm_value(key: str, value: str):
+    """Typed value of one `key: value` line of the lastfm_artists section; rejects, never rewrites."""
+    if key == "enabled":
+        return _followed_value(key, value)
+    if key == "user":
+        if not LASTFM_USER.fullmatch(value):
+            raise ValueError("user must be a Last.fm user name: 2-15 letters, digits, _ or - (not a URL)")
+        return value
+    low, high = {"years": (1, 10), "max_artists": (1, 10000), "rescan_days": (0, 3650)}[key]
+    if not INT_VALUE.fullmatch(value) or not low <= int(value) <= high:
+        raise ValueError(f"{key} must be a whole number from {low} to {high}")
+    return int(value)
+
+
+def _lastfm_exclude_item(name: str, seen: list[str]) -> str:
+    """One excluded artist name: printable, bounded, not quoted, no inline comment, not a repeat (after normalising)."""
+    if len(name) > LASTFM_NAME_MAX or not name.isprintable():
+        raise ValueError(f"an excluded name must be printable and at most {LASTFM_NAME_MAX} characters")
+    if name[0] in "\"'" or re.search(r"\s#", name):
+        raise ValueError("an excluded name is written as is: no quotes and no inline comment")
+    norm = normalize(name)
+    if not norm:
+        raise ValueError("an excluded name has nothing left after normalising")
+    if len(seen) >= LASTFM_EXCLUDE_MAX:
+        raise ValueError(f"at most {LASTFM_EXCLUDE_MAX} excluded names")
+    if norm in (normalize(x) for x in seen):
+        raise ValueError("artist listed twice")
+    return name
 
 
 def _followed_value(key: str, value: str):
@@ -305,8 +358,8 @@ def _followed_value(key: str, value: str):
 
 def parse_source_config(text: str) -> SourceConfig:
     """Strict parser for sources.yml. Playlist part: a flat list, one `- <url>` per line (a leading indent is
-    tolerated outside the section); blank lines and whole-line `#` comments are ignored, anything else is an error
-    (no silent skip). Every URL passes validate_playlist_url. Optional section, at most once, header at column 0:
+    tolerated outside the sections); blank lines and whole-line `#` comments are ignored, anything else is an error
+    (no silent skip). Every URL passes validate_playlist_url. Optional sections, each at most once, header at column 0:
 
         followed_artists:
           enabled: true          (two-space indent; keys: enabled max_artists rescan_days groups market exclude)
@@ -314,53 +367,74 @@ def parse_source_config(text: str) -> SourceConfig:
           exclude:
             - <22-char artist id>    (four-space indent)
 
-    The section ends at the next line without indent. Unknown or repeated keys, a malformed value, a repeated
-    excluded id and anything else is an error. A file without the section behaves exactly as before."""
+        lastfm_artists:          (#152; keys: enabled user years max_artists rescan_days exclude)
+          user: some_name
+          years: 5
+          exclude:
+            - <artist name, as is>
+
+    A section ends at the next line without indent. Unknown or repeated keys, a malformed value, a repeated
+    excluded entry and anything else is an error. A file without a section behaves exactly as before."""
     urls: list[str] = []
-    fields: dict = {}
-    exclude: list[str] = []
-    seen_section = in_section = in_exclude = False
+    cur: str | None = None  # name of the section being read
+    seen: dict[str, bool] = {"followed_artists": False, "lastfm_artists": False}
+    fields: dict[str, dict] = {"followed_artists": {}, "lastfm_artists": {}}
+    exclude: dict[str, list[str]] = {"followed_artists": [], "lastfm_artists": []}
+    keys = {"followed_artists": FOLLOWED_KEYS, "lastfm_artists": LASTFM_KEYS}
+    headers = {FOLLOWED_HEADER: "followed_artists", LASTFM_HEADER: "lastfm_artists"}
+    in_exclude = False
     for no, raw in enumerate(text.splitlines(), 1):
         line = raw.rstrip()
         if not line.strip() or line.lstrip().startswith("#"):
             continue
-        if in_section and line[0] in " \t":
-            where = f"sources line {no} (followed_artists)"
-            if m := FOLLOWED_ITEM.fullmatch(line):
+        if cur and line[0] in " \t":
+            where = f"sources line {no} ({cur})"
+            item_rx = FOLLOWED_ITEM if cur == "followed_artists" else LASTFM_ITEM
+            if m := item_rx.fullmatch(line):
                 if not in_exclude:
                     raise IngestError(f"{where}: a list item is only allowed under 'exclude:'")
-                if not ARTIST_ID.fullmatch(m[1]):
-                    raise IngestError(f"{where}: not a Spotify artist id (22 letters/digits): {m[1][:40]!r}")
-                if m[1] in exclude:
-                    raise IngestError(f"{where}: artist id listed twice")
-                exclude.append(m[1])
+                if cur == "followed_artists":
+                    if not ARTIST_ID.fullmatch(m[1]):
+                        raise IngestError(f"{where}: not a Spotify artist id (22 letters/digits): {m[1][:40]!r}")
+                    if m[1] in exclude[cur]:
+                        raise IngestError(f"{where}: artist id listed twice")
+                else:
+                    try:
+                        _lastfm_exclude_item(m[1], exclude[cur])
+                    except ValueError as e:
+                        raise IngestError(f"{where}: {e}") from None
+                exclude[cur].append(m[1])
                 continue
             m = FOLLOWED_KEY.fullmatch(line)
             if not m:
-                raise IngestError(f"{where}: expected '  <key>: <value>' (two spaces) or '    - <artist id>'")
+                what = "artist id" if cur == "followed_artists" else "artist name"
+                raise IngestError(f"{where}: expected '  <key>: <value>' (two spaces) or '    - <{what}>'")
             key, value = m[1], m[2]
-            if key not in FOLLOWED_KEYS:
-                raise IngestError(f"{where}: unknown key {key!r} (allowed: {', '.join(FOLLOWED_KEYS)})")
-            if key in fields:
+            if key not in keys[cur]:
+                raise IngestError(f"{where}: unknown key {key!r} (allowed: {', '.join(keys[cur])})")
+            if key in fields[cur]:
                 raise IngestError(f"{where}: key {key!r} given twice")
             in_exclude = key == "exclude"
             if in_exclude:
+                what = "artist id" if cur == "followed_artists" else "artist name"
                 if value is not None:
-                    raise IngestError(f"{where}: 'exclude:' takes a list on the following lines ('    - <artist id>')")
-                fields[key] = ()
+                    raise IngestError(f"{where}: 'exclude:' takes a list on the following lines ('    - <{what}>')")
+                fields[cur][key] = ()
             elif value is None:
                 raise IngestError(f"{where}: key {key!r} has no value")
             else:
                 try:
-                    fields[key] = _followed_value(key, value)
+                    fields[cur][key] = (_followed_value if cur == "followed_artists" else _lastfm_value)(key, value)
                 except ValueError as e:
                     raise IngestError(f"{where}: {e}") from None
             continue
-        in_section = in_exclude = False
-        if line == FOLLOWED_HEADER:
-            if seen_section:
-                raise IngestError(f"sources line {no}: section 'followed_artists' given twice")
-            seen_section = in_section = True
+        cur, in_exclude = None, False
+        if line in headers:
+            name = headers[line]
+            if seen[name]:
+                raise IngestError(f"sources line {no}: section '{name}' given twice")
+            seen[name] = True
+            cur = name
             continue
         m = SOURCES_ITEM.fullmatch(line.strip())
         if not m:
@@ -369,13 +443,20 @@ def parse_source_config(text: str) -> SourceConfig:
             urls.append(validate_playlist_url(m[1]))
         except IngestError as e:
             raise IngestError(f"sources line {no}: {e}") from None
-    followed = None
-    if seen_section:
-        fields["exclude"] = tuple(exclude)
-        followed = FollowedConfig(**fields)
-    if not urls and not (followed and followed.enabled):
-        raise IngestError("sources file lists no playlists" + (" and followed_artists is not enabled" if followed else ""))
-    return SourceConfig(list(dict.fromkeys(urls)), followed)
+    followed = lastfm = None
+    if seen["followed_artists"]:
+        fields["followed_artists"]["exclude"] = tuple(exclude["followed_artists"])
+        followed = FollowedConfig(**fields["followed_artists"])
+    if seen["lastfm_artists"]:
+        fields["lastfm_artists"]["exclude"] = tuple(exclude["lastfm_artists"])
+        lastfm = LastfmConfig(**fields["lastfm_artists"])
+        if lastfm.enabled and not lastfm.user:
+            raise IngestError("sources: section 'lastfm_artists' needs 'user' (your Last.fm user name) when enabled")
+    if not urls and not (followed and followed.enabled) and not (lastfm and lastfm.enabled):
+        present = [n for n, c in (("followed_artists", followed), ("lastfm_artists", lastfm)) if c]
+        raise IngestError("sources file lists no playlists" + (f" and {' and '.join(present)} "
+                          f"{'is' if len(present) == 1 else 'are'} not enabled" if present else ""))
+    return SourceConfig(list(dict.fromkeys(urls)), followed, lastfm)
 
 
 def parse_sources(text: str) -> list[str]:
@@ -837,7 +918,7 @@ class RunState:
             raw_artists, dropped = {}, dropped + 1
         for aid, day in raw_artists.items():
             try:
-                if not ARTIST_ID.fullmatch(aid):
+                if not (ARTIST_ID.fullmatch(aid) or LASTFM_ARTIST_KEY.fullmatch(aid)):
                     raise ValueError("id")
                 st.artists[aid] = datetime.date.fromisoformat(day)
             except (TypeError, ValueError):
@@ -1153,6 +1234,108 @@ def followed_summary(fr: FollowedRun) -> str:
     return f"followed artists: {', '.join(parts)}; tracks: {summary(fr.counts)}"
 
 
+# ---- Last.fm artists source (#152) ----
+# The owner's top artists over the last N years (ingest/lastfm.py, fetched at the start of every run: nothing is cached,
+# Last.fm ToS cl. 4.3 [R] ties caching to the response headers, which the client does not read) -> each artist's tracks
+# (ingest/lastfm_tracks.py) -> cross-release dedupe -> drop what is already stored under another id (Spotify rows) ->
+# the same run() as a playlist, with the title-only matcher mode for tracks without a duration. The cap, cooldown,
+# pacing and the sign-in stop apply unchanged; progress lives in the `artists` map of the state file, keyed by
+# lastfm_artist_key(name). Imported lazily by execute(): a run without this section never loads ingest/lastfm*.py.
+
+@dataclass
+class LastfmRun(FollowedRun):
+    """What the Last.fm phase did (the counters of FollowedRun; `deferred` stays 0: max_artists sizes the ranking)."""
+    dropped_stored: int = 0     # records dropped because the same track is already stored under another id
+
+
+def lastfm_artist_key(name: str) -> str:
+    """Stable state key of a Last.fm artist: derived from the normalised name, accepted by RunState."""
+    return LASTFM_ID_PREFIX + stable_id("lastfm artist", normalize(name))
+
+
+LASTFM_ARTIST_CALLS = 150  # lastfm_tracks.CALL_BUDGET (requests per artist); a test keeps the two equal
+
+
+def real_lastfm_enumerator(client) -> Callable[[dict], list[dict]]:
+    """ranked artist ({name, mbid, playcount}) -> song records. One client for the run: its pacing is continuous and
+    each artist has its own request budget (lastfm_tracks.CALL_BUDGET)."""
+    import lastfm_tracks
+
+    def enumerate_artist(artist: dict) -> list[dict]:
+        return lastfm_tracks.artist_tracks(client, artist["name"], artist.get("mbid"), out=log).records
+    return enumerate_artist
+
+
+def run_lastfm(lr: LastfmRun, cfg: LastfmConfig, artists: list[dict],
+               enumerate_artist: Callable[[dict], list[dict]], stored_rows: list[tuple], deps: Deps, existing: set,
+               covers: dict, work: Path, dry: bool, limits: RunLimits | None, state: RunState) -> None:
+    """Works through `artists` ([{"name", "mbid", "playcount"}, ...] in ranking order) and records in `lr`, with the
+    guarantees of run_followed: excluded names and artists scanned less than cfg.rescan_days ago are skipped, a failed
+    enumeration is logged and counted while the others go on, a sign-in challenge ends the run (raised after `lr` is
+    updated), a limit ends the phase, and a scan is recorded only when it reached the last track (never in a dry run)."""
+    import dedupe as dedupe_mod
+    import lastfm
+    first: dict[str, dict] = {}
+    for a in artists:
+        first.setdefault(lastfm_artist_key(a["name"]), a)  # first (best ranked) occurrence wins
+    lr.listed = len(first)
+    excluded = {normalize(x) for x in cfg.exclude}
+    wanted = {k: a for k, a in first.items() if normalize(a["name"]) not in excluded}
+    lr.excluded = len(first) - len(wanted)
+    due = [(k, a) for k, a in wanted.items() if state.artist_due(k, cfg.rescan_days)]
+    lr.recent = len(wanted) - len(due)
+    for n, (key, a) in enumerate(due):
+        left = len(due) - n
+        if limits and not limits.stop_reason and (reason := limits.exhausted()):
+            limits.stop(reason)
+        if limits and limits.stop_reason:
+            lr.status, lr.not_started = "stopped", left
+            log(f"stopped: {limits.stop_reason}: limit reached; {left} artist(s) not started; the next run continues")
+            return
+        label = printable(a["name"])
+        try:
+            songs = enumerate_artist(a)
+            result = dedupe_mod.collapse(songs, collect_pairs=True)
+        except (lastfm.LastfmError, IngestError, OSError, ValueError, TypeError) as e:
+            detail = f": {e}" if isinstance(e, (lastfm.LastfmError, IngestError)) else ""
+            log(f"ERROR artist {label}: enumeration failed: {type(e).__name__}{detail}")
+            lr.failed += 1
+            continue
+        present = {kept for gone, kept in result.pairs if gone in existing}
+        kept = [r for r in result.kept if r["song_id"] not in present]
+        feed = drop_stored_lastfm(kept, stored_rows)
+        lr.dropped_stored += len(kept) - len(feed)
+        log(f"artist {label}: {dedupe_mod.summary(result)}"
+            + (f", {len(result.kept) - len(feed)} already stored" if len(feed) != len(result.kept) else ""))
+        try:
+            counts = run(feed, deps, existing, covers, work, dry, limits, state)
+        except YouTubeSignInRequired as e:
+            lr.add(e.counts or {})
+            lr.status, lr.not_started, lr.not_attempted = "interrupted", left - 1, e.tracks_not_attempted + 1
+            log(f"artist {label}: interrupted by youtube-sign-in: {summary(e.counts or {k: 0 for k in COUNT_KEYS})}; "
+                f"{left - 1} artist(s) not started")
+            raise
+        counts["exists"] += len(result.kept) - len(feed)
+        lr.add(counts)
+        log(f"artist {label}: {summary(counts)}")
+        if limits and limits.stop_reason:  # a limit ended the artist early: not recorded, the next run resumes here
+            lr.status, lr.not_started, lr.not_attempted = "stopped", left - 1, limits.not_attempted
+            log_limit_stop_artists(limits, left - 1)
+            return
+        lr.scanned += 1
+        if not dry:
+            state.record_artist(key)
+
+
+def lastfm_summary(lr: LastfmRun) -> str:
+    """One line of counts for the log."""
+    parts = [f"{lr.listed} ranked", f"{lr.scanned} scanned", f"{lr.recent} scanned recently", f"{lr.excluded} excluded"]
+    for n, what in ((lr.not_started, "not started"), (lr.failed, "failed"), (lr.dropped_stored, "already stored")):
+        if n:
+            parts.append(f"{n} {what}")
+    return f"lastfm artists: {', '.join(parts)}; tracks: {summary(lr.counts)}"
+
+
 # ---- structured result (--result-json, read by scripts/run-ingest-local.sh into last-run.json) ----
 # Only counts, class names, status words and playlist URLs WITHOUT query (already validated); never an id, token or
 # a message text. failure_class: none | partial (some track/playlist failed) | config (bad sources/env, nothing
@@ -1163,6 +1346,9 @@ def followed_summary(fr: FollowedRun) -> str:
 # Added in #121 (additive, only when sources.yml has an enabled followed_artists section): `followed_artists` =
 # {status: done | stopped | interrupted, the track counts of the artist phase, artists: {listed, excluded,
 # skipped_recent, deferred, scanned, failed, not_started}}; its track counts are also part of `counts`.
+# Added in #152 (additive, only when sources.yml has an enabled lastfm_artists section): `lastfm_artists` = the same
+# shape, artists: {listed, excluded, skipped_recent, scanned, failed, not_started, dropped_stored}; its counts (and
+# its `matched_title_only`) are also part of `counts`.
 RESULT_COUNT_KEYS = ("added", "skipped", "no_match", "too_big", "failed", "not_attempted", "cooldown")
 
 
@@ -1184,7 +1370,8 @@ def stop_reason(results: dict | None, interrupted: YouTubeSignInRequired | None,
 
 
 def build_result(urls: list[str], results: dict | None, interrupted: YouTubeSignInRequired | None,
-                 exit_code: int, limits: RunLimits | None = None, followed: FollowedRun | None = None) -> dict:
+                 exit_code: int, limits: RunLimits | None = None, followed: FollowedRun | None = None,
+                 lastfm: LastfmRun | None = None) -> dict:
     """Result dict for --result-json. `results` is url -> counts (None = unreadable playlist); with `interrupted`
     the finished playlists come from interrupted.results, the one after them is the interrupted one."""
     done = interrupted.results if interrupted else (results or {})
@@ -1212,7 +1399,16 @@ def build_result(urls: list[str], results: dict | None, interrupted: YouTubeSign
                                "scanned": followed.scanned, "failed": followed.failed,
                                "not_started": followed.not_started}}
         counts = {k: counts[k] + section[k] for k in RESULT_COUNT_KEYS}
-    title_only = sum(p.get("matched_title_only", 0) for p in (*playlists, *([section] if section else [])))
+    lastfm_section = None
+    if lastfm:  # additive (#152): only counts, never an artist name or id
+        lastfm_section = {"status": lastfm.status, **_result_counts(lastfm.counts, lastfm.not_attempted),
+                          "artists": {"listed": lastfm.listed, "excluded": lastfm.excluded,
+                                      "skipped_recent": lastfm.recent, "scanned": lastfm.scanned,
+                                      "failed": lastfm.failed, "not_started": lastfm.not_started,
+                                      "dropped_stored": lastfm.dropped_stored}}
+        counts = {k: counts[k] + lastfm_section[k] for k in RESULT_COUNT_KEYS}
+    title_only = sum(p.get("matched_title_only", 0)
+                     for p in (*playlists, *[x for x in (section, lastfm_section) if x]))
     if title_only:  # additive (#151): present only when the title-only matcher mode matched something
         counts["matched_title_only"] = title_only
     counts["playlists_unreadable"] = sum(p["status"] == "unreadable" for p in playlists)
@@ -1229,6 +1425,8 @@ def build_result(urls: list[str], results: dict | None, interrupted: YouTubeSign
               "playlists": playlists, "counts": counts}
     if section:
         result["followed_artists"] = section
+    if lastfm_section:
+        result["lastfm_artists"] = lastfm_section
     return result
 
 
@@ -1271,11 +1469,11 @@ def main() -> int:
     args = ap.parse_args()
     if bool(args.playlist_url) == bool(args.sources):
         ap.error("give exactly one of PLAYLIST_URL or --sources FILE")
-    state: dict = {"urls": [], "results": None, "interrupted": None, "limits": None, "followed": None}
+    state: dict = {"urls": [], "results": None, "interrupted": None, "limits": None, "followed": None, "lastfm": None}
     code = execute(args, state)
     if args.result_json:
         write_result(args.result_json, build_result(state["urls"], state["results"], state["interrupted"], code,
-                                                    state["limits"], state["followed"]))
+                                                    state["limits"], state["followed"], state["lastfm"]))
     return code
 
 
@@ -1306,6 +1504,27 @@ def positive_float(text: str) -> float:
     if v <= 0:
         raise argparse.ArgumentTypeError("must be greater than 0")
     return v
+
+
+def open_lastfm(cfg: LastfmConfig, sources: Path | None) -> tuple[list[dict], Callable | None, int]:
+    """(ranking, enumerator, 0), or ([], None, EXIT_CONFIG) after logging why the Last.fm source cannot run: no or a
+    malformed LASTFM_API_KEY, an unknown/private/empty profile, a refused or failing Last.fm. Messages come from the
+    client already redacted and name the variable, never its value. Imports ingest/lastfm*.py lazily (only here)."""
+    import lastfm
+    key = ""
+    try:
+        key = lastfm.api_key_from_env()
+        # one client for the run: the ranking needs about 53 requests per year, each artist has its own budget
+        budget = 1 + cfg.years * lastfm.WEEKS_PER_YEAR_BOUND + 4 + cfg.max_artists * LASTFM_ARTIST_CALLS
+        client = lastfm.LastfmClient(key, max_calls=budget, out=log)
+        ranking = lastfm.top_artists(client, cfg.user, cfg.years, max_artists=cfg.max_artists, out=log)
+    except lastfm.LastfmError as e:
+        log(f"ERROR cannot read the Last.fm ranking: {redact(str(e), [key])}; lastfm_artists is enabled in {sources}: "
+            f"set LASTFM_API_KEY in .env (docs/local-ingest.md), check the user name and that the profile is public, "
+            f"or set `enabled: false` in the lastfm_artists section; exit code {EXIT_CONFIG}")
+        return [], None, EXIT_CONFIG
+    log(f"lastfm artists: {len(ranking)} ranked over the last {cfg.years} year(s)")
+    return ranking, real_lastfm_enumerator(client), 0
 
 
 def execute(args: argparse.Namespace, state: dict) -> int:
@@ -1350,6 +1569,14 @@ def execute(args: argparse.Namespace, state: dict) -> int:
             return EXIT_CONFIG
         log(f"followed artists: {len(followed_artists_list)} listed by Spotify")
 
+    lastfm_cfg = config.lastfm if config.lastfm and config.lastfm.enabled else None
+    lastfm_ranking: list[dict] = []
+    lastfm_enumerate = None
+    if lastfm_cfg:  # before any work: no key, a bad user or a private/empty profile is a config error, nothing runs
+        lastfm_ranking, lastfm_enumerate, code = open_lastfm(lastfm_cfg, args.sources)
+        if code:
+            return code
+
     from ytmusicapi import YTMusic
     existing = {r["spotify_id"] for r in d1_query("SELECT spotify_id FROM tracks")}
     covers = {r["id"]: r["cover_file_id"] for r in d1_query("SELECT id, cover_file_id FROM albums")}
@@ -1381,6 +1608,14 @@ def execute(args: argparse.Namespace, state: dict) -> int:
                 except YouTubeSignInRequired as e:
                     e.results, e.playlists_not_attempted = results, 0  # every playlist was finished before
                     raise
+            if lastfm_cfg:
+                lr = state["lastfm"] = LastfmRun()
+                try:
+                    run_lastfm(lr, lastfm_cfg, lastfm_ranking, lastfm_enumerate, read_stored_rows(d1_query),
+                               deps, existing, covers, work, args.dry_run, limits, track_state)
+                except YouTubeSignInRequired as e:
+                    e.results, e.playlists_not_attempted = results, 0
+                    raise
         except YouTubeSignInRequired as e:
             state["interrupted"] = e
             log(f"ERROR {FAILURE_YOUTUBE_SIGN_IN}: YouTube asks to sign in (bot check); skipping the rest of the "
@@ -1390,15 +1625,19 @@ def execute(args: argparse.Namespace, state: dict) -> int:
             return EXIT_YOUTUBE_SIGN_IN
     state["results"] = results
     ok = [c for c in results.values() if c is not None]
-    fr = state["followed"]
-    total = {k: sum(c.get(k, 0) for c in [*ok, *([fr.counts] if fr else [])]) for k in (*COUNT_KEYS, "cooldown", "matched_title_only")}
+    fr, lr = state["followed"], state.get("lastfm")
+    total = {k: sum(c.get(k, 0) for c in [*ok, *([fr.counts] if fr else []), *([lr.counts] if lr else [])])
+             for k in (*COUNT_KEYS, "cooldown", "matched_title_only")}
     broken = len(results) - len(ok)
+    artists_failed = (fr.failed if fr else 0) + (lr.failed if lr else 0)
     if fr:
         log(followed_summary(fr))
+    if lr:
+        log(lastfm_summary(lr))
     log(f"done: {summary(total)}" + (f"; {broken} playlist(s) could not be read" if broken else "")
-        + (f"; {fr.failed} artist(s) could not be enumerated" if fr and fr.failed else ""))
+        + (f"; {artists_failed} artist(s) could not be enumerated" if artists_failed else ""))
     log(f"stop reason: {stop_reason(results, None, limits)}")
-    return 1 if broken or total["failed"] or (fr and fr.failed) else 0
+    return 1 if broken or total["failed"] or artists_failed else 0
 
 
 if __name__ == "__main__":
