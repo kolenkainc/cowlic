@@ -377,12 +377,13 @@ def _record(oc: ArtistOutcome, row: Row, rows: list[Row]) -> None:
 
 # ---- output ----
 
-def write_csv(path: Path, rows: list[Row]) -> None:
-    """New file only (never overwrites), mode 0600, UTF-8 with BOM so a spreadsheet reads non-Latin titles."""
+def write_csv(path: Path, rows: list[Row], columns: list[str] = COLUMNS) -> None:
+    """New file only (never overwrites), mode 0600, UTF-8 with BOM so a spreadsheet reads non-Latin titles.
+    `rows` need a cells() method matching `columns` (lastfm_report.py reuses this with its own)."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
-        w.writerow(COLUMNS)
+        w.writerow(columns)
         for r in rows:
             w.writerow(r.cells())
 
