@@ -18,6 +18,7 @@ import lastfm
 import lastfm_tracks
 import match
 import spotify_user
+import tg_check
 from test_followed import aid, art
 from test_ingest import GOOD_URL, FixedToday, Fakes, sid, song
 
@@ -692,7 +693,7 @@ class SpotdlEnvTest(NoNetwork):
 
     def child_says(self, hidden):
         env = {"SPOTIFY_CLIENT_ID": "cid", "SPOTIFY_CLIENT_SECRET": "csecret", "LASTFM_API_KEY": KEY}
-        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, env), \
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, env, clear=True), \
                 mock.patch.object(ingest, "SPOTDL_CMD", [sys.executable, "-c", self.CODE]), \
                 mock.patch.object(ingest, "SPOTDL_HIDDEN_ENV", hidden):
             _, tail = REAL_SPOTDL_RUN(["save", "u"], Path(d))
@@ -704,6 +705,67 @@ class SpotdlEnvTest(NoNetwork):
 
     def test_the_check_can_fail(self):
         self.assertEqual(self.child_says(ingest.SPOTDL_HIDDEN_ENV - {"LASTFM_API_KEY"}), "SEEN")
+
+
+class SpotdlEnvFromFileTest(NoNetwork):
+    """Fail closed (#181): no value that load_env took from .env reaches the spotdl child, whatever its name."""
+
+    # The fake child writes only the probed names (and their values, all fake) to its cwd, never the whole environment.
+    CODE = ("import json, os; probes = {probes}; "
+            "open('env.json', 'w').write(json.dumps({{k: os.environ[k] for k in probes if k in os.environ}}))")
+    OUTER = {"SPOTIFY_CLIENT_ID": "cid", "SPOTIFY_CLIENT_SECRET": "csecret", "PATH": "/outer/bin", "HOME": "/outer/home",
+             "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "TMPDIR": "/outer/tmp", "XDG_CACHE_HOME": "/outer/cache",
+             "HTTPS_PROXY": "http://outer-proxy.invalid"}
+    DOTENV = (b"FUTURE_SECRET_TOKEN=fake-1\nLASTFM_SHARED_SECRET=fake-2\nINGEST_GRAFANA_TOKEN=fake-3\n"
+              b"LASTFM_API_KEY=fake-4\nFILE_ONLY=from-file\nBOTH=from-file\n")
+
+    PROBES = {"FUTURE_SECRET_TOKEN", "LASTFM_SHARED_SECRET", "INGEST_GRAFANA_TOKEN", "LASTFM_API_KEY", "FILE_ONLY",
+              "BOTH", "COLUMNS", "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET", *OUTER}
+
+    def child_env(self, drop_record=False):
+        code = self.CODE.format(probes=repr(sorted(self.PROBES)))
+        env = {**self.OUTER, "BOTH": "from-outer"}  # the whole environment of the test: clear=True, nothing real
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "ingest").mkdir()
+            (root / ".env").write_bytes(self.DOTENV)
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(tg_check, "ENV_FROM_FILE", set()), \
+                    mock.patch.object(tg_check, "__file__", str(root / "ingest" / "tg_check.py")), \
+                    mock.patch.object(ingest, "SPOTDL_CMD", [sys.executable, "-c", code]):
+                tg_check.load_env()
+                self.assertTrue(os.environ.get("FUTURE_SECRET_TOKEN") == "fake-1", "the .env was not loaded")  # the .env really was loaded
+                if drop_record:  # the mutation: as if the new logic did not exist
+                    tg_check.ENV_FROM_FILE.clear()
+                REAL_SPOTDL_RUN(["save", "u"], root)
+            return json.loads((root / "env.json").read_text())
+
+    def test_no_env_file_key_reaches_the_child_even_when_it_is_not_in_the_fixed_set(self):
+        child = self.child_env()
+        for name in ("FUTURE_SECRET_TOKEN", "LASTFM_SHARED_SECRET", "INGEST_GRAFANA_TOKEN", "FILE_ONLY"):
+            self.assertFalse(name in ingest.SPOTDL_HIDDEN_ENV, name)
+            self.assertFalse(name in child, name)
+        self.assertFalse("LASTFM_API_KEY" in child, "LASTFM_API_KEY")
+
+    def test_the_outer_environment_still_passes(self):
+        child = self.child_env()
+        for name in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "XDG_CACHE_HOME", "HTTPS_PROXY"):
+            self.assertTrue(child.get(name) == self.OUTER[name], name)
+        self.assertTrue(child.get("COLUMNS") == ingest.SPOTDL_CONSOLE_COLUMNS, "COLUMNS")
+
+    def test_the_spotify_app_credentials_stay_out_of_the_environment(self):
+        child = self.child_env()
+        self.assertFalse("SPOTIFY_CLIENT_ID" in child, "SPOTIFY_CLIENT_ID")
+        self.assertFalse("SPOTIFY_CLIENT_SECRET" in child, "SPOTIFY_CLIENT_SECRET")
+
+    def test_a_name_in_both_keeps_the_outer_value_and_the_file_value_never_appears(self):
+        child = self.child_env()  # load_env does not override an existing variable: the caller's value wins
+        self.assertTrue(child.get("BOTH") == "from-outer", "BOTH")
+        self.assertFalse("from-file" in child.values(), "a .env value reached the child")
+
+    def test_the_check_can_fail(self):
+        child = self.child_env(drop_record=True)
+        for name in ("FUTURE_SECRET_TOKEN", "LASTFM_SHARED_SECRET", "INGEST_GRAFANA_TOKEN"):
+            self.assertTrue(name in child, name)
 
 
 class LazyImportTest(unittest.TestCase):

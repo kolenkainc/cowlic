@@ -79,6 +79,11 @@ def parse_env(data: bytes) -> dict[str, str]:
     return out
 
 
+# Names load_env put into os.environ (a name that was already set is not in it: the outer value stays and is the
+# caller's own). Child processes that must not see .env values are built from os.environ minus this set.
+ENV_FROM_FILE: set[str] = set()
+
+
 def load_env() -> None:
     """Load ./.env into os.environ without overriding variables that are already set (an explicit environment
     wins). Raises EnvSyntaxError on unsupported syntax."""
@@ -86,7 +91,9 @@ def load_env() -> None:
     if not env.exists():
         return
     for k, v in parse_env(env.read_bytes()).items():
-        os.environ.setdefault(k, v)
+        if k not in os.environ:
+            os.environ[k] = v
+            ENV_FROM_FILE.add(k)
 
 
 def call(token: str, method: str, **params) -> dict:
