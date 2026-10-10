@@ -160,6 +160,10 @@ elif mode == "debug_cause":
     print(f"[13:10:01] WARNING  MainThread - Some YouTube downloads require Deno. Run spotdl --download-deno{pad} deno.py:143")
     print(f"[13:10:01] DEBUG    MainThread - ERROR: [youtube] x: Video unavailable. This video is private{pad} base.py:408")
     print("AudioProviderError: YT-DLP download error - https://music.youtube.com/watch?v=x")
+elif mode.startswith("tail:"):
+    # the yt-dlp exception is among the LAST lines, so it lands in the tail as well
+    print(f"[13:10:01] DEBUG    MainThread - {mode.split(':', 1)[1]} base.py:408")
+    print("AudioProviderError: YT-DLP download error - https://music.youtube.com/watch?v=x")
 elif mode.startswith("buried:"):
     # the yt-dlp exception is logged early; a rich traceback box (with a chained cause) follows it
     pad = " " * 300
@@ -262,8 +266,105 @@ class SpotdlOutputTest(FakeSpotdlCase):
         lines = ["[13:10:00] DEBUG MainThread - Searching for x base.py:178", "plain text"]
         self.assertEqual(ingest.cause_lines(lines), [])
 
+    SIGNED = (
+        "ERROR: unable to download video data: HTTPSConnectionPool(host='rr1---sn-xx.googlevideo.com', port=443): "
+        "Max retries exceeded with url: /videoplayback?expire=1760000000&ip=203.0.113.7&sig=AOq0QJ8wRAIgabc"
+        "&pot=MnQ1abcdefghijklmnopqrstuvwxyz0123"
+    )
+    LEAKS = ("203.0.113.7", "expire=", "sig=", "pot=", "AOq0QJ8wRAIgabc", "MnQ1abcdefghijklmnopqrstuvwxyz0123")
+
+    def assert_clean(self, out):
+        for gone in self.LEAKS:
+            self.assertNotIn(gone, out)
+
+    def test_cause_lines_strip_signed_url_query_and_tokens(self):
+        line = f"[13:10:00] DEBUG MainThread - {self.SIGNED} (Caused by NewConnectionError) base.py:408"
+        out = " ".join(ingest.cause_lines([line]))
+        self.assert_clean(out)
+        self.assertIn("unable to download video data", out)
+        self.assertIn("/videoplayback?<stripped>", out)
+        self.assertIn("Max retries exceeded", out)
+
+    def test_final_error_text_from_download_has_no_signed_url(self):
+        # the tail path: the record is among the last lines, so it reaches the IngestError via the tail too
+        out = download_log(self.work, "tail:" + self.SIGNED)
+        self.assert_clean(out)
+        self.assertIn("Max retries exceeded", out)
+        self.assertIn("/videoplayback?<stripped>", out)
+
+    def test_final_error_text_for_buried_record_has_no_signed_url(self):
+        self.assert_clean(download_log(self.work, "buried:" + self.SIGNED))
+
+    def test_tail_of_scrubs_every_line(self):
+        out = ingest.tail_of(f"[13:10:00] DEBUG MainThread - {self.SIGNED} base.py:408\nplain", [])
+        self.assert_clean(out)
+
+    def test_watch_url_keeps_video_id_but_drops_other_params(self):
+        f = ingest.scrub_cause
+        self.assertEqual(f("see https://music.youtube.com/watch?v=abcDEF_-123"), "see https://music.youtube.com/watch?v=abcDEF_-123")
+        self.assertEqual(f("https://x/watch?v=abcDEF_-123&list=PLsecretlistxx&si=zz"), "https://x/watch?v=abcDEF_-123&<stripped>")
+        self.assertEqual(f("https://x/watch?list=PL1&v=abc"), "https://x/watch?v=abc&<stripped>")
+        self.assertEqual(f("https://x/p?id=1#frag"), "https://x/p?<stripped>")
+
+    def test_percent_encoded_query_is_stripped(self):
+        out = ingest.scrub_cause("url: /videoplayback%3Fexpire%3D1760000000%26ip%3D203.0.113.7%26sig%3Dabc rest")
+        self.assertNotIn("expire", out)
+        self.assertNotIn("203.0.113.7", out)
+        self.assertIn("/videoplayback?<stripped>", out)
+
+    def test_path_style_and_param_ips_are_masked(self):
+        f = ingest.scrub_cause
+        self.assertNotIn("203.0.113.7", f("GET /videoplayback/ip/203.0.113.7/expire/1760000000/x failed"))
+        self.assertNotIn("203.0.113.7", f("params;ip=203.0.113.7;other"))
+        self.assertIn("ip=<ip>", f("params;ip=203.0.113.7;other"))
+        self.assertNotIn("2001:db8", f("/ip/2001:db8:85a3::8a2e:370:7334/x"))
+
+    def test_bare_ip_addresses_are_masked(self):
+        f = ingest.scrub_cause
+        self.assertEqual(f("connect to 203.0.113.7 failed"), "connect to <ip> failed")
+        self.assertEqual(f("connect to [2001:db8::1] failed"), "connect to [<ip>] failed")
+        self.assertEqual(f("addr 2001:0db8:85a3:0000:0000:8a2e:0370:7334 x"), "addr <ip> x")
+        self.assertEqual(f("addr ::1 x"), "addr <ip> x")
+
+    def test_timestamps_versions_and_hostnames_are_left_alone(self):
+        for text in ("[13:10:00] DEBUG MainThread - hello base.py:408", "yt-dlp 2025.10.22 is old", "ffmpeg 7.1.1 ok",
+                     "host rr1---sn-xx.googlevideo.com port 443", "see music.youtube.com/watch", "std::vector<int> fails"):
+            self.assertEqual(ingest.scrub_cause(text), text)
+
+    def test_long_opaque_tokens_are_masked_also_when_joined(self):
+        f = ingest.scrub_cause
+        self.assertEqual(f("bad QUJDREVGR0hJSktMTU5PUFFSU1RVVldY end"), "bad <token> end")
+        jwt = "eyJhbGciOiJIUzI1.eyJzdWIiOiIxMjM0.SflKxwRJSMeKKF2QT4"
+        self.assertEqual(f(f"auth {jwt} end"), "auth <token> end")
+        self.assertEqual(f("path /a1b2c3d4e5/f6g7h8i9j0/k1l2m3n4o5 end"), "path /<token> end")
+
+    def test_wrapped_url_continuation_is_masked(self):
+        out = ingest.scrub_cause("&ip=203.0.113.7&sig=abc123&lsig=def&pot=xyz&Key=k1 tail")
+        for gone in ("203.0.113.7", "abc123", "def", "xyz", "k1"):
+            self.assertNotIn(gone, out)
+        self.assertIn("tail", out)
+
+    def test_html_escaped_separators_are_masked(self):
+        out = ingest.scrub_cause("h/videoplayback&amp;ip=203.0.113.7&amp;sig=abc&amp;expire=1760000000 end")
+        for gone in ("203.0.113.7", "sig=abc"):
+            self.assertNotIn(gone, out)
+        self.assertIn("end", out)
+
+    def test_scrub_is_linear_on_long_input(self):
+        import time
+        t = time.monotonic()
+        ingest.scrub_cause("a" * 100_000)
+        ingest.scrub_cause("a." * 50_000)
+        for _ in range(1000):
+            ingest.scrub_cause("ab12" * 400)
+        self.assertLess(time.monotonic() - t, 1.0)
+
+    def test_scrub_keeps_ordinary_text(self):
+        for text in ("is that ok?", "issue #12 failed", "C# is fine", "Sign in to confirm you're not a bot"):
+            self.assertEqual(ingest.scrub_cause(text), text)
+
     def test_long_lines_are_capped(self):
-        self.assertEqual(len(ingest.tail_of("x" * 5000, [])), ingest.LINE_MAX)
+        self.assertEqual(len(ingest.tail_of("ab " * 5000, [])), ingest.LINE_MAX)
 
     def test_redact_plain(self):
         self.assertEqual(ingest.redact(f"a {SECRET} b", [SECRET, "", CID]), "a *** b")
