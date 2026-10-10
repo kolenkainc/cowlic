@@ -1,0 +1,11 @@
+name = "cowlic"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cowlic"
+database_id = "REPLACE_AFTER_d1_create"
+migrations_dir = "migrations"
+
+# Secrets (set with `wrangler secret put`): TG_BOT_TOKEN, SUBSONIC_USER, SUBSONIC_PASSWORD
