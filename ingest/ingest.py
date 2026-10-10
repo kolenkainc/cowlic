@@ -324,7 +324,7 @@ def tg_delete(message_id: int) -> None:
     tg_check._send(req)
 
 SPOTDL_HIDDEN_ENV = {"TG_BOT_TOKEN", "TG_CHANNEL_ID", "INGEST_CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_TOKEN",
-                     "CLOUDFLARE_ACCOUNT_ID", "D1_DATABASE_ID"}
+                     "CLOUDFLARE_ACCOUNT_ID", "D1_DATABASE_ID", "SPOTIFY_USER_REFRESH_TOKEN"}
 TAIL_LINES = 15  # lines of spotdl output kept in an error, so a YouTube block stays diagnosable
 LINE_MAX = 400
 # spotdl hides the real yt-dlp error (logger.debug(exception)) below DEBUG, and always prints its "Some YouTube
