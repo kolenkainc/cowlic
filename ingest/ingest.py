@@ -1,6 +1,7 @@
-"""Sync one public Spotify playlist into the library: match -> download -> Telegram -> D1.
+"""Sync public Spotify playlists into the library: match -> download -> Telegram -> D1.
 
-Usage: python ingest/ingest.py PLAYLIST_URL [--dry-run]
+Usage: python ingest/ingest.py (PLAYLIST_URL | --sources sources.yml) [--dry-run]
+One playlist failing does not stop the others; the exit code is 1 if any playlist or track failed.
 
 Env (or ./.env): TG_BOT_TOKEN, TG_CHANNEL_ID, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET,
 INGEST_CLOUDFLARE_API_TOKEN (narrow, D1:Edit only), CLOUDFLARE_ACCOUNT_ID, D1_DATABASE_ID. Secrets are never
@@ -170,6 +171,38 @@ def cause_lines(lines: list[str]) -> list[str]:
 def tail_of(text: str, secrets: list[str]) -> str:
     """Last TAIL_LINES meaningful lines of tool output (see clean_lines)."""
     return "\n".join(clean_lines(text, secrets)[-TAIL_LINES:])
+
+
+# Spotify playlist or album URL: https only, fixed host, 22-char id, optional harmless query (?si=...).
+PLAYLIST_URL = re.compile(r"https://open\.spotify\.com/(?:playlist|album)/[A-Za-z0-9]{22}(?:\?[A-Za-z0-9=&_.%-]{1,200})?")
+SOURCES_ITEM = re.compile(r"-[ \t]+(\S+)")
+
+
+def validate_playlist_url(url: str) -> str:
+    """Allowlist check shared by the CLI argument and sources.yml; rejects, never rewrites."""
+    if not PLAYLIST_URL.fullmatch(url):
+        raise IngestError(f"not a Spotify playlist/album URL (https://open.spotify.com/playlist/<22 chars>): {url[:120]!r}")
+    return url
+
+
+def parse_sources(text: str) -> list[str]:
+    """Strict parser for sources.yml: a flat list, one `- <url>` per line; blank lines and whole-line `#` comments
+    are ignored, anything else is an error (no silent skip). Every URL passes validate_playlist_url."""
+    urls = []
+    for no, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = SOURCES_ITEM.fullmatch(line)
+        if not m:
+            raise IngestError(f"sources line {no}: expected '- <playlist url>'")
+        try:
+            urls.append(validate_playlist_url(m[1]))
+        except IngestError as e:
+            raise IngestError(f"sources line {no}: {e}") from None
+    if not urls:
+        raise IngestError("sources file lists no playlists")
+    return list(dict.fromkeys(urls))
 
 
 def stable_id(*parts: str) -> str:
@@ -427,11 +460,44 @@ def run(songs: list[dict], deps: Deps, existing: set, covers: dict, work: Path, 
     return counts
 
 
+def summary(counts: dict) -> str:
+    return (f"{counts['new']} new, {counts['exists']} already present, {counts['no_match']} no match, "
+            f"{counts['too_big']} too big, {counts['failed']} failed")
+
+
+def run_playlists(urls: list[str], fetch_songs: Callable[[str], list[dict]], deps: Deps, existing: set,
+                  covers: dict, work: Path, dry: bool) -> dict[str, dict | None]:
+    """Runs every playlist; one failing playlist does not hide the others. Prints one result line per playlist.
+    Returns url -> counts, or None when the playlist could not be fetched (counts also hold failed tracks)."""
+    results: dict[str, dict | None] = {}
+    for url in urls:
+        try:
+            songs = fetch_songs(url)
+        except (IngestError, OSError, ValueError) as e:
+            log(f"playlist {url}: FAILED: {type(e).__name__}: {e}")
+            results[url] = None
+            continue
+        results[url] = run(songs, deps, existing, covers, work, dry)
+        log(f"playlist {url}: {summary(results[url])}")
+    return results
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Sync one public Spotify playlist into the library.")
-    ap.add_argument("playlist_url")
+    ap = argparse.ArgumentParser(description="Sync public Spotify playlists into the library.")
+    ap.add_argument("playlist_url", nargs="?", help="one playlist URL (or use --sources)")
+    ap.add_argument("--sources", type=Path, metavar="FILE", help="sources.yml: sync every playlist listed in it")
     ap.add_argument("--dry-run", action="store_true", help="match only; download and upload nothing")
     args = ap.parse_args()
+    if bool(args.playlist_url) == bool(args.sources):
+        ap.error("give exactly one of PLAYLIST_URL or --sources FILE")
+    try:
+        if args.sources:
+            urls = parse_sources(args.sources.read_text(encoding="utf-8"))
+        else:
+            urls = [validate_playlist_url(args.playlist_url)]
+    except (IngestError, OSError, UnicodeDecodeError) as e:
+        log(f"ERROR {e}")
+        return 1
     try:
         tg_check.load_env()
     except tg_check.EnvSyntaxError as e:
@@ -451,17 +517,19 @@ def main() -> int:
     covers = {r["id"]: r["cover_file_id"] for r in d1_query("SELECT id, cover_file_id FROM albums")}
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
-        save = work / "list.spotdl"
-        try:
-            spotdl_run(["save", args.playlist_url, "--save-file", str(save)], work)
-        except IngestError as e:
-            log(f"ERROR spotdl save failed: {e}")
-            return 1
-        counts = run(json.loads(save.read_text(encoding="utf-8")), real_deps(YTMusic()), existing, covers, work,
-                     args.dry_run)
-    log(f"done: {counts['new']} new, {counts['exists']} already present, {counts['no_match']} no match, "
-          f"{counts['too_big']} too big, {counts['failed']} failed")
-    return 1 if counts["failed"] else 0
+
+        def fetch_songs(url: str) -> list[dict]:
+            save = work / "list.spotdl"
+            save.unlink(missing_ok=True)
+            spotdl_run(["save", url, "--save-file", str(save)], work)
+            return json.loads(save.read_text(encoding="utf-8"))
+
+        results = run_playlists(urls, fetch_songs, real_deps(YTMusic()), existing, covers, work, args.dry_run)
+    ok = [c for c in results.values() if c is not None]
+    total = {k: sum(c[k] for c in ok) for k in ("new", "exists", "no_match", "too_big", "failed")}
+    broken = len(results) - len(ok)
+    log(f"done: {summary(total)}" + (f"; {broken} playlist(s) could not be read" if broken else ""))
+    return 1 if broken or total["failed"] else 0
 
 
 if __name__ == "__main__":
