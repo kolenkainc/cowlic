@@ -1,6 +1,6 @@
 """Sync public Spotify playlists into the library: match -> download -> Telegram -> D1.
 
-Usage: python ingest/ingest.py (PLAYLIST_URL | --sources sources.yml) [--dry-run]
+Usage: python ingest/ingest.py (PLAYLIST_URL | --sources sources.yml) [--dry-run] [--result-json PATH]
 One playlist failing does not stop the others; the exit code is 1 if any playlist or track failed.
 
 Env (or ./.env): TG_BOT_TOKEN, TG_CHANNEL_ID, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET,
@@ -53,6 +53,7 @@ class YouTubeSignInRequired(IngestError):
         self.counts: dict | None = None  # counts of the playlist in progress, challenged track not included
         self.tracks_not_attempted = 0    # tracks after the challenged one in the playlist in progress
         self.playlists_not_attempted = 0  # playlists after the one in progress (not even fetched)
+        self.results: dict = {}          # url -> counts of the playlists finished before the one in progress
 
 
 # Distinct process exit code and failure class for this outcome (1 = other failures, 2 = bad usage).
@@ -520,6 +521,7 @@ def run_playlists(urls: list[str], fetch_songs: Callable[[str], list[dict]], dep
             results[url] = run(songs, deps, existing, covers, work, dry)
         except YouTubeSignInRequired as e:
             e.playlists_not_attempted = len(urls) - n - 1
+            e.results = results
             log_interrupted(url, results, e)
             raise
         log(f"playlist {url}: {summary(results[url])}")
@@ -536,14 +538,88 @@ def log_interrupted(url: str, results: dict, e: YouTubeSignInRequired) -> None:
         f"playlist (plus the track that was challenged), {e.playlists_not_attempted} playlist(s) not started")
 
 
+# ---- structured result (--result-json, read by scripts/run-ingest-local.sh into last-run.json) ----
+# Only counts, class names, status words and playlist URLs WITHOUT query (already validated); never an id, token or
+# a message text. failure_class: none | partial (some track/playlist failed) | config (bad sources/env, nothing
+# ran) | youtube-sign-in. A crash writes no file at all; the wrapper reports that as `crash`.
+RESULT_COUNT_KEYS = ("added", "skipped", "no_match", "too_big", "failed", "not_attempted")
+
+
+def _result_counts(c: dict | None, not_attempted: int = 0) -> dict:
+    c = c or {}
+    return {"added": c.get("new", 0), "skipped": c.get("exists", 0), "no_match": c.get("no_match", 0),
+            "too_big": c.get("too_big", 0), "failed": c.get("failed", 0), "not_attempted": not_attempted}
+
+
+def build_result(urls: list[str], results: dict | None, interrupted: YouTubeSignInRequired | None,
+                 exit_code: int) -> dict:
+    """Result dict for --result-json. `results` is url -> counts (None = unreadable playlist); with `interrupted`
+    the finished playlists come from interrupted.results, the one after them is the interrupted one."""
+    done = interrupted.results if interrupted else (results or {})
+    playlists = []
+    for n, url in enumerate(urls):
+        item = {"url": url.split("?", 1)[0]}
+        if url in done and done[url] is None:
+            item.update(status="unreadable", **_result_counts(None))
+        elif url in done:
+            item.update(status="done", **_result_counts(done[url]))
+        elif interrupted and n == len(done):
+            na = interrupted.tracks_not_attempted + 1 if interrupted.counts is not None else 0
+            item.update(status="interrupted", **_result_counts(interrupted.counts, na))
+        else:
+            item.update(status="not_attempted", **_result_counts(None))
+        playlists.append(item)
+    counts = {k: sum(p[k] for p in playlists) for k in RESULT_COUNT_KEYS}
+    counts["playlists_unreadable"] = sum(p["status"] == "unreadable" for p in playlists)
+    counts["playlists_not_attempted"] = sum(p["status"] == "not_attempted" for p in playlists)
+    if exit_code == 0:
+        cls = "none"
+    elif exit_code == EXIT_YOUTUBE_SIGN_IN:
+        cls = FAILURE_YOUTUBE_SIGN_IN
+    elif results is not None:
+        cls = "partial"
+    else:
+        cls = "config"
+    return {"failure_class": cls, "exit_code": exit_code, "playlists": playlists, "counts": counts}
+
+
+def write_result(path: Path, result: dict) -> None:
+    """Atomic (temp file + rename in the same directory), mode 0600. A write failure is logged, never silent, and
+    does not change the exit code."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(result, f)
+            f.write("\n")
+        os.replace(tmp, path)
+    except OSError as e:
+        log(f"WARN could not write the result file: {type(e).__name__}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Sync public Spotify playlists into the library.")
     ap.add_argument("playlist_url", nargs="?", help="one playlist URL (or use --sources)")
     ap.add_argument("--sources", type=Path, metavar="FILE", help="sources.yml: sync every playlist listed in it")
     ap.add_argument("--dry-run", action="store_true", help="match only; download and upload nothing")
+    ap.add_argument("--result-json", type=Path, metavar="PATH",
+                    help="write the structured result (counts, failure class) to PATH at the end of the run")
     args = ap.parse_args()
     if bool(args.playlist_url) == bool(args.sources):
         ap.error("give exactly one of PLAYLIST_URL or --sources FILE")
+    state: dict = {"urls": [], "results": None, "interrupted": None}
+    code = execute(args, state)
+    if args.result_json:
+        write_result(args.result_json, build_result(state["urls"], state["results"], state["interrupted"], code))
+    return code
+
+
+def execute(args: argparse.Namespace, state: dict) -> int:
+    """The run itself. Records what the structured result needs in `state` (urls, results, interrupted)."""
     try:
         if args.sources:
             urls = parse_sources(args.sources.read_text(encoding="utf-8-sig"))
@@ -552,6 +628,7 @@ def main() -> int:
     except (IngestError, OSError, UnicodeDecodeError) as e:
         log(f"ERROR {e}")
         return 1
+    state["urls"] = urls
     try:
         tg_check.load_env()
     except tg_check.EnvSyntaxError as e:
@@ -580,11 +657,13 @@ def main() -> int:
 
         try:
             results = run_playlists(urls, fetch_songs, real_deps(YTMusic()), existing, covers, work, args.dry_run)
-        except YouTubeSignInRequired:
+        except YouTubeSignInRequired as e:
+            state["interrupted"] = e
             log(f"ERROR {FAILURE_YOUTUBE_SIGN_IN}: YouTube asks to sign in (bot check); skipping the rest of the "
                 f"run (remaining tracks and playlists), not retrying; manual action needed: wait and re-run later, "
                 f"do not add cookies; exit code {EXIT_YOUTUBE_SIGN_IN}")
             return EXIT_YOUTUBE_SIGN_IN
+    state["results"] = results
     ok = [c for c in results.values() if c is not None]
     total = {k: sum(c[k] for c in ok) for k in ("new", "exists", "no_match", "too_big", "failed")}
     broken = len(results) - len(ok)
