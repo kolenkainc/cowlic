@@ -221,9 +221,9 @@ class FakeSpotdlCase(unittest.TestCase):
 
 class SpotdlOutputTest(FakeSpotdlCase):
     def test_exit_zero_without_file_surfaces_block_message(self):
-        out = download_log(self.work, "block")
+        out = download_log(self.work, "tail:ERROR: [youtube] x: HTTP Error 403: Forbidden")
         self.assertIn("expected exactly one mp3 after download", out)
-        self.assertIn("Sign in to confirm you're not a bot", out)
+        self.assertIn("HTTP Error 403: Forbidden", out)
 
     def test_surfaced_tail_is_limited(self):
         out = download_log(self.work, "noisy")
@@ -254,7 +254,7 @@ class SpotdlOutputTest(FakeSpotdlCase):
         self.assertNotIn("   ", out)  # padding collapsed
 
     def test_exception_line_far_from_the_end_is_surfaced_on_the_error_line(self):
-        msg = "ERROR: [youtube] x: Sign in to confirm you're not a bot"
+        msg = "ERROR: [youtube] x: HTTP Error 403: Forbidden"
         out = download_log(self.work, "buried:" + msg)
         first = next(ln for ln in out.splitlines() if ln.startswith("ERROR "))
         self.assertIn(f"yt-dlp error: [13:10:01] DEBUG MainThread - {msg} base.py:408", first)
@@ -561,6 +561,85 @@ class RunPlaylistsTest(unittest.TestCase):
         for argv in ([], [GOOD_URL, "--sources", "x.yml"]):
             with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 self.run_main(argv)
+
+
+class YouTubeSignInTest(FakeSpotdlCase):
+    """A sign-in challenge ends the whole run: no retry, remaining tracks and playlists skipped, distinct exit."""
+
+    def run_two_playlists(self, mode):
+        os.environ["FAKE_MODE"] = mode
+        real = ingest.real_deps(None)
+        searched = []
+
+        def find(s):
+            searched.append(s["song_id"])
+            return SimpleNamespace(video_id="v")
+
+        deps = ingest.Deps(find, real.download, None, None, None, None)
+        fetched = []
+
+        def fetch(url):
+            fetched.append(url)
+            return [song(1), song(2)]
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            try:
+                ingest.run_playlists([GOOD_URL, GOOD_URL2], fetch, deps, set(), {}, self.work, False)
+                raised = False
+            except ingest.YouTubeSignInRequired:
+                raised = True
+        return raised, searched, fetched, out.getvalue()
+
+    def test_challenge_skips_remaining_tracks_and_playlists(self):
+        raised, searched, fetched, out = self.run_two_playlists("block")
+        self.assertTrue(raised)
+        self.assertEqual(searched, [sid(1)])  # one download attempt: no retry, track 2 never tried
+        self.assertEqual(fetched, [GOOD_URL])  # second playlist never fetched
+
+    def test_other_download_errors_do_not_end_the_run(self):
+        raised, searched, fetched, out = self.run_two_playlists("debug_cause")
+        self.assertFalse(raised)
+        self.assertEqual(searched, [sid(1), sid(2), sid(1), sid(2)])
+        self.assertEqual(fetched, [GOOD_URL, GOOD_URL2])
+
+    def test_detection_matches_real_captured_lines(self):
+        for line in ("ERROR: [youtube] x: Sign in to confirm you're not a bot",
+                     "[13:10:01] DEBUG MainThread - ERROR: [youtube] x: Sign in to confirm you’re not a bot. "
+                     "Use --cookies-from-browser base.py:408",
+                     "yt_dlp.utils.DownloadError: ERROR: [youtube] x: SIGN IN TO CONFIRM YOU'RE NOT A BOT"):
+            with self.subTest(line=line):
+                self.assertTrue(ingest.is_sign_in_challenge([line]))
+        for line in ("ERROR: [youtube] x: Video unavailable. This video is private",
+                     "ERROR: [youtube] x: Sign in to confirm your age"):
+            with self.subTest(line=line):
+                self.assertFalse(ingest.is_sign_in_challenge([line]))
+
+    def run_main(self, exc):
+        env = {k: "x" for k in ingest.REQUIRED_ENV}
+        out = io.StringIO()
+
+        def boom(*a):
+            raise exc
+
+        with mock.patch.dict(os.environ, env), mock.patch("tg_check.load_env"), \
+                mock.patch.object(sys, "argv", ["ingest.py", GOOD_URL]), \
+                mock.patch.object(ingest, "d1_query", return_value=[]), \
+                mock.patch.object(ingest, "js_runtime_problem", return_value=None), \
+                mock.patch.object(ingest, "real_deps", return_value=None), \
+                mock.patch.dict(sys.modules, {"ytmusicapi": SimpleNamespace(YTMusic=lambda: None)}), \
+                mock.patch.object(ingest, "run_playlists", boom), \
+                contextlib.redirect_stdout(out):
+            return ingest.main(), out.getvalue()
+
+    def test_main_exits_with_distinct_code_and_one_clear_line(self):
+        code, out = self.run_main(ingest.YouTubeSignInRequired("x"))
+        self.assertEqual(code, ingest.EXIT_YOUTUBE_SIGN_IN)
+        self.assertNotIn(code, (0, 1, 2))
+        lines = [ln for ln in out.splitlines() if "youtube-sign-in" in ln]
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(ingest.FAILURE_YOUTUBE_SIGN_IN, "youtube-sign-in")
+        self.assertNotIn("done:", out)
 
 
 if __name__ == "__main__":

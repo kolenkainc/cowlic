@@ -43,6 +43,23 @@ class IngestError(Exception):
     """Per-track failure with a message that is safe to print (no tokens, no URLs with tokens)."""
 
 
+class YouTubeSignInRequired(IngestError):
+    """YouTube answered with its bot check ("Sign in to confirm you're not a bot"). Not a per-track failure: it ends
+    the whole run (no retry, no bypass), see run() and main()."""
+
+
+# Distinct process exit code and failure class for this outcome (1 = other failures, 2 = bad usage).
+EXIT_YOUTUBE_SIGN_IN = 3
+FAILURE_YOUTUBE_SIGN_IN = "youtube-sign-in"
+# yt-dlp's wording, as captured in the cause lines: "ERROR: [youtube] <id>: Sign in to confirm you're not a bot.
+# Use --cookies-from-browser ...". The apostrophe may be straight, curly or missing.
+SIGN_IN_CHALLENGE = re.compile(r"sign in to confirm (?:that )?you.?re not a bot", re.IGNORECASE)
+
+
+def is_sign_in_challenge(lines: list[str]) -> bool:
+    return any(SIGN_IN_CHALLENGE.search(ln) for ln in lines)
+
+
 # ---- pure logic (unit tested) ----
 
 def primary_artist(song: dict) -> str:
@@ -421,6 +438,8 @@ def real_deps(ytm) -> Deps:
                           tdir.parent)
         files = list(tdir.glob("*.mp3"))
         if len(files) != 1:
+            if is_sign_in_challenge(causes):
+                raise YouTubeSignInRequired("YouTube asks to sign in (bot check)")
             # causes first and on the first line: the CI summary lists only the first line of each ERROR
             raise IngestError("expected exactly one mp3 after download"
                               + (f"; yt-dlp error: {' | '.join(causes)}" if causes else "")
@@ -445,6 +464,8 @@ def run(songs: list[dict], deps: Deps, existing: set, covers: dict, work: Path, 
         label = f"{(song.get('artists') or ['?'])[0]} - {song.get('name', '?')}"
         try:
             status = process_track(song, deps, existing, covers, work, dry)
+        except YouTubeSignInRequired:
+            raise  # ends the run, not just this track
         except (IngestError, OSError, KeyError, ValueError, IndexError, TypeError) as e:
             detail = f": {e}" if isinstance(e, IngestError) else ""
             log(f"ERROR {label}: {type(e).__name__}{detail}")
@@ -473,6 +494,8 @@ def run_playlists(urls: list[str], fetch_songs: Callable[[str], list[dict]], dep
     for url in urls:
         try:
             songs = fetch_songs(url)
+        except YouTubeSignInRequired:
+            raise
         except (IngestError, OSError, ValueError) as e:
             log(f"playlist {url}: FAILED: {type(e).__name__}: {e}")
             results[url] = None
@@ -524,7 +547,12 @@ def main() -> int:
             spotdl_run(["save", url, "--save-file", str(save)], work)
             return json.loads(save.read_text(encoding="utf-8"))
 
-        results = run_playlists(urls, fetch_songs, real_deps(YTMusic()), existing, covers, work, args.dry_run)
+        try:
+            results = run_playlists(urls, fetch_songs, real_deps(YTMusic()), existing, covers, work, args.dry_run)
+        except YouTubeSignInRequired:
+            log(f"ERROR {FAILURE_YOUTUBE_SIGN_IN}: YouTube asks to sign in (bot check); skipping the rest of the "
+                f"run (remaining tracks and playlists), not retrying; exit code {EXIT_YOUTUBE_SIGN_IN}")
+            return EXIT_YOUTUBE_SIGN_IN
     ok = [c for c in results.values() if c is not None]
     total = {k: sum(c[k] for c in ok) for k in ("new", "exists", "no_match", "too_big", "failed")}
     broken = len(results) - len(ok)
