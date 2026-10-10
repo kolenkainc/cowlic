@@ -6,3 +6,5 @@ __pycache__/
 .venv/
 wrangler.local.toml
 .claude/worktrees/
+ingest-state.json
+match-report*.csv

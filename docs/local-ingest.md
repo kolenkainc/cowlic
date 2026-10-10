@@ -265,13 +265,168 @@ Find the logs in Grafana (Explore, Loki data source of your stack):
 Set the time range to the last 24 hours or more (one run a day). Free tier retention is about 14 days. Whether
 the first live push works is verified by the owner in #108.
 
+## Per-run limits and the local state file
+
+Added in #119 (the base for the artist source in #121). Without the options below a run behaves as before:
+no cap and no time limit. The wrapper does not forward options yet; use them when calling ingest directly:
+
+```sh
+ingest/.venv/bin/python ingest/ingest.py --sources sources.yml --max-new 200 --max-minutes 90
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--max-new N` | none (no cap) | Stop after N tracks were attempted in this run. Counted: new, too big, failed (and dry-run matches). Not counted: tracks already in the library, tracks in cooldown, tracks with no match (no download was tried) |
+| `--max-minutes M` | none (no limit) | Wall clock. No new track is started after M minutes (a download in progress finishes) |
+| `--state-file PATH` | `${XDG_STATE_HOME:-$HOME/.local/state}/cowlic/ingest-state.json` | Where the state is kept |
+| `--retry-no-match-days D` | 30 | Do not retry a `no_match` track for D days (0 = retry every run) |
+| `--retry-failed-days D` | 3 | Do not retry a `failed` track for D days (0 = retry every run) |
+
+The limits are checked before each track that would be worked on and before each next playlist is fetched. When
+one is hit the run ends normally (exit code unchanged: 0 unless something failed), logs one line
+`stopped: cap|time: ...` with counts, and the next run picks up the rest (already stored tracks are skipped).
+
+### State file
+
+`ingest-state.json` sits next to the log in the state directory (outside the repo; `ingest-state.json` is also in
+`.gitignore`). It remembers, per Spotify track id, that the track ended `no_match` or `failed` and the date
+(UTC) after which it may be tried again:
+
+```json
+{"version": 1, "tracks": {"<22-char spotify id>": {"status": "no_match", "retry_after": "2026-11-09"}}}
+```
+
+- Tracks in cooldown are skipped without any YouTube work, logged as `skipped (cooldown, retry later): <label>`
+  (the same label ingest logs for other skipped tracks), and do not use the cap.
+- A track that later ends `new`, `exists` or `too_big` is removed from the state. A sign-in challenge is not a
+  track failure and is not recorded. A `--dry-run` reads the state but never writes it.
+- Only ids, a status word and a date are stored: no titles, artists or URLs. Mode 0600 (directory 0700).
+- Written atomically after every change (temp file + fsync + rename), so a killed run keeps what it learned and a
+  failed write leaves the previous file intact (one `WARN could not write the state file` line per run).
+- A missing file starts empty. A corrupted or unknown file starts empty with `WARN state file is corrupted ...`
+  and is replaced at the next change; malformed single entries are ignored with a WARN. Ingest never fails
+  because of the state file. To reset all cooldowns, delete the file.
+
+### Why a run stopped
+
+The log ends every run with `stop reason: done|cap|time|sign-in` (a run that never started, such as a config
+error, logs none). The same value is `stop_reason` in `last-run.json` -> `result` (`null` when nothing ran):
+
+- `done`: all playlists were worked through. `cap` / `time`: a limit ended the run early. `sign-in`: the
+  YouTube sign-in stop (exit 3).
+- A playlist that was cut short by a limit has `status: "stopped"` and `not_attempted` = tracks not looked at;
+  later playlists are `not_attempted`. A limit stop is not a failure: `failure_class` stays `none`.
+- New count `cooldown` (per playlist and in `counts`): tracks skipped because of the state file.
+
+## Pacing and backoff
+
+Added in #120. Reason: yt-dlp documents about 300 videos per hour for a guest YouTube session and recommends a
+5-10 s pause between downloads; running flat out (about 300-400 tracks an hour) is at that limit, so it is not
+the default.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--pace-seconds S` | 5 | Pause between downloads, counted from the end of the previous download (time spent on matching in between counts). 0 = no pause |
+| `--pace-jitter-seconds J` | 5 | A random 0..J seconds is added to every pause, so the pause is 5-10 s by default. 0 = a fixed pause |
+| `--retry-attempts N` | 3 | Attempts in total (1 try + 2 retries) for a transient error. 1 = no retry |
+
+- The pause is only taken before a download: not before the first one of a run, and never for tracks that are
+  already present, in cooldown, without a match, or in `--dry-run` (no download happens there). It counts as wall
+  clock for `--max-minutes`. Waits use a monotonic clock.
+- Backoff: after a transient error the wait doubles, 10 s then 20 s, never more than 120 s. Transient means HTTP
+  429 or 5xx (also "Too Many Requests", "Service Unavailable", "Bad Gateway", "Gateway Timeout") in the error of
+  a download, of the YouTube Music search (also network errors there) or of the Spotify playlist fetch. After the
+  last attempt the error counts as an ordinary track failure (cooldown, see above) or a failed playlist.
+- The YouTube sign-in challenge is never retried and is not paced around: the first one ends the whole run
+  (exit 3, see below), the tracks and the cap are not touched afterwards, and what the state file learned before it
+  stays. Nothing here bypasses a YouTube check (#62).
+- These defaults also apply to plain playlist runs (the timer): a run is slower by 5-10 s per downloaded track
+  after the first. Use `--pace-seconds 0 --pace-jitter-seconds 0` for the old speed.
+- yt-dlp's own sleep options (`--sleep-interval` and friends) are not used: spotdl accepts yt-dlp options through
+  `--yt-dlp-args` and passes them to its `YoutubeDL` object (read in spotdl's source, not run), but ingest starts
+  one spotdl process per track, and yt-dlp's sleeps live inside one process, so the pause is done by ingest.
+
+## Match-rate report (go/no-go gate for the artist ingest)
+
+Before all followed artists are ingested (umbrella #102) we measure how often the matcher finds the right YouTube
+Music video for an artist's tracks. The matcher was validated on only 12-22 tracks so far (assessment #92,
+section 5); known weak spots are remasters, live versions, different durations and non-Latin names.
+`ingest/match_report.py` measures it on a sample. It downloads and uploads nothing and touches no Telegram, D1,
+cookies or Spotify user login: only Spotify catalog reads (Client Credentials, the `SPOTIFY_CLIENT_*` values the
+ingest already uses) and YouTube Music searches.
+
+```sh
+ingest/.venv/bin/python ingest/match_report.py <artist id or URL> [<artist id or URL> ...] \
+    [--artists-file artists.txt] [--max-tracks 150] [--min-interval 1.0] [--wrong N --checked M] [--out match-report-NAME.csv]
+```
+
+- Pick 5-10 artists that look like your library: some with remasters and live albums, some with non-Latin names.
+  `--artists-file` takes one id or `https://open.spotify.com/artist/<id>` URL per line (`#` comments allowed). A
+  value that is not a valid id or URL is refused, never rewritten.
+- Per artist: tracks are listed, duplicate recordings collapsed (`dedupe.py`), then a deterministic sample is
+  searched. `--max-tracks` (default 150, at most 1000) is a hard cap for the whole run, shared between the artists
+  (budget an artist does not use goes to the next ones). It must be at least the number of artists.
+- The search is throttled: at least `--min-interval` seconds (default and minimum 1) between two searches, bounded
+  backoff on HTTP 429/5xx, at most 4 x `--max-tracks` searches, and a stop after 3 failed tracks in a row. A
+  150-track run takes roughly 3-8 minutes. Do not run it repeatedly in a loop.
+- Output: `match-report-<UTC time>.csv` in the current directory (or `--out`; the name must match
+  `match-report*.csv`, which is gitignored; an existing file is never overwritten). UTF-8 with BOM, mode 0600.
+  Titles are untrusted text: control characters are stripped and a cell starting with `=`, `+`, `-` or `@` gets a
+  leading apostrophe, so the file is safe to open in a spreadsheet.
+- Columns: `artist, artist_id, title, duration_s, matched_title, matched_duration_s, duration_delta_s, similarity,
+  status, reason, pattern, reviewed`. Status: `matched`; `no_match` (the matched columns then show the closest
+  result YouTube Music returned and `reason` is `title` (no result with title similarity >= 0.85), `duration` (the
+  title fit but the duration was more than 3 s off) or `no_results`); `uncomparable` (no usable title or duration,
+  not searched); `error` (the search failed after retries). `pattern` tags every `no_match` row (below);
+  `reviewed` is empty: you fill it with `ok` or `wrong` for the matched rows you check.
+- Failing patterns, one primary pattern per `no_match` row so the counts add up, first rule that fits wins, taken
+  from the Spotify title: `remaster` (remaster, deluxe, anniversary, expanded, reissue, bonus track), `live` (live,
+  acoustic, session, unplugged), `remix` (remix, rmx, edit, mix), `non-latin` (any letter outside the Latin script:
+  Cyrillic, CJK, Arabic, Greek ...), `featuring` (feat, ft), `short-generic` (at most 2 words, or at most 6
+  characters, or intro/outro/interlude/untitled/skit/prelude/reprise/theme), then by the search outcome:
+  `duration-only` (the title was found, the duration was off), `no-results`, `other`.
+- The summary on stdout gives the counts, the match rate overall and per artist, the share of search errors (with a
+  loud WARNING above 10%: the verdict may be misleading), the failing patterns with counts, most frequent first,
+  and the 15 lowest-similarity failures. Exit code 0 normally, 2 if an artist failed or the run stopped early (the
+  CSV is still written), 1 for invalid input or missing credentials. A YouTube sign-in challenge in a search stops
+  the run at once; it is not bypassed.
+
+### How to read it
+
+The gate is the one from assessment #92: **matched >= 80% AND wrong <= 2%**. Match rate = `matched / (matched +
+no_match)` on the sample (`uncomparable` and `error` are left out; look at them separately, many of either means
+the sample or the connection is bad). The script prints one of three verdicts:
+
+| Verdict | Meaning |
+|---|---|
+| `matched rate >= 80%: go IF the owner's spot-check of matched rows finds <= 2% wrong` | Half the gate. Do the spot-check below; only if it holds, start the capped first run (#113) |
+| `matched rate < 80%: no-go for now (tune the matcher; see the top failing patterns)` | Tune the matcher for the most frequent failing pattern, re-run the report on the same artists, compare |
+| `no verdict` | Nothing was compared (all `uncomparable` or `error`) |
+
+The wrong-match rate cannot be computed automatically (the script cannot know that a matched video is the wrong
+recording). It comes from the owner: label a random sample of `matched` rows `ok` or `wrong` in the `reviewed`
+column (open the matched video on https://music.youtube.com; a live or cover version that slipped through is
+`wrong`; at least 50 rows is a sensible sample), wrong rate = wrong / checked, must be <= 2%. You can pass the counts
+back (`--wrong N --checked M` on a re-run; it only prints the rate against the limit, it does not change the
+verdict line). A sample under 30 compared tracks only gives a hint (the summary says so). Read the per-artist lines
+too: one artist at 20% in an otherwise good sample (say, a non-Latin name) is a finding even when the overall rate
+passes.
+
+What the owner does (ticket #112): run the report on the chosen artists, open the CSV, filter `status = no_match`
+and sort by `similarity` ascending (the stdout list is the same view). For a handful of rows check on
+https://music.youtube.com whether a correct video exists. `reason = duration` with a right-looking video means the
+tolerance is too tight or the Spotify release is a different edit; `reason = title` with a right-looking video means
+the title normalisation misses something (remaster or live suffixes, transliteration); `no_results` means search,
+not scoring, is the problem. Do the `matched` spot-check above. Then write the match rate, the wrong rate, the
+decision and the top failing patterns in #112. Do not commit the CSV.
+
 ## Exit codes
 
 | Code | From | Meaning | `failure_class` |
 |---|---|---|---|
 | 0 | ingest | Everything done; new tracks added, others already present | `none` |
 | 1 | ingest | Some track or playlist failed, or sources/`.env` invalid | `partial` or `config` |
-| 2 | ingest | Bad command-line usage (only when calling ingest directly) | none written |
+| 2 | ingest | Bad command-line usage (only when calling ingest directly), or `followed_artists` is enabled but the Spotify user login is missing or rejected (nothing ran; the result file, if requested, says `config`) | none written, or `config` |
 | 3 | ingest | YouTube asked to sign in; rest of the run skipped | `youtube-sign-in` |
 | 75 | wrapper | Another run holds the lock; nothing ran | not written |
 | 78 | wrapper | A required prerequisite or the venv is missing, or (before the lock) `flock` is missing, the state dir is unusable, neither `HOME` nor `XDG_STATE_HOME` is set, or `cd` to the repo fails; nothing ran. `last-run.json` is written (class `config`) only for failures after the lock is taken (venv, prerequisite check); for the pre-lock failures none is written (flock missing: one ERROR line in the log if the state dir exists, otherwise stderr only) | `config` or not written |
@@ -307,6 +462,102 @@ with `?si=...`. The playlist or album must be public. Private playlists and Like
 invalid line fails the whole run (exit 1, class `config`). URLs are public data; never put secrets in the file.
 Test a new entry with `ingest/.venv/bin/python ingest/ingest.py --sources sources.yml --dry-run`.
 
+## Followed artists (all artists you follow, no playlist)
+
+Added in #121. `sources.yml` can have a `followed_artists:` section. A run then also takes the artists the owner
+follows on Spotify, lists each artist's releases and tracks, removes duplicate recordings across releases
+(single + album + deluxe, `ingest/dedupe.py`) and feeds the result into the same per-track pipeline as a
+playlist. Nothing is created or changed on Spotify: the login scope is `user-follow-read` (read only) and no
+playlist is made anywhere. The D1 schema is unchanged.
+
+**It is off until you add the section.** The repo's `sources.yml` has no such section, so the nightly timer run
+behaves exactly as before until the owner opts in (a file without the section is parsed and run as before).
+
+### Format
+
+The playlist list stays as it is. The section is added next to it. Strict, dependency-free: indentation is exactly
+two spaces for keys and four for the `exclude` items; whole-line `#` comments and blank lines are allowed; no
+inline comments, no other YAML. Unknown or repeated keys, a bad value, a repeated id or a repeated section fail
+the whole run with exit 1 (class `config`) before anything runs.
+
+```yaml
+# (commented example, put it at the end of sources.yml when you opt in)
+# followed_artists:
+#   enabled: true          # false turns the source off without deleting the section; default true
+#   max_artists: 50        # artists started per run, 1..10000; default: no limit
+#   rescan_days: 7         # a fully scanned artist is looked at again after this many days, 0..3650; default 7
+#   groups: album,single   # Spotify release groups: album, single, compilation, appears_on; default album,single
+#   market: US             # ISO 3166-1 alpha-2, upper case; default US
+#   exclude:               # artist ids that are never ingested
+#     - <22-character artist id>
+```
+
+(Remove the leading `# ` of every line of the section to enable it.) The first-run recipe below lists your followed
+artists with their ids: `python ingest/spotify_user.py followed` prints `name<TAB>id`. A file with only the
+section and no playlist is valid; a file with `enabled: false` and no playlist is not (nothing to do).
+Not supported (deliberately, to keep the parser strict and small): exclude by name, a title filter (`skip_titles`),
+other keys.
+
+### What a run does
+
+1. Reads the followed list (read scope, token refreshed from `SPOTIFY_USER_REFRESH_TOKEN`). Repeated artist ids
+   across pages are dropped. Ids on `exclude` are skipped.
+2. Playlists first (if any), then the artists in the order Spotify returns them. An artist scanned to the end
+   less than `rescan_days` ago is skipped without any Spotify call.
+3. Per artist: enumerate releases and tracks (Client Credentials, the same `SPOTIFY_CLIENT_ID/SECRET`), collapse
+   duplicate recordings (earliest release wins; a recording already stored under another release is not
+   downloaded again), then the normal per-track pipeline: already stored tracks are skipped, tracks in cooldown
+   are skipped, the rest are matched, downloaded (paced, with backoff) and stored.
+4. When the artist's last track was handled the day is recorded in the state file (`"artists"` key, ids and
+   dates only). An artist stopped by the cap, the time limit or a sign-in challenge is not recorded: the next run
+   starts there again and adds only what is missing. A track that failed in an otherwise complete scan is
+   retried through its normal cooldown (`--retry-failed-days`) when the artist is rescanned, not by the artist
+   record. An artist whose enumeration fails (Spotify error) is logged (`ERROR artist <name>: enumeration
+   failed`), counted, not recorded (so the next run retries it), the others go on, and the exit code is 1.
+5. Everything from the sections above applies unchanged: `--max-new` (shared with the playlists), `--max-minutes`,
+   cooldowns, pacing and backoff, and the YouTube sign-in stop (the first challenge ends the whole run, exit 3).
+   `max_artists` counts artists started in this run (including one whose enumeration failed), not the skipped
+   ones, so a run with `max_artists: 50` works through the list in batches over several nights.
+
+The log gets one line per artist with counts (`artist <name>: listed N, unique N, dropped N` and the result) and
+one `followed artists: ...` line; `last-run.json` -> `result` gets a `followed_artists` object (status, track
+counts and artist counts `listed, excluded, skipped_recent, deferred, scanned, failed, not_started`) and its
+track counts are part of `counts`. Counts only: no artist id or name is written there.
+
+### First run (owner steps, #111 and #113)
+
+Not run by the author (no network or login was used while building this). Do these on the laptop, in order:
+
+1. Once: `ingest/.venv/bin/python ingest/spotify_user.py login`, open the printed URL, approve (scope
+   `user-follow-read`). The refresh token is stored in `.env` as `SPOTIFY_USER_REFRESH_TOKEN` (valid about 6 months;
+   run `login` again on `invalid_grant`). This is the owner ticket #111.
+2. Optional check: `ingest/.venv/bin/python ingest/spotify_user.py followed` lists the followed artists and the total.
+3. Add the section to `sources.yml` (see above) in a branch/PR with `max_artists` small, e.g. 5, and the ids of
+   artists you do not want in `exclude`.
+4. Dry run, nothing is downloaded or stored and the artist state is not written (it still reads D1, Spotify and
+   YouTube Music, and counts matches against the cap):
+   `ingest/.venv/bin/python ingest/ingest.py --sources sources.yml --dry-run --max-new 20 --state-file /tmp/dry-state.json`
+5. First capped run by hand: `ingest/.venv/bin/python ingest/ingest.py --sources sources.yml --max-new 50 --max-minutes 60`,
+   then read the log and `last-run.json`-style result (`--result-json /tmp/r.json`). Repeat; a re-run adds only new
+   tracks. This is the owner ticket #113.
+
+Without `SPOTIFY_USER_REFRESH_TOKEN` (or with a rejected one) the run does nothing: it logs one `ERROR` line with
+the fix and exits with code 2 (class `config`; before any playlist is run, so fix the login or set
+`enabled: false`). A sources file without the section never needs the login.
+
+### The cap and the 21:10 timer
+
+The wrapper `scripts/run-ingest-local.sh` does not forward ingest options yet, so the timer run has NO cap and no
+time limit: with the section enabled and a big followed list, the first night would try to ingest everything
+(about 5-10 s pause plus the download per track; the unit stops at `TimeoutStartSec=2h`, and a run killed by that
+timeout writes no `last-run.json`). Until the wrapper forwards options, either run the backlog by hand with the
+options above, or set `max_artists` small in `sources.yml` so a night stays short. Progress is kept either way: a
+killed run keeps what the state file and D1 already hold, and the next run continues. Follow-up for the wrapper
+(not done here): let `run-ingest-local.sh` append extra ingest arguments from one environment variable, for
+example `COWLIC_INGEST_ARGS="--max-new 200 --max-minutes 90"` set in the unit with `Environment=`, expanded
+unquoted into the command line, with a test in `scripts/test-run-ingest-local.sh`. With a cap of 200 a night,
+about 2,500 tracks take about 13 nights and 40,000 about 200.
+
 ## Troubleshooting
 
 | Symptom | Likely cause and fix |
@@ -320,4 +571,6 @@ Test a new entry with `ingest/.venv/bin/python ingest/ingest.py --sources source
 | Unit fails immediately with status 203 or 200 | Wrong repo path in `WorkingDirectory` / `ExecStart`; fix both, `daemon-reload` |
 | `ffmpeg` not found only under systemd | The unit's `PATH` lacks its directory; extend the `Environment=PATH=` line |
 | Timer did not run last night | Machine was off or you were logged out; see Persistent and linger above; check `finished_at` in `last-run.json` |
+| Exit 2, log says `SPOTIFY_USER_REFRESH_TOKEN is not set` or `invalid_grant` | `followed_artists` is on but there is no valid Spotify login: `ingest/.venv/bin/python ingest/spotify_user.py login` (once; valid about 6 months), or set `enabled: false` in the section |
+| `ERROR artist <name>: enumeration failed` | Spotify error for that artist (rate limit, 5xx, network); exit 1, the others went on, the artist is retried by the next run |
 | Track skipped as `no_match` or `too_big` | No acceptable YouTube Music match (title and duration within 3 s), or the mp3 exceeds Telegram's 20 MB limit (about 10 minutes at 256k) |

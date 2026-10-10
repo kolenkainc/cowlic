@@ -789,5 +789,641 @@ class ResultJsonTest(unittest.TestCase):
             self.assertFalse(p.exists())
 
 
+class Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+class LimitsTest(unittest.TestCase):
+    """--max-new / --max-minutes: a budget for one run; skipped tracks never use it."""
+
+    def go(self, songs, existing=(), no_match=(), fail_upload=(), state=None, **limit_kw):
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(out):
+            f = Fakes(Path(d), no_match=no_match, fail_upload=fail_upload)
+            limits = ingest.RunLimits(**limit_kw)
+            counts = ingest.run(songs, f.deps(), set(existing), {}, Path(d), False, limits, state)
+        return f, counts, limits, out.getvalue()
+
+    def test_without_limits_nothing_changes(self):
+        f, c, limits, _ = self.go([song(n) for n in range(1, 8)])
+        self.assertEqual(c["new"], 7)
+        self.assertIsNone(limits.stop_reason)
+
+    def test_cap_stops_the_run_and_records_the_rest(self):
+        f, c, limits, _ = self.go([song(n) for n in range(1, 6)], max_new=2)
+        self.assertEqual(f.uploaded, [sid(1), sid(2)])
+        self.assertEqual((limits.stop_reason, limits.attempted, limits.not_attempted), ("cap", 2, 3))
+
+    def test_already_present_tracks_do_not_use_the_cap(self):
+        f, c, limits, _ = self.go([song(n) for n in range(1, 6)], existing=[sid(1), sid(2)], max_new=1)
+        self.assertEqual(f.uploaded, [sid(3)])
+        self.assertEqual((c["exists"], c["new"], limits.stop_reason), (2, 1, "cap"))
+
+    def test_no_match_does_not_use_the_cap_but_failures_do(self):
+        f, c, limits, _ = self.go([song(n) for n in range(1, 5)], no_match=[sid(1)], max_new=1)
+        self.assertEqual((c["no_match"], f.uploaded, limits.stop_reason), (1, [sid(2)], "cap"))
+        f, c, limits, _ = self.go([song(n) for n in range(1, 5)], fail_upload=[sid(1)], max_new=1)
+        self.assertEqual((c["failed"], f.uploaded, limits.stop_reason), (1, [], "cap"))
+
+    def test_a_cap_that_is_not_reached_is_done(self):
+        _, c, limits, _ = self.go([song(1), song(2)], max_new=2)
+        self.assertEqual((c["new"], limits.stop_reason), (2, None))  # exactly the cap, nothing left: done
+
+    def test_time_limit_stops_before_the_next_track(self):
+        clock = Clock()
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(out):
+            f = Fakes(Path(d))
+            deps = f.deps()
+            inner = deps.download
+
+            def slow(s, m, tdir):
+                clock.t += 30  # each download takes 30 s
+                return inner(s, m, tdir)
+
+            deps.download = slow
+            limits = ingest.RunLimits(max_minutes=1, clock=clock)
+            ingest.run([song(n) for n in range(1, 6)], deps, set(), {}, Path(d), False, limits)
+        self.assertEqual(f.uploaded, [sid(1), sid(2)])
+        self.assertEqual((limits.stop_reason, limits.not_attempted), ("time", 3))
+
+    def test_cap_is_shared_by_all_playlists_and_logged(self):
+        songs = {GOOD_URL: [song(1), song(2)], GOOD_URL2: [song(3)]}
+        fetched, out = [], io.StringIO()
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(out):
+            f = Fakes(Path(d))
+            limits = ingest.RunLimits(max_new=2)
+            res = ingest.run_playlists([GOOD_URL, GOOD_URL2], lambda u: fetched.append(u) or songs[u], f.deps(),
+                                       set(), {}, Path(d), False, limits)
+        self.assertEqual((fetched, f.uploaded), ([GOOD_URL], [sid(1), sid(2)]))  # 2nd playlist not even fetched
+        self.assertEqual(list(res), [GOOD_URL])
+        self.assertIn("stopped: cap: --max-new 2 reached (2 attempted)", out.getvalue())
+        self.assertIn("1 playlist(s) not started", out.getvalue())
+        r = ingest.build_result([GOOD_URL, GOOD_URL2], res, None, 0, limits)
+        self.assertEqual([p["status"] for p in r["playlists"]], ["done", "not_attempted"])
+        self.assertEqual(r["stop_reason"], "cap")
+
+    def test_stop_inside_a_playlist_is_reported_as_stopped(self):
+        songs = {GOOD_URL: [song(n) for n in range(1, 5)], GOOD_URL2: [song(9)]}
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(io.StringIO()):
+            f = Fakes(Path(d))
+            limits = ingest.RunLimits(max_new=1)
+            res = ingest.run_playlists([GOOD_URL, GOOD_URL2], lambda u: songs[u], f.deps(), set(), {}, Path(d),
+                                       False, limits)
+        r = ingest.build_result([GOOD_URL, GOOD_URL2], res, None, 0, limits)
+        self.assertEqual([p["status"] for p in r["playlists"]], ["stopped", "not_attempted"])
+        self.assertEqual((r["playlists"][0]["added"], r["playlists"][0]["not_attempted"]), (1, 3))
+        self.assertEqual((r["stop_reason"], r["failure_class"], r["counts"]["not_attempted"]), ("cap", "none", 3))
+        json.dumps(r)
+
+    def test_limit_options_are_validated(self):
+        for bad in ("0", "-1", "x", "1.5", "nan"):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(sys, "argv", ["ingest.py", GOOD_URL, "--max-new", bad]):
+                ingest.main()
+        for bad in ("0", "-1", "inf", "nan"):
+            with self.subTest(minutes=bad), self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(sys, "argv", ["ingest.py", GOOD_URL, "--max-minutes", bad]):
+                ingest.main()
+
+
+class FixedToday:
+    def __init__(self, day="2026-10-10"):
+        self.day = ingest.datetime.date.fromisoformat(day)
+
+    def __call__(self):
+        return self.day
+
+
+class StateTest(unittest.TestCase):
+    """The local state file: cooldown for no_match/failed tracks, atomic, never fatal."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+        self.path = self.dir / "cowlic" / "ingest-state.json"
+        self.today = FixedToday()
+
+    def state(self, **days):
+        return ingest.RunState.load(self.path, days or None, self.today)
+
+    def go(self, songs, state, existing=(), dry=False, limits=None, **kw):
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(out):
+            f = Fakes(Path(d), **kw)
+            counts = ingest.run(songs, f.deps(), set(existing), {}, Path(d), dry, limits, state)
+        return f, counts, out.getvalue()
+
+    def test_missing_file_starts_empty_without_a_warning(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            st = self.state()
+        self.assertEqual((st.entries, out.getvalue()), ({}, ""))
+        self.assertFalse(self.path.exists())  # nothing is written until something is learned
+
+    def test_no_match_and_failed_are_remembered_with_the_default_periods(self):
+        st = self.state()
+        f, c, _ = self.go([song(1), song(2), song(3)], st, no_match=[sid(1)], fail_upload=[sid(2)])
+        self.assertEqual((c["no_match"], c["failed"], c["new"]), (1, 1, 1))
+        data = json.loads(self.path.read_text())
+        self.assertEqual(data["version"], 1)
+        self.assertEqual(data["tracks"], {sid(1): {"status": "no_match", "retry_after": "2026-11-09"},
+                                          sid(2): {"status": "failed", "retry_after": "2026-10-13"}})
+        self.assertEqual(ingest.DEFAULT_RETRY_NO_MATCH_DAYS, 30)
+        self.assertEqual(ingest.DEFAULT_RETRY_FAILED_DAYS, 3)
+
+    def test_periods_are_configurable_and_zero_means_always_retry(self):
+        st = self.state(no_match=5, failed=0)
+        self.go([song(1), song(2)], st, no_match=[sid(1)], fail_upload=[sid(2)])
+        self.assertEqual(json.loads(self.path.read_text())["tracks"],
+                         {sid(1): {"status": "no_match", "retry_after": "2026-10-15"}})
+
+    def test_state_file_holds_ids_and_dates_only(self):
+        self.go([song(1)], self.state(), no_match=[sid(1)])
+        text = self.path.read_text()
+        self.assertNotIn("T1", text)  # no title, album, artist or url
+        self.assertEqual(set(json.loads(text)["tracks"][sid(1)]), {"status", "retry_after"})
+
+    def test_tracks_in_cooldown_are_skipped_and_do_not_use_the_cap(self):
+        st = self.state()
+        self.go([song(1), song(2)], st, no_match=[sid(1)], fail_upload=[sid(2)])
+        limits = ingest.RunLimits(max_new=1)
+        searched = []
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(io.StringIO()) as out:
+            f = Fakes(Path(d))
+            deps = f.deps()
+            deps.find_match = lambda s: searched.append(s["song_id"]) or object()
+            c = ingest.run([song(1), song(2), song(3), song(4)], deps, set(), {}, Path(d), False, limits, st)
+        self.assertEqual(searched, [sid(3)])  # 1 and 2 never searched or downloaded
+        self.assertEqual((c["cooldown"], c["new"], limits.stop_reason, limits.not_attempted), (2, 1, "cap", 1))
+        self.assertIn("skipped (cooldown, retry later): A - T1", out.getvalue())
+        self.assertNotIn(sid(1), out.getvalue())  # ids are not printed
+
+    def test_cooldown_ends_on_the_retry_date_and_success_clears_the_entry(self):
+        st = self.state()
+        self.go([song(1)], st, no_match=[sid(1)])
+        self.today.day = ingest.datetime.date(2026, 11, 8)
+        self.assertTrue(st.in_cooldown(sid(1)))
+        self.today.day = ingest.datetime.date(2026, 11, 9)
+        self.assertFalse(st.in_cooldown(sid(1)))
+        f, c, _ = self.go([song(1)], st)  # retried: now it matches
+        self.assertEqual((c["new"], c["cooldown"], st.entries), (1, 0, {}))
+        self.assertEqual(json.loads(self.path.read_text())["tracks"], {})
+
+    def test_a_track_already_in_the_library_is_not_counted_as_cooldown(self):
+        st = self.state()
+        self.go([song(1)], st, fail_upload=[sid(1)])
+        _, c, _ = self.go([song(1)], st, existing=[sid(1)])
+        self.assertEqual((c["exists"], c["cooldown"], st.entries), (1, 0, {}))
+
+    def test_state_survives_a_restart_and_drops_expired_entries(self):
+        self.go([song(1), song(2)], self.state(), no_match=[sid(1)], fail_upload=[sid(2)])
+        again = self.state()  # a new process reads the file
+        self.assertEqual(set(again.entries), {sid(1), sid(2)})
+        self.today.day = ingest.datetime.date(2026, 10, 14)  # failed (3 days) expired, no_match not
+        later = self.state()
+        self.assertEqual(set(later.entries), {sid(1)})
+
+    def test_dry_run_reads_the_state_but_never_writes_it(self):
+        st = self.state()
+        self.go([song(1)], st, dry=True, no_match=[sid(1)])
+        self.assertFalse(self.path.exists())
+
+    def test_sign_in_challenge_is_not_recorded_as_a_track_failure(self):
+        st = self.state()
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(io.StringIO()):
+            f = Fakes(Path(d))
+            deps = f.deps()
+
+            def blocked(s, m, tdir):
+                raise ingest.YouTubeSignInRequired("x")
+
+            deps.download = blocked
+            with self.assertRaises(ingest.YouTubeSignInRequired):
+                ingest.run([song(1)], deps, set(), {}, Path(d), False, None, st)
+        self.assertEqual(st.entries, {})
+        self.assertFalse(self.path.exists())
+
+    def test_file_is_private_and_atomic(self):
+        self.go([song(1)], self.state(), no_match=[sid(1)])
+        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.path.parent.stat().st_mode), 0o700)
+        self.assertEqual([x.name for x in self.path.parent.iterdir()], [self.path.name])  # no temp file left
+
+    def test_failed_write_keeps_the_previous_file_and_warns_once(self):
+        st = self.state()
+        self.go([song(1)], st, no_match=[sid(1)])
+        before = self.path.read_text()
+        with mock.patch("os.replace", side_effect=OSError("boom")):
+            _, _, out = self.go([song(2), song(3)], st, no_match=[sid(2), sid(3)])
+        self.assertEqual(self.path.read_text(), before)  # old content intact
+        self.assertEqual([x.name for x in self.path.parent.iterdir()], [self.path.name])  # temp file removed
+        self.assertEqual(out.count("WARN could not write the state file"), 1)
+        self.assertTrue(st.in_cooldown(sid(2)))  # still applies to the rest of this run
+
+    def test_write_interrupted_midway_keeps_the_previous_file(self):
+        self.go([song(1)], self.state(), no_match=[sid(1)])
+        before = self.path.read_text()
+        with mock.patch("json.dump", side_effect=RuntimeError("killed")), self.assertRaises(RuntimeError):
+            ingest.atomic_write_json(self.path, {"x": 1})
+        self.assertEqual(self.path.read_text(), before)
+        self.assertEqual([x.name for x in self.path.parent.iterdir()], [self.path.name])
+
+    def test_corrupted_files_start_empty_with_a_warning_and_never_crash(self):
+        self.path.parent.mkdir(parents=True)
+        for name, raw in (("garbage", b"\x00\xff{{{"), ("empty", b""), ("truncated", b'{"version": 1, "tracks": {"'),
+                          ("not an object", b"[1, 2]"), ("wrong version", b'{"version": 2, "tracks": {}}'),
+                          ("tracks not an object", b'{"version": 1, "tracks": []}'), ("deep", b"[" * 100000)):
+            with self.subTest(name):
+                self.path.write_bytes(raw)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    st = self.state()
+                self.assertEqual(st.entries, {})
+                self.assertIn("WARN state file is corrupted", out.getvalue())
+        # the next change replaces the corrupted file with a valid one
+        self.go([song(1)], st, no_match=[sid(1)])
+        self.assertIn(sid(1), json.loads(self.path.read_text())["tracks"])
+
+    def test_malformed_entries_are_ignored_and_good_ones_kept(self):
+        self.path.parent.mkdir(parents=True)
+        good = {"status": "failed", "retry_after": "2026-10-12"}
+        self.path.write_text(json.dumps({"version": 1, "tracks": {
+            sid(1): good, "../x": good, sid(2): {"status": "bogus", "retry_after": "2026-10-12"},
+            sid(3): {"status": "failed", "retry_after": "not a date"}, sid(4): "x", sid(5): {}}}))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            st = self.state()
+        self.assertEqual(set(st.entries), {sid(1)})
+        self.assertIn("ignored 5 malformed entries", out.getvalue())
+
+    def test_unreadable_state_path_is_not_fatal(self):
+        self.path.mkdir(parents=True)  # a directory where the file should be
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            st = self.state()
+        self.assertEqual(st.entries, {})
+        self.assertIn("WARN state file unreadable", out.getvalue())
+
+    def test_default_path_is_next_to_the_log(self):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": "/x/state"}):
+            self.assertEqual(ingest.default_state_path(), Path("/x/state/cowlic/ingest-state.json"))
+        env = {k: v for k, v in os.environ.items() if k != "XDG_STATE_HOME"}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch("os.path.expanduser", return_value="/h"):
+            self.assertEqual(ingest.default_state_path(), Path("/h/.local/state/cowlic/ingest-state.json"))
+
+
+class StopReasonMainTest(unittest.TestCase):
+    """main(): options reach run_playlists, the stop reason lands in the log and in --result-json."""
+
+    def run_main(self, argv, run_playlists):
+        env = {k: "x" for k in ingest.REQUIRED_ENV}
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch("tg_check.load_env"), \
+                mock.patch.object(sys, "argv", ["ingest.py", *argv]), \
+                mock.patch.object(ingest, "d1_query", return_value=[]), \
+                mock.patch.object(ingest, "js_runtime_problem", return_value=None), \
+                mock.patch.object(ingest, "real_deps", return_value=None), \
+                mock.patch.dict(sys.modules, {"ytmusicapi": SimpleNamespace(YTMusic=lambda: None)}), \
+                mock.patch.object(ingest, "run_playlists", run_playlists), \
+                contextlib.redirect_stdout(out):
+            return ingest.main(), out.getvalue()
+
+    OK = {"new": 1, "exists": 0, "no_match": 0, "too_big": 0, "failed": 0}
+
+    def reason(self, run_playlists, extra=()):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "r.json"
+            code, out = self.run_main([GOOD_URL, "--result-json", str(p), "--state-file", str(Path(d) / "s.json"),
+                                       *extra], run_playlists)
+            return code, out, json.loads(p.read_text())
+
+    def test_done(self):
+        code, out, r = self.reason(lambda urls, *a: {u: dict(self.OK) for u in urls})
+        self.assertEqual((code, r["stop_reason"], r["failure_class"]), (0, "done", "none"))
+        self.assertIn("stop reason: done", out)
+
+    def test_options_are_passed_on_and_a_cap_stop_is_reported(self):
+        seen = {}
+
+        def capped(urls, fetch, deps, existing, covers, work, dry, limits, state):
+            seen.update(max_new=limits.max_new, minutes=limits.deadline is not None, state=state.path.name,
+                        days=state.retry_days)
+            limits.stop("cap", 4)
+            limits.stopped_url = urls[0]
+            return {u: dict(self.OK) for u in urls}
+
+        code, out, r = self.reason(capped, ["--max-new", "1", "--max-minutes", "5", "--retry-no-match-days", "9",
+                                            "--retry-failed-days", "1"])
+        self.assertEqual(seen, {"max_new": 1, "minutes": True, "state": "s.json", "days": {"no_match": 9, "failed": 1}})
+        self.assertEqual((code, r["stop_reason"], r["failure_class"]), (0, "cap", "none"))
+        self.assertEqual(r["playlists"][0]["status"], "stopped")
+        self.assertIn("stop reason: cap", out)
+
+    def test_time_stop_with_a_failure_still_exits_1(self):
+        def timed(urls, fetch, deps, existing, covers, work, dry, limits, state):
+            limits.stop("time")
+            return {u: dict(self.OK, failed=1) for u in urls}
+
+        code, out, r = self.reason(timed)
+        self.assertEqual((code, r["stop_reason"], r["failure_class"]), (1, "time", "partial"))
+
+    def test_sign_in(self):
+        def sign_in(urls, *a):
+            e = ingest.YouTubeSignInRequired("x")
+            e.counts, e.results = dict(self.OK), {}
+            raise e
+
+        code, out, r = self.reason(sign_in)
+        self.assertEqual((code, r["stop_reason"]), (3, "sign-in"))
+        self.assertIn("stop reason: sign-in", out)
+
+    def test_nothing_ran_has_no_stop_reason(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "r.json"
+            code, out = self.run_main(["https://example.invalid/x", "--result-json", str(p)], None)
+            self.assertEqual(code, 1)
+            self.assertIsNone(json.loads(p.read_text())["stop_reason"])
+            self.assertNotIn("stop reason", out)
+
+    def test_existing_result_keys_are_unchanged(self):
+        _, _, r = self.reason(lambda urls, *a: {u: dict(self.OK) for u in urls})
+        self.assertLessEqual({"failure_class", "exit_code", "playlists", "counts"}, set(r))
+        self.assertLessEqual({"url", "status", "added", "skipped", "no_match", "too_big", "failed", "not_attempted"},
+                             set(r["playlists"][0]))
+
+    def test_existing_run_has_no_limits_by_default(self):
+        seen = {}
+
+        def look(urls, fetch, deps, existing, covers, work, dry, limits, state):
+            seen.update(max_new=limits.max_new, deadline=limits.deadline)
+            return {u: dict(self.OK) for u in urls}
+
+        self.reason(look)
+        self.assertEqual(seen, {"max_new": None, "deadline": None})
+
+
+class FakeTime:
+    """Fake monotonic clock whose sleep advances it: waits are recorded, never slept."""
+
+    def __init__(self):
+        self.t, self.sleeps = 100.0, []
+
+    def clock(self):
+        return self.t
+
+    def sleep(self, s):
+        self.sleeps.append(s)
+        self.t += s
+
+
+def throttle(ft, **kw):
+    kw = {"pace_seconds": 5, "jitter_seconds": 0, "attempts": 3, "base": 10, "cap": 120, **kw}
+    return ingest.Throttle(sleep=ft.sleep, clock=ft.clock, rng=lambda: 0.5, **kw)
+
+
+def flaky(errors, result="ok"):
+    """Callable raising the given errors one by one, then returning `result`; .calls counts the calls."""
+    def fn():
+        fn.calls += 1
+        if fn.calls <= len(errors):
+            raise errors[fn.calls - 1]
+        return result
+    fn.calls = 0
+    return fn
+
+
+E429 = ingest.IngestError("expected exactly one mp3 after download; yt-dlp error: ERROR: [youtube] x: HTTP Error 429: Too Many Requests")
+
+
+class TransientTest(unittest.TestCase):
+    def test_transient_text(self):
+        for t in ("HTTP Error 429: Too Many Requests", "Server returned HTTP 503: Service Unavailable.",
+                  "http status: 429, code: -1", "HTTP Error 502", "gateway timeout"):
+            with self.subTest(t=t):
+                self.assertTrue(ingest.transient_text(ingest.IngestError(t)))
+        for t in ("HTTP Error 403: Forbidden", "HTTP Error 404", "expected exactly one mp3", "YouTube asks to sign in (bot check)",
+                  "id 4291234", "Telegram API error 429: flood"):
+            with self.subTest(t=t):
+                self.assertFalse(ingest.transient_text(ingest.IngestError(t)))
+
+    def test_search_also_retries_network_errors_but_download_does_not(self):
+        self.assertTrue(ingest.transient_search(ConnectionError("reset")))
+        self.assertFalse(ingest.transient_text(ConnectionError("reset")))
+
+
+class BackoffTest(unittest.TestCase):
+    def test_retries_a_transient_error_with_doubling_waits_then_succeeds(self):
+        ft, fn = FakeTime(), flaky([E429, E429])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(throttle(ft).call(fn, ingest.transient_text, "download"), "ok")
+        self.assertEqual((fn.calls, ft.sleeps), (3, [10, 20]))
+
+    def test_attempts_are_bounded_and_the_last_error_is_raised(self):
+        ft, fn = FakeTime(), flaky([E429] * 9)
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(ingest.IngestError) as cm:
+            throttle(ft).call(fn, ingest.transient_text, "download")
+        self.assertIs(cm.exception, E429)
+        self.assertEqual((fn.calls, ft.sleeps), (3, [10, 20]))
+
+    def test_wait_is_capped(self):
+        ft, fn = FakeTime(), flaky([E429] * 9)
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(ingest.IngestError):
+            throttle(ft, attempts=6, base=50, cap=120).call(fn, ingest.transient_text, "download")
+        self.assertEqual(ft.sleeps, [50, 100, 120, 120, 120])
+
+    def test_a_permanent_error_is_not_retried(self):
+        ft, fn = FakeTime(), flaky([ingest.IngestError("HTTP Error 403: Forbidden")])
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(ingest.IngestError):
+            throttle(ft).call(fn, ingest.transient_text, "download")
+        self.assertEqual((fn.calls, ft.sleeps), (1, []))
+
+    def test_sign_in_challenge_is_never_retried(self):
+        ft, fn = FakeTime(), flaky([ingest.YouTubeSignInRequired("x")])
+        # a predicate that accepts everything must not matter: the challenge is excluded before it is asked
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(ingest.YouTubeSignInRequired):
+            throttle(ft).call(fn, lambda e: True, "download")
+        self.assertEqual((fn.calls, ft.sleeps), (1, []))
+
+    def test_one_attempt_means_no_retry(self):
+        ft, fn = FakeTime(), flaky([E429])
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(ingest.IngestError):
+            throttle(ft, attempts=1).call(fn, ingest.transient_text, "download")
+        self.assertEqual((fn.calls, ft.sleeps), (1, []))
+
+    def test_the_log_line_has_no_error_text(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            throttle(FakeTime()).call(flaky([ingest.IngestError("HTTP Error 429 secret-detail")]),
+                                      ingest.transient_text, "download")
+        self.assertIn("retrying in 10 s", out.getvalue())
+        self.assertNotIn("secret-detail", out.getvalue())
+
+
+class PacingTest(unittest.TestCase):
+    def run_songs(self, ft, songs, existing=(), no_match=(), **kw):
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(out):
+            f = Fakes(Path(d), no_match=no_match)
+            deps = ingest.harden_deps(f.deps(), throttle(ft, **kw))
+            counts = ingest.run(songs, deps, set(existing), {}, Path(d), False)
+        return f, counts
+
+    def test_pause_between_downloads_but_not_before_the_first(self):
+        ft = FakeTime()
+        f, c = self.run_songs(ft, [song(n) for n in range(1, 4)])
+        self.assertEqual((c["new"], ft.sleeps), (3, [5, 5]))
+
+    def test_the_pause_counts_from_the_end_of_the_previous_download(self):
+        ft = FakeTime()
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(io.StringIO()):
+            f = Fakes(Path(d))
+            deps = f.deps()
+            inner = deps.find_match
+
+            def find(s):
+                ft.t += 3  # 3 s of matching work between two downloads
+                return inner(s)
+
+            deps.find_match = find
+            ingest.run([song(1), song(2)], ingest.harden_deps(deps, throttle(ft)), set(), {}, Path(d), False)
+        self.assertEqual(ft.sleeps, [2])  # a 5 s pace minus the 3 s already spent
+
+    def test_skipped_and_unmatched_tracks_are_not_paced(self):
+        ft = FakeTime()
+        f, c = self.run_songs(ft, [song(n) for n in range(1, 6)], existing=[sid(1), sid(2)], no_match=[sid(4)])
+        self.assertEqual((c["new"], c["exists"], c["no_match"]), (2, 2, 1))
+        self.assertEqual(ft.sleeps, [5])  # only between the two downloads
+
+    def test_jitter_is_added_and_deterministic_with_an_injected_rng(self):
+        ft = FakeTime()
+        f, c = self.run_songs(ft, [song(1), song(2)], jitter_seconds=4)  # rng 0.5 -> +2 s
+        self.assertEqual(ft.sleeps, [7])
+
+    def test_pace_zero_never_sleeps(self):
+        ft = FakeTime()
+        f, c = self.run_songs(ft, [song(n) for n in range(1, 4)], pace_seconds=0)
+        self.assertEqual((c["new"], ft.sleeps), (3, []))
+
+    def test_a_download_retries_a_transient_error_and_search_retries_too(self):
+        ft = FakeTime()
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(out):
+            f = Fakes(Path(d))
+            deps = f.deps()
+            dl, find = deps.download, deps.find_match
+            dl_fail, find_fail = flaky([E429]), flaky([ingest.IngestError("Server returned HTTP 503: Service Unavailable.")])
+            deps.download = lambda s, m, t: dl_fail() and dl(s, m, t)
+            deps.find_match = lambda s: find_fail() and find(s)
+            c = ingest.run([song(1)], ingest.harden_deps(deps, throttle(ft)), set(), {}, Path(d), False)
+        self.assertEqual((c["new"], c["failed"], ft.sleeps), (1, 0, [10, 10]))
+
+    def test_no_throttle_means_unchanged_deps(self):
+        deps = Fakes(Path(".")).deps()
+        self.assertIs(ingest.harden_deps(deps, None), deps)
+
+    def test_options_are_validated(self):
+        for opt, bad in (("--pace-seconds", "-1"), ("--pace-seconds", "nan"), ("--pace-seconds", "x"),
+                         ("--pace-jitter-seconds", "inf"), ("--retry-attempts", "0"), ("--retry-attempts", "1.5")):
+            with self.subTest(opt=opt, bad=bad), self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(sys, "argv", ["ingest.py", GOOD_URL, opt, bad]):
+                ingest.main()
+
+    def test_defaults_are_the_documented_ones(self):
+        self.assertEqual((ingest.DEFAULT_PACE_SECONDS, ingest.DEFAULT_PACE_JITTER_SECONDS, ingest.DEFAULT_ATTEMPTS,
+                          ingest.BACKOFF_BASE_SECONDS, ingest.BACKOFF_CAP_SECONDS), (5.0, 5.0, 3, 10.0, 120.0))
+        t = ingest.Throttle()
+        self.assertEqual((t.pace, t.jitter, t.attempts), (5.0, 5.0, 3))
+
+
+class SignInStopsArtistStyleRunTest(unittest.TestCase):
+    """#66 holds for a long multi-source run with a cap and a state file (the shape of the artist run in #121): the
+    FIRST sign-in challenge ends the whole run, exit code 3, no retry, no backoff wait, no cap used afterwards,
+    and what was learned before it stays in the state file."""
+
+    A1, A2 = "https://open.spotify.com/playlist/" + "a" * 22, GOOD_URL2
+
+    def run_it(self, challenge_on, extra=()):
+        ft_sleeps, fetched, downloads = [], [], []
+        songs = {self.A1: [song(n) for n in range(1, 7)], self.A2: [song(n) for n in range(7, 9)]}
+        bad_dl = {sid(2)}                    # an ordinary failure BEFORE the challenge: recorded, run goes on
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        dpath = Path(d)
+        f = Fakes(dpath)
+
+        def fake_spotdl(args, cwd):
+            fetched.append(args[1])
+            Path(args[args.index("--save-file") + 1]).write_text(json.dumps(songs[args[1]]))
+            return [], ""
+
+        def real_deps(ytm, thr):
+            deps = f.deps()
+            inner = deps.download
+
+            def download(s, m, t):
+                downloads.append(s["song_id"])
+                if s["song_id"] == sid(challenge_on):
+                    raise ingest.YouTubeSignInRequired("YouTube asks to sign in (bot check)")
+                if s["song_id"] in bad_dl:
+                    raise ingest.IngestError("expected exactly one mp3 after download")
+                return inner(s, m, t)
+
+            deps.download = download
+            return ingest.harden_deps(deps, thr)
+
+        env = {k: "x" for k in ingest.REQUIRED_ENV}
+        out = io.StringIO()
+        res, st = dpath / "r.json", dpath / "state.json"
+        argv = ["ingest.py", "--sources", str(dpath / "s.yml"), "--result-json", str(res), "--state-file", str(st),
+                "--max-new", "5", *extra]
+        (dpath / "s.yml").write_text(f"- {self.A1}\n- {self.A2}\n")
+        with mock.patch.dict(os.environ, env), mock.patch("tg_check.load_env"), mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(ingest, "d1_query", return_value=[]), \
+                mock.patch.object(ingest, "js_runtime_problem", return_value=None), \
+                mock.patch.object(ingest, "spotdl_run", fake_spotdl), \
+                mock.patch.object(ingest, "real_deps", real_deps), \
+                mock.patch.object(ingest.time, "sleep", ft_sleeps.append), \
+                mock.patch.dict(sys.modules, {"ytmusicapi": SimpleNamespace(YTMusic=lambda: None)}), \
+                contextlib.redirect_stdout(out):
+            code = ingest.main()
+        return code, out.getvalue(), json.loads(res.read_text()), json.loads(st.read_text()), downloads, fetched, ft_sleeps
+
+    def test_first_challenge_stops_everything(self):
+        code, out, r, state, downloads, fetched, sleeps = self.run_it(challenge_on=3, extra=["--pace-seconds", "0",
+                                                                                            "--pace-jitter-seconds", "0"])
+        self.assertEqual(code, ingest.EXIT_YOUTUBE_SIGN_IN)
+        self.assertEqual(downloads, [sid(1), sid(2), sid(3)])  # challenged track tried once; 4, 5, 6 never
+        self.assertEqual(fetched, [self.A1])                    # the second source is not even fetched
+        self.assertEqual(sleeps, [])                            # no backoff wait for the challenge
+        self.assertEqual((r["failure_class"], r["exit_code"], r["stop_reason"]), ("youtube-sign-in", 3, "sign-in"))
+        self.assertEqual([p["status"] for p in r["playlists"]], ["interrupted", "not_attempted"])
+        # the cap (5) was not consumed by the challenge or by anything after it: 1 new + 1 failed counted before it
+        self.assertEqual((r["counts"]["added"], r["counts"]["failed"]), (1, 1))
+        # progress kept: the ordinary failure is in the state file, the challenged track is not
+        self.assertEqual(list(state["tracks"]), [sid(2)])
+        self.assertIn("stop reason: sign-in", out)
+
+    def test_a_challenge_on_a_later_track_with_pacing_on_still_stops_without_extra_waits(self):
+        code, out, r, state, downloads, fetched, sleeps = self.run_it(challenge_on=3, extra=["--pace-seconds", "5",
+                                                                                            "--pace-jitter-seconds", "0"])
+        self.assertEqual((code, downloads), (3, [sid(1), sid(2), sid(3)]))
+        # only the two pace pauses (before download 2 and 3, at most 5 s each); no backoff wait (10 s) and no
+        # pause after the challenge. time.sleep is mocked, so nothing really sleeps.
+        self.assertEqual(len(sleeps), 2)
+        self.assertTrue(all(0 < s <= 5 for s in sleeps), sleeps)
+
+    def test_without_a_challenge_the_same_run_goes_on(self):
+        code, out, r, state, downloads, fetched, sleeps = self.run_it(challenge_on=99, extra=["--pace-seconds", "0",
+                                                                                             "--pace-jitter-seconds", "0"])
+        self.assertEqual(downloads[:2], [sid(1), sid(2)])
+        self.assertEqual((r["stop_reason"], r["counts"]["added"]), ("cap", 4))  # the cap of 5 attempts ends it
+
+
 if __name__ == "__main__":
     unittest.main()

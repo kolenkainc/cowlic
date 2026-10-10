@@ -518,6 +518,201 @@ class Login(unittest.TestCase):
         self.assertIn("invalid_grant", str(err))
 
 
+def aid(n: int) -> str:
+    return f"id{n:05d}"
+
+
+def page(ids, after=None, total=None):
+    body = {"artists": {"items": [{"id": aid(i), "name": f"Artist {i}", "type": "artist"} for i in ids],
+                        "total": total if total is not None else len(ids), "cursors": {"after": after},
+                        "limit": 50, "href": "x"}}
+    return 200, body, {"retry-after": ""}
+
+
+class FakeGet:
+    """Serves the queued (status, body, headers) tuples in order and records every call."""
+    def __init__(self, *responses):
+        self.responses, self.calls = list(responses), []
+
+    def __call__(self, url, headers, timeout):
+        self.calls.append((url, dict(headers), timeout))
+        return self.responses.pop(0)
+
+
+class Followed(unittest.TestCase):
+    def query(self, url):
+        u = urllib.parse.urlsplit(url)
+        self.assertEqual((u.scheme, u.netloc, u.path), ("https", "api.spotify.com", "/v1/me/following"))
+        return {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+
+    def test_paging_follows_the_cursor_and_stops_at_the_end(self):
+        get = FakeGet(page(range(1, 51), after=aid(50), total=120), page(range(51, 101), after=aid(100), total=120),
+                      page(range(101, 121), after=None, total=120))
+        artists, total = su.fetch_followed(CANARY_ACCESS, get, sleep=lambda s: self.fail("no sleep"))
+        self.assertEqual(total, 120)
+        self.assertEqual([a["id"] for a in artists], [aid(i) for i in range(1, 121)])
+        self.assertEqual(artists[0], {"id": aid(1), "name": "Artist 1"})
+        qs = [self.query(c[0]) for c in get.calls]
+        self.assertEqual(qs, [{"type": "artist", "limit": "50"},
+                              {"type": "artist", "limit": "50", "after": aid(50)},
+                              {"type": "artist", "limit": "50", "after": aid(100)}])
+        for _, headers, timeout in get.calls:
+            self.assertEqual(headers["Authorization"], f"Bearer {CANARY_ACCESS}")
+            self.assertLessEqual(timeout, 30)
+
+    def test_empty_list(self):
+        get = FakeGet(page([], after=None, total=0))
+        self.assertEqual(su.fetch_followed(CANARY_ACCESS, get), ([], 0))
+        self.assertEqual(len(get.calls), 1)
+
+    def test_followed_artists_returns_the_list(self):
+        self.assertEqual(su.followed_artists(CANARY_ACCESS, FakeGet(page([1, 2], total=2))),
+                         [{"id": aid(1), "name": "Artist 1"}, {"id": aid(2), "name": "Artist 2"}])
+
+    def test_429_then_success_waits_retry_after(self):
+        slept = []
+        get = FakeGet((429, {}, {"retry-after": "7"}), page([1], total=1))
+        self.assertEqual(su.fetch_followed(CANARY_ACCESS, get, sleep=slept.append)[1], 1)
+        self.assertEqual(slept, [7])
+        self.assertEqual(len(get.calls), 2)
+        self.assertEqual(get.calls[0][0], get.calls[1][0])
+
+    def test_429_is_bounded(self):
+        slept = []
+        get = FakeGet(*[(429, {}, {"retry-after": "2"})] * 10)
+        with self.assertRaisesRegex(su.UserAuthError, "429"):
+            su.fetch_followed(CANARY_ACCESS, get, sleep=slept.append)
+        self.assertEqual(len(get.calls), su.MAX_ATTEMPTS)
+        self.assertEqual(slept, [2] * (su.MAX_ATTEMPTS - 1))
+
+    def test_429_long_or_bad_retry_after(self):
+        get = FakeGet((429, {}, {"retry-after": "3600"}))
+        with self.assertRaisesRegex(su.UserAuthError, "429"):
+            su.fetch_followed(CANARY_ACCESS, get, sleep=lambda s: self.fail("must not wait"))
+        self.assertEqual(len(get.calls), 1)
+        for bad in ["", "abc", "-1", "1.5", "9" * 40]:
+            slept = []
+            get = FakeGet((429, {}, {"retry-after": bad}), page([1]))
+            su.fetch_followed(CANARY_ACCESS, get, sleep=slept.append)
+            self.assertEqual(slept, [su.DEFAULT_RETRY_WAIT], bad)
+
+    def test_403_message_is_actionable(self):
+        with self.assertRaises(su.UserAuthError) as cm:
+            su.fetch_followed(CANARY_ACCESS, FakeGet((403, {"error": {"message": CANARY_ACCESS}}, {})))
+        msg = str(cm.exception)
+        for word in ("403", "Development Mode", "User Management", "Premium"):
+            self.assertIn(word, msg)
+        self.assertNotIn(CANARY_ACCESS, msg)
+
+    def test_401_says_log_in_again(self):
+        with self.assertRaisesRegex(su.UserAuthError, "401.*login"):
+            su.fetch_followed(CANARY_ACCESS, FakeGet((401, {}, {})))
+
+    def test_other_errors_are_redacted_and_carry_no_body(self):
+        for status in (400, 500, 502):
+            body = {"error": {"status": status, "message": f"boom {CANARY_ACCESS}"}}
+            with self.subTest(status=status), self.assertRaises(su.UserAuthError) as cm:
+                su.fetch_followed(CANARY_ACCESS, FakeGet((status, body, {})))
+            self.assertIn(str(status), str(cm.exception))
+            self.assertNotIn(CANARY_ACCESS, str(cm.exception))
+
+    def test_malformed_responses(self):
+        bad = [{}, {"artists": []}, {"artists": {"items": "x"}},
+               {"artists": {"items": [{"id": "a b", "name": "n"}]}},
+               {"artists": {"items": [{"id": aid(1)}]}}, {"artists": {"items": ["x"]}}]
+        for body in bad:
+            with self.subTest(body=body), self.assertRaises(su.UserAuthError):
+                su.fetch_followed(CANARY_ACCESS, FakeGet((200, body, {})))
+
+    def test_cursor_that_does_not_advance_or_is_unsafe_fails(self):
+        for first, second in [(aid(1), aid(1)), ("a&limit=1", None)]:
+            get = FakeGet(page([1], after=first), page([2], after=second))
+            with self.subTest(first=first), self.assertRaisesRegex(su.UserAuthError, "cursor"):
+                su.fetch_followed(CANARY_ACCESS, get)
+        get = FakeGet(*[page([1], after=aid(i)) for i in range(1, 400)])
+        with self.assertRaisesRegex(su.UserAuthError, "pages"):
+            su.fetch_followed(CANARY_ACCESS, get)
+        self.assertEqual(len(get.calls), su.MAX_PAGES)
+
+    def test_network_error_has_no_details(self):
+        with mock.patch.object(su.urllib.request.OpenerDirector, "open",
+                               side_effect=urllib.error.URLError("dns " + CANARY_ACCESS)):
+            with self.assertRaises(su.UserAuthError) as cm:
+                su.default_get(su.API_BASE + "/x", {"Authorization": "Bearer " + CANARY_ACCESS}, 1)
+        self.assertNotIn(CANARY_ACCESS, str(cm.exception))
+
+    def test_default_get_does_not_follow_redirects(self):
+        req = urllib.request.Request("https://api.spotify.com/x", headers={"Authorization": "Bearer t"})
+        self.assertIsNone(su._NoRedirect().redirect_request(req, None, 302, "Found", {}, "https://evil.example/"))
+
+    def run_followed(self, get, token_side_effect=None):
+        lines, out_err, logs = [], io.StringIO(), io.StringIO()
+        handler = logging.StreamHandler(logs)
+        logging.getLogger().addHandler(handler)
+        self.addCleanup(logging.getLogger().removeHandler, handler)
+        patch = mock.patch.object(su, "get_access_token", side_effect=token_side_effect) if token_side_effect \
+            else mock.patch.object(su, "get_access_token", return_value=CANARY_ACCESS)
+        err = None
+        with contextlib.redirect_stdout(out_err), contextlib.redirect_stderr(out_err), patch:
+            try:
+                su.followed(get, sleep=lambda s: None, out=lines.append)
+            except su.UserAuthError as e:
+                err = e
+        return lines, out_err.getvalue() + logs.getvalue(), err
+
+    def test_command_prints_name_id_and_total_only(self):
+        get = FakeGet(page([1, 2], after=aid(2), total=3), page([3], total=3))
+        lines, other, err = self.run_followed(get)
+        self.assertIsNone(err)
+        self.assertEqual(lines, [f"Artist 1\t{aid(1)}", f"Artist 2\t{aid(2)}", f"Artist 3\t{aid(3)}", "total: 3"])
+        self.assertEqual(other, "")
+        self.assertNotIn(CANARY_ACCESS, "\n".join(lines))
+
+    def test_command_prints_nothing_on_a_partial_failure(self):
+        lines, _, err = self.run_followed(FakeGet(page([1], after=aid(1), total=2), (500, {}, {})))
+        self.assertIsNotNone(err)
+        self.assertEqual(lines, [])
+
+    def test_command_neutralises_control_characters_in_names(self):
+        body = (200, {"artists": {"items": [{"id": aid(1), "name": "A\x1b[31m\nB"}], "total": 1}}, {})
+        lines, _, _ = self.run_followed(FakeGet(body))
+        self.assertEqual(lines[0], f"A?[31m?B\t{aid(1)}")
+
+    def test_command_surfaces_invalid_grant_from_the_token_helper(self):
+        real = su.get_access_token
+
+        def boom():
+            return real(FakePost(400, {"error": "invalid_grant"}), Path("/nonexistent/.env"))
+        with mock.patch.dict(os.environ, {"SPOTIFY_CLIENT_ID": "cid", KEY: CANARY_REFRESH}), \
+                mock.patch.object(su.tg_check, "load_env"):
+            get = FakeGet()
+            _, _, err = self.run_followed(get, token_side_effect=boom)
+        self.assertRegex(str(err), "invalid_grant.*login")
+        self.assertEqual(get.calls, [])
+
+    def test_command_never_logs_in_or_stores(self):
+        with mock.patch.object(su, "login") as lg, mock.patch.object(su, "store_refresh_token") as st:
+            self.run_followed(FakeGet(page([1])))
+        lg.assert_not_called()
+        st.assert_not_called()
+
+    def test_main_dispatch(self):
+        for cmd, called in (("followed", "followed"), ("login", "login")):
+            with mock.patch.object(su.sys, "argv", ["x", cmd]), mock.patch.object(su.tg_check, "load_env"), \
+                    mock.patch.object(su, "followed") as f, mock.patch.object(su, "login") as lg:
+                su.main()
+            self.assertEqual((f.called, lg.called), (called == "followed", called == "login"))
+        with mock.patch.object(su.sys, "argv", ["x", "bogus"]), self.assertRaises(SystemExit):
+            su.main()
+
+    def test_main_exits_non_zero_with_a_redacted_message(self):
+        with mock.patch.object(su.sys, "argv", ["x", "followed"]), mock.patch.object(su.tg_check, "load_env"), \
+                mock.patch.object(su, "followed", side_effect=su.UserAuthError("nope")):
+            with self.assertRaises(SystemExit) as cm:
+                su.main()
+        self.assertEqual(cm.exception.code, "ERROR nope")
+
+
 class Integration(unittest.TestCase):
     def test_required_env_does_not_include_the_refresh_key(self):
         self.assertNotIn(KEY, ingest.REQUIRED_ENV)

@@ -2,6 +2,7 @@
 
 Usage:
   python ingest/spotify_user.py login
+  python ingest/spotify_user.py followed   # read-only: prints "name<TAB>spotify id" per followed artist, then the total
 
 `login` prints an authorization URL; open it in a browser, approve, and the redirect lands on a one-shot listener
 on 127.0.0.1:8888. The refresh token is stored as the single key SPOTIFY_USER_REFRESH_TOKEN in the local .env.
@@ -15,6 +16,7 @@ Spotify docs relied on (read 2026-10-10):
 """
 import base64
 import hashlib
+import http.client
 import hmac
 import json
 import os
@@ -54,9 +56,19 @@ ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 # sanitised (a space, quote, '#', newline or non-ASCII byte could change how parse_env reads the line).
 _TOKEN_OK = re.compile(r"[A-Za-z0-9._~+/=-]{1,2048}")
 _ERROR_CODE = re.compile(r"[a-z_]{1,40}")
+_SPOTIFY_ID = re.compile(r"[A-Za-z0-9]{1,64}")  # base62; also the allowlist for the `after` cursor we send back
+
+API_BASE = "https://api.spotify.com/v1"
+PAGE_SIZE = 50  # the maximum for GET /me/following
+MAX_PAGES = 200  # 10000 artists; a guard against a cursor that never ends
+MAX_ATTEMPTS = 3  # requests per page when Spotify answers 429
+RETRY_AFTER_MAX = 30  # seconds; a longer Retry-After is reported instead of waited for
+DEFAULT_RETRY_WAIT = 5  # seconds, when a 429 carries no usable Retry-After
 
 # (url, form fields, timeout) -> (HTTP status, parsed JSON object). Injected in tests.
 HttpPost = Callable[[str, dict, float], tuple[int, dict]]
+# (url, headers, timeout) -> (HTTP status, parsed JSON object, {"retry-after": value or ""}). Injected in tests.
+HttpGet = Callable[[str, dict, float], tuple[int, dict, dict]]
 
 
 class UserAuthError(Exception):
@@ -196,7 +208,7 @@ def default_post(url: str, form: dict, timeout: float) -> tuple[int, dict]:
             status, raw = r.status, r.read()
     except urllib.error.HTTPError as e:
         status, raw = e.code, e.read()
-    except (urllib.error.URLError, OSError) as e:  # includes timeouts; the class name only, no request details
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as e:  # includes timeouts; the class name only, no request details
         raise UserAuthError(f"network error talking to Spotify ({type(e).__name__})") from None
     try:
         body = json.loads(raw)
@@ -315,12 +327,118 @@ def get_access_token(post: HttpPost = default_post, env_path: Path = ENV_PATH) -
     return access
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):  # never follow: the Authorization header must not leave the API
+        return None
+
+
+def default_get(url: str, headers: dict, timeout: float) -> tuple[int, dict, dict]:
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as r:
+            status, raw, hdrs = r.status, r.read(), r.headers
+    except urllib.error.HTTPError as e:
+        status, raw, hdrs = e.code, e.read(), e.headers
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as e:  # includes timeouts; the class name only, no request details
+        raise UserAuthError(f"network error talking to Spotify ({type(e).__name__})") from None
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        body = {}
+    return status, body if isinstance(body, dict) else {}, {"retry-after": hdrs.get("Retry-After", "")}
+
+
+def _clean(text: str) -> str:
+    """Printable form of an API string: control characters (terminal escapes, newlines) become '?'."""
+    return "".join(c if c.isprintable() else "?" for c in text)
+
+
+def _get_page(get: HttpGet, sleep: Callable[[float], None], url: str, token: str) -> dict:
+    """GET one page with the bearer token. 429 waits Retry-After (at most RETRY_AFTER_MAX s) and retries, up to
+    MAX_ATTEMPTS requests in all; every other non-200 raises with a short, fixed message."""
+    secret_values = [token]
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        status, body, hdrs = get(url, {"Authorization": f"Bearer {token}", "Accept": "application/json"}, HTTP_TIMEOUT)
+        if status == 200:
+            return body
+        if status == 429:
+            ra = hdrs.get("retry-after", "")
+            wait = int(ra) if ra.isascii() and ra.isdigit() and len(ra) <= 6 else DEFAULT_RETRY_WAIT
+            if wait > RETRY_AFTER_MAX:
+                raise _fail(f"Spotify rate limit (HTTP 429): asked to wait {wait} s, longer than the {RETRY_AFTER_MAX} s "
+                            f"limit; try again later", secret_values)
+            if attempt == MAX_ATTEMPTS:
+                raise _fail(f"Spotify rate limit (HTTP 429) still active after {MAX_ATTEMPTS} attempts; try again "
+                            f"later", secret_values)
+            sleep(wait)
+            continue
+        if status == 401:
+            raise _fail(f"Spotify rejected the access token (HTTP 401); {RELOGIN}", secret_values)
+        if status == 403:
+            raise _fail("Spotify refused the request (HTTP 403). Likely causes: the app is in Development Mode and "
+                        "this Spotify account is not added under User Management in the developer dashboard, the app "
+                        "owner has no active Premium subscription, or the login did not grant user-follow-read "
+                        f"({RELOGIN} if the scope changed)", secret_values)
+        raise _fail(f"Spotify API error: HTTP {status}", secret_values)
+    raise AssertionError("unreachable")
+
+
+def fetch_followed(token: str, get: HttpGet = default_get,
+                   sleep: Callable[[float], None] = time.sleep) -> tuple[list[dict], int]:
+    """All followed artists as ({"id", "name"}, ...) in API order, plus Spotify's `total`. Pages of 50 by the
+    `after` cursor (the last artist id). Raises UserAuthError; nothing is returned for a partial result."""
+    artists: list[dict] = []
+    total = None
+    after = None
+    for _ in range(MAX_PAGES):
+        q = {"type": "artist", "limit": PAGE_SIZE}
+        if after is not None:
+            q["after"] = after
+        page = _get_page(get, sleep, f"{API_BASE}/me/following?{urllib.parse.urlencode(q)}", token)
+        block = page.get("artists")
+        items = block.get("items") if isinstance(block, dict) else None
+        if not isinstance(items, list):
+            raise _fail("unexpected response from Spotify: no artists list", [token])
+        for it in items:
+            if not isinstance(it, dict) or not isinstance(it.get("id"), str) or not isinstance(it.get("name"), str) \
+                    or not _SPOTIFY_ID.fullmatch(it["id"]):
+                raise _fail("unexpected response from Spotify: malformed artist entry", [token])
+            artists.append({"id": it["id"], "name": it["name"]})
+        if isinstance(block.get("total"), int) and not isinstance(block.get("total"), bool):
+            total = block["total"]
+        cursors = block.get("cursors")
+        nxt = cursors.get("after") if isinstance(cursors, dict) else None
+        if not items or not isinstance(nxt, str) or not nxt:
+            return artists, total if total is not None else len(artists)
+        if nxt == after or not _SPOTIFY_ID.fullmatch(nxt):
+            raise _fail("unexpected response from Spotify: the paging cursor is not usable", [token])
+        after = nxt
+    raise _fail(f"stopped after {MAX_PAGES} pages: more followed artists than expected", [token])
+
+
+def followed_artists(token: str, get: HttpGet = default_get,
+                     sleep: Callable[[float], None] = time.sleep) -> list[dict]:
+    """The list for other tools (e.g. #121): [{"id", "name"}, ...]. `token` from get_access_token()."""
+    return fetch_followed(token, get, sleep)[0]
+
+
+def followed(get: HttpGet = default_get, sleep: Callable[[float], None] = time.sleep,
+             out: Callable[[str], None] = print) -> None:
+    """Print one `name<TAB>id` line per followed artist, then `total: N`. Output only after every page succeeded."""
+    token = get_access_token()
+    artists, total = fetch_followed(token, get, sleep)
+    for a in artists:
+        out(f"{_clean(a['name'])}\t{a['id']}")
+    out(f"total: {total}")
+
+
 def main() -> None:
-    if sys.argv[1:] != ["login"]:
+    cmd = sys.argv[1:]
+    if cmd not in (["login"], ["followed"]):
         sys.exit(__doc__)
     try:
         tg_check.load_env()
-        login()
+        login() if cmd == ["login"] else followed()
     except (UserAuthError, tg_check.EnvSyntaxError) as e:
         sys.exit(f"ERROR {e}")
 
