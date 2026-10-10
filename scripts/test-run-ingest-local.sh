@@ -34,6 +34,21 @@ SH
   cat > "$R/ingest/.venv/bin/python" <<'PY'
 #!/bin/sh
 [ "${1:-}" != -I ] || exec python3 "$@"  # the wrapper validates the result JSON with `python -I -c ...`
+case "${1:-}" in
+  */ship_grafana.py)  # the Grafana shipper: records its call, then behaves as STUB_SHIP says
+    echo "$@" > "$STUB_SHIP_ARGS_FILE"
+    cp "$STUB_LAST_RUN_FILE" "$STUB_SHIP_ARGS_FILE.lastrun" 2>/dev/null || echo missing > "$STUB_SHIP_ARGS_FILE.lastrun"
+    if [ -e /proc/self/fd/9 ]; then echo leaked > "$STUB_SHIP_ARGS_FILE.fd9"; fi
+    case "${STUB_SHIP:-ok}" in
+      ok) echo "grafana: loki push ok (HTTP 204)"; exit 0 ;;
+      fail) echo "grafana: boom"; exit 1 ;;
+      kill) kill -9 $$ ;;
+      hang) sleep 300; exit 0 ;;
+      noisy) printf 'grafana: SECRET$(touch %s/pwned)`x` \033[31m%0300d\nsecond line\n' "$STUB_SHIP_ARGS_FILE.d" 0; exit 0 ;;
+      silent) exit 0 ;;
+      exit0-stderr) echo "Traceback: token=SENTINEL_SHIP_STDERR" >&2; exit 0 ;;
+    esac ;;
+esac
 echo "$@" > "$STUB_ARGS_FILE"
 if [ -e /proc/self/fd/9 ]; then echo leaked > "$STUB_ARGS_FILE.fd9"; fi
 echo "stub ingest output"
@@ -47,7 +62,8 @@ done
 exit "${STUB_RC:-0}"
 PY
   chmod +x "$R/scripts/"*.sh "$R/ingest/.venv/bin/python"
-  export STUB_ARGS_FILE="$C/args"
+  export STUB_ARGS_FILE="$C/args" STUB_SHIP_ARGS_FILE="$C/ship_args" STUB_LAST_RUN_FILE="$S/cowlic/last-run.json"
+  : > "$R/ingest/ship_grafana.py"  # the wrapper only checks that it exists; the stub python plays it
 }
 run() { # runs the wrapper, output to $C/out, sets rc
   rc=0; XDG_STATE_HOME="$S" bash "$R/scripts/run-ingest-local.sh" > "$C/out" 2>&1 || rc=$?
@@ -204,6 +220,67 @@ wait "$bg" || true
 unset STUB_SLEEP
 assert "last-run: replaced by the run that held the lock" "$(valid_json && [ "$(jget exit_code)" = 0 ] && echo 0 || echo 1)"
 unset STUB_RESULT
+
+# 9. Grafana shipping: best effort, never changes the exit code or last-run.json, never hangs the run
+STUB_RC=0; STUB_RESULT=""; export STUB_RC STUB_RESULT
+new_case ship_ok; mkdir -p "$S/cowlic"; printf 'earlier run line\nsecond earlier line\n' > "$(LOGF)"; pre_size="$(wc -c < "$(LOGF)")"
+export STUB_SHIP=ok; run
+assert "ship: shipper called with log, offset, last-run, started-at" "$(grep -q -- "ship_grafana.py --log $(LOGF) --offset $pre_size --last-run $(LASTF) --started-at 20" "$STUB_SHIP_ARGS_FILE" && echo 0 || echo 1)"
+assert "ship: offset is the log size before the run" "$([ "$pre_size" -gt 0 ] && echo 0 || echo 1)"
+assert "ship: last-run.json already written when the shipper runs" "$(python3 -I -c 'import json,sys; json.load(open(sys.argv[1]))' "$STUB_SHIP_ARGS_FILE.lastrun" && echo 0 || echo 1)"
+assert "ship: lock fd not inherited by the shipper" "$([ ! -e "$STUB_SHIP_ARGS_FILE.fd9" ] && echo 0 || echo 1)"
+assert "ship: its one status line is logged" "$(grep -q 'run-ingest-local: grafana: loki push ok (HTTP 204)' "$(LOGF)" && echo 0 || echo 1)"
+assert "ship: exit 0 unchanged" "$([ "$rc" = 0 ] && echo 0 || echo 1)"
+new_case ship_first; export STUB_SHIP=ok; run  # no log yet: offset 0
+assert "ship: first run has offset 0" "$(grep -q -- '--offset 0 ' "$STUB_SHIP_ARGS_FILE" && echo 0 || echo 1)"
+assert "ship: no error output for a missing log" "$(grep -q 'No such file' "$C/out" && echo 1 || echo 0)"
+
+for mode in ok fail kill silent noisy exit0-stderr; do
+  for code in 0 1 3; do
+    new_case "ship_${mode}_$code"; STUB_RC=$code; STUB_SHIP=$mode; export STUB_RC STUB_SHIP
+    [ "$code" = 0 ] || STUB_RESULT="$(res_with partial)"; export STUB_RESULT; run; STUB_RESULT=""
+    assert "ship $mode: exit code $code unchanged" "$([ "$rc" = "$code" ] && echo 0 || echo 1)"
+    assert "ship $mode: last-run.json valid with exit_code $code" "$(valid_json && [ "$(jget exit_code)" = "$code" ] && echo 0 || echo 1)"
+    assert "ship $mode: lock released" "$(flock -n "$S/cowlic/ingest.lock" true && echo 0 || echo 1)"
+  done
+done
+new_case ship_fail_log; STUB_RC=0 STUB_SHIP=fail; export STUB_RC STUB_SHIP; run
+assert "ship fail: one WARN line, stub output not logged" "$(grep -q 'WARN grafana shipping failed' "$(LOGF)" && ! grep -q 'grafana: boom' "$(LOGF)" && echo 0 || echo 1)"
+new_case ship_kill_log; STUB_SHIP=kill; export STUB_SHIP; run
+assert "ship killed by a signal: WARN line, exit 0" "$([ "$rc" = 0 ] && grep -q 'WARN grafana shipping' "$(LOGF)" && echo 0 || echo 1)"
+new_case ship_noisy; STUB_SHIP=noisy; export STUB_SHIP; run
+assert "ship noisy: only a sanitized first line is logged" "$(grep -q 'run-ingest-local: grafana: SECRET' "$(LOGF)" && ! grep -q 'second line' "$(LOGF)" && ! grep -q "$(printf '\033')" "$(LOGF)" && ! grep -q '\$(' "$(LOGF)" && ! grep -q '`' "$(LOGF)" && echo 0 || echo 1)"
+assert "ship noisy: nothing executed from its output" "$([ ! -e "$STUB_SHIP_ARGS_FILE.d/pwned" ] && echo 0 || echo 1)"
+assert "ship noisy: logged line is bounded" "$([ "$(grep 'grafana: SECRET' "$(LOGF)" | head -1 | wc -c)" -lt 300 ] && echo 0 || echo 1)"
+new_case ship_stderr; STUB_SHIP=exit0-stderr; export STUB_SHIP; run
+assert "ship: its stderr is dropped" "$(grep -rq SENTINEL_SHIP_STDERR "$C/out" "$(LOGF)" && echo 1 || echo 0)"
+new_case ship_silent; STUB_SHIP=silent; export STUB_SHIP; run
+assert "ship silent: no extra line, exit 0" "$([ "$rc" = 0 ] && ! grep -q 'run-ingest-local: grafana' "$(LOGF)" && echo 0 || echo 1)"
+
+# a hanging shipper is killed by the timeout and the run still ends with the ingest exit code
+new_case ship_hang; STUB_RC=1; STUB_SHIP=hang; STUB_RESULT="$(res_with partial)"; export STUB_RC STUB_SHIP STUB_RESULT
+run_start=$SECONDS; export COWLIC_SHIP_TIMEOUT=2; run; elapsed=$((SECONDS - run_start)); unset COWLIC_SHIP_TIMEOUT
+assert "ship hang: killed by timeout, run ends within seconds" "$([ "$elapsed" -lt 20 ] && echo 0 || echo 1)"
+assert "ship hang: ingest exit code 1 unchanged" "$([ "$rc" = 1 ] && echo 0 || echo 1)"
+assert "ship hang: timed out line logged" "$(grep -q 'WARN grafana shipping timed out' "$(LOGF)" && echo 0 || echo 1)"
+assert "ship hang: last-run.json intact" "$(valid_json && [ "$(jget exit_code)" = 1 ] && echo 0 || echo 1)"
+assert "ship hang: lock released" "$(flock -n "$S/cowlic/ingest.lock" true && echo 0 || echo 1)"
+assert "ship: default hard limit is 30 s" "$(grep -q 'COWLIC_SHIP_TIMEOUT:-30' "$ROOT/scripts/run-ingest-local.sh" && echo 0 || echo 1)"
+unset STUB_SHIP STUB_RESULT
+
+# wrapper failures before ingest also go through finish: still exit 78 whatever the shipper does
+new_case ship_novenv; rm -rf "$R/ingest/.venv"; STUB_RC=0; export STUB_RC; run
+assert "ship: missing venv still exits 78 and ships nothing" "$([ "$rc" = 78 ] && [ ! -e "$STUB_SHIP_ARGS_FILE" ] && echo 0 || echo 1)"
+new_case ship_nofile; rm -f "$R/ingest/ship_grafana.py"; STUB_SHIP=fail; export STUB_SHIP; run
+assert "ship: missing shipper file is skipped silently" "$([ "$rc" = 0 ] && [ ! -e "$STUB_SHIP_ARGS_FILE" ] && ! grep -q 'WARN grafana' "$(LOGF)" && echo 0 || echo 1)"
+new_case ship_lock; STUB_SLEEP=2; export STUB_SLEEP
+( XDG_STATE_HOME="$S" bash "$R/scripts/run-ingest-local.sh" > "$C/out1" 2>&1 ) &
+bg=$!
+for _ in $(seq 50); do [ -s "$STUB_ARGS_FILE" ] && break; sleep 0.1; done
+STUB_SHIP=ok; export STUB_SHIP; rm -f "$STUB_SHIP_ARGS_FILE"; run
+assert "ship: a lock-blocked invocation ships nothing" "$([ "$rc" = 75 ] && [ ! -e "$STUB_SHIP_ARGS_FILE" ] && echo 0 || echo 1)"
+wait "$bg" || true
+unset STUB_SLEEP STUB_SHIP
 
 if ((failures)); then echo "$failures check(s) failed"; exit 1; fi
 echo "All checks passed."
