@@ -4,6 +4,8 @@
 // Reports, by endpoint name only: calls, D1 rows read (meta.rows_read), response bytes and wall time.
 // Wall time is local workerd + sqlite. handler_cpu is the handler's own CPU (row mapping, JSON) with D1 round trips
 // removed (recorded results replayed), a proxy for Worker CPU time; the Cloudflare CPU meter is not available locally.
+// Note: `esbuild` is imported without being declared in package.json; it resolves through wrangler's hoisted
+// dependency in node_modules (no dependency was added).
 // Run: node scripts/measure-library.mjs [--tracks=10000,40000] [--migrations=N]
 //   --lib=path      handlers to measure (default src/library.ts)
 //   --migrations=N  apply only the first N migration files (to compare before/after an index migration)
