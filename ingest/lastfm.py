@@ -82,6 +82,10 @@ class LastfmError(Exception):
     """Failure talking to Last.fm. The message is redacted: never the key, never a URL with its query."""
 
 
+class ResponseTooLarge(LastfmError):
+    """The response body exceeded MAX_BODY; never retried."""
+
+
 def clean_text(value: str, limit: int = NAME_MAX) -> str:
     """Untrusted text made safe to print: control and format characters removed, whitespace collapsed, cut."""
     text = "".join(c for c in value if unicodedata.category(c)[0] != "C" or c in " \t\n")
@@ -119,7 +123,7 @@ _OPEN = urllib.request.build_opener(_NoRedirect).open
 def _parse(raw: bytes) -> dict:
     try:
         body = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):  # RecursionError: a deeply nested body that passes the size cap
         return {}
     return body if isinstance(body, dict) else {}
 
@@ -135,7 +139,7 @@ def default_fetch(url: str, timeout: float) -> tuple[int, dict]:
     except (urllib.error.URLError, OSError, http.client.HTTPException) as e:  # class name only: it can hold the URL
         raise LastfmError(f"network error talking to Last.fm ({type(e).__name__})") from None
     if len(raw) > MAX_BODY:
-        raise LastfmError(f"Last.fm response larger than {MAX_BODY} bytes; stopping")
+        raise ResponseTooLarge(f"Last.fm response larger than {MAX_BODY} bytes; stopping")
     return status, _parse(raw)
 
 
@@ -177,7 +181,7 @@ class LastfmClient:
             try:
                 status, body = self._fetch(url, HTTP_TIMEOUT)
             except LastfmError as e:
-                if last:
+                if last or isinstance(e, ResponseTooLarge):  # an oversized body is not retried
                     raise self._err(str(e)) from None
                 self._wait(attempt, "network error")
                 continue
@@ -193,7 +197,7 @@ class LastfmClient:
                     self._wait(attempt, f"error {code}")
                     continue
                 raise self._err(ERROR_MESSAGES.get(code) or self._generic(code, body))
-            if status >= 500:
+            if status >= 500 or status == 429:
                 if last:
                     raise self._err(f"Last.fm kept answering HTTP {status} after {MAX_RETRIES} retries")
                 self._wait(attempt, f"HTTP {status}")

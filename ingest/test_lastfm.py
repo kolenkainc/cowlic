@@ -254,6 +254,9 @@ class ClientTests(unittest.TestCase):
         c, _ = make(Fake([], errors=[(503, {}), lf.LastfmError("network error talking to Last.fm (TimeoutError)")]))
         c.call("user.getWeeklyChartList", user=USER)
         self.assertEqual(c.calls, 3)
+        c, _ = make(Fake([], errors=[(429, {}), (200, {"weeklychartlist": {}})]))  # HTTP 429 is retried too
+        c.call("user.getWeeklyChartList", user=USER)
+        self.assertEqual(c.calls, 2)
         c, _ = make(Fake([], errors=[(502, {})] * 10))
         with self.assertRaisesRegex(lf.LastfmError, "HTTP 502"):
             c.call("user.getWeeklyChartList", user=USER)
@@ -326,6 +329,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"{" + b" " * (lf.MAX_BODY + 10) + b"}")
+        elif self.path.startswith("/deep"):  # deeply nested JSON that fits under the size cap
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"[" * (lf.MAX_BODY - 10))
         elif self.path.startswith("/err"):
             self.send_response(403)
             self.end_headers()
@@ -362,6 +369,42 @@ class DefaultFetchTests(unittest.TestCase):
     def test_oversized_body_rejected(self):
         with self.assertRaisesRegex(lf.LastfmError, "larger than"):
             lf.default_fetch(self.base + "/big", 5)
+
+    def test_deeply_nested_body_is_a_clean_error(self):
+        self.assertEqual(lf.default_fetch(self.base + "/deep", 10), (200, {}))  # no RecursionError escapes
+        calls = []
+
+        def fetch(url, timeout):
+            calls.append(url)
+            return lf.default_fetch(self.base + "/deep", timeout)
+        c, _ = make(fetch)
+        with self.assertRaisesRegex(lf.LastfmError, "empty or non-JSON"):
+            c.call("user.getWeeklyChartList", user=USER)
+        self.assertEqual(len(calls), 1)
+
+    def test_oversized_body_is_not_retried(self):
+        calls = []
+
+        def fetch(url, timeout):
+            calls.append(url)
+            return lf.default_fetch(self.base + "/big", timeout)
+        c, _ = make(fetch)
+        with self.assertRaisesRegex(lf.LastfmError, "larger than"):
+            c.call("user.getWeeklyChartList", user=USER)
+        self.assertEqual(len(calls), 1)
+
+    def test_cli_deeply_nested_body_prints_error_not_traceback(self):
+        def factory(key):
+            return REAL_CLIENT(key, fetch=lambda url, t: lf.default_fetch(self.base + "/deep", t),
+                               sleep=lambda s: None, out=lambda s: None)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {"LASTFM_API_KEY": KEY}, clear=True), \
+                mock.patch.object(lf.tg_check, "load_env"), mock.patch.object(lf, "LastfmClient", factory), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = lf.main(["top-artists", "--user", USER])
+        self.assertEqual(rc, 1)
+        self.assertIn("empty or non-JSON", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
 
     def test_network_error_shows_class_name_only(self):
         with self.assertRaises(lf.LastfmError) as cm:
