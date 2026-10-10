@@ -20,6 +20,9 @@ async function md5Hex(input: string): Promise<string> {
 }
 
 export async function authenticate(params: URLSearchParams, env: AuthEnv): Promise<boolean> {
+  // Fail closed if secrets are not configured (otherwise md5("undefined"+salt) would authenticate).
+  if (!env.SUBSONIC_USER || !env.SUBSONIC_PASSWORD) return false;
+
   const user = params.get("u") ?? "";
   if (!safeEqual(user, env.SUBSONIC_USER)) return false;
 
