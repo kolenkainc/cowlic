@@ -2,10 +2,9 @@
 
 How to run and operate the ingest on the owner's laptop. Design background: [architecture.md](architecture.md).
 
-Status of the commands below: the wrapper, the prerequisite check and the units are merged; `last-run.json`
-(failure classes, fields) is described as of PR #127. Commands marked "read-only checked" were run while writing
-this page. Everything else (a real run, enabling the timer) is untested by the author and is done by the owner
-in #73 and #74.
+Status of the commands below: the wrapper (including `last-run.json`), the prerequisite check and the units are
+merged. Commands marked "read-only checked" were run while writing this page. Everything else (a real run,
+enabling the timer) is untested by the author and is done by the owner in #73 and #74.
 
 ## What runs where
 
@@ -41,8 +40,14 @@ It prints `ok` or `MISSING` with a fix hint per item and exits 1 if anything is 
 - `.env` at the repo root (gitignored), with these keys (names only; values never go in docs, chat or git):
   `TG_BOT_TOKEN`, `TG_CHANNEL_ID`, `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`,
   `INGEST_CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `D1_DATABASE_ID`.
-  Syntax is `KEY=value`, one per line, no `export`. The check only verifies that each key is present and
-  non-empty.
+  The check only greps key names: it can say `ok` while the first run still fails on syntax. The parser
+  (`parse_env` in `ingest/tg_check.py`) accepts blank lines, comment lines (first non-blank char `#`, any text
+  after it) and `KEY=value` where KEY is `[A-Za-z_][A-Za-z0-9_]*`. The value is taken verbatim; trailing
+  spaces and tabs are trimmed; matching quotes around the whole value are removed; an empty value counts as
+  missing. It rejects, with exit 1 (class `config`): `export KEY=...`; spaces around `=`; a value starting with
+  whitespace; an unquoted inline comment (` #` in the value); an unbalanced quote or text after the closing
+  quote; a repeated key; non-ASCII bytes outside comment lines; a NUL byte; a bare CR (CRLF line ends are
+  fine). A syntax error is logged with the line number (and key name) only, never the value.
 
 ## Secrets
 
@@ -148,7 +153,8 @@ lost until the next day. The overlap lock is inside the wrapper (flock), so the 
 ```
 
 Replace the path with your clone. Cron uses local time. Cron's environment is minimal: make sure `ffmpeg` is on
-the PATH (add `PATH=/usr/local/bin:/usr/bin:/bin:$HOME/.deno/bin` as a line above), `HOME` is set by cron. The
+the PATH (add `PATH=/usr/local/bin:/usr/bin:/bin:/home/USER/.deno/bin` as a line above; cron does not expand `$HOME` or `~` in
+variable assignments, so write the absolute path, see `man 5 crontab`), `HOME` is set by cron. The
 wrapper writes its own log, so discarding cron's output is fine. Do not enable both the timer and cron.
 
 ## Logs, status and overlap
@@ -194,9 +200,6 @@ The journal holds the same output as the log for systemd runs (stdout/stderr go 
 - If the wrapper itself is killed (SIGKILL, or systemd stopping the unit at the timeout) no new file is written
   and the previous one stays: compare `finished_at` with the date.
 
-Format source: PR #127 (description and the `feat/last-run-status` wrapper). If that PR merged differently, the
-merged code wins.
-
 ### Overlap
 
 The wrapper takes `flock -n` on `ingest.lock`. If a run is active, a second invocation prints one line to stderr,
@@ -212,7 +215,7 @@ run is still going: wait for it to finish.
 | 2 | ingest | Bad command-line usage (only when calling ingest directly) | none written |
 | 3 | ingest | YouTube asked to sign in; rest of the run skipped | `youtube-sign-in` |
 | 75 | wrapper | Another run holds the lock; nothing ran | not written |
-| 78 | wrapper | A required prerequisite or the venv or state dir is missing; nothing ran | `config` |
+| 78 | wrapper | A required prerequisite or the venv is missing, or (before the lock) `flock` is missing, the state dir is unusable, neither `HOME` nor `XDG_STATE_HOME` is set, or `cd` to the repo fails; nothing ran. `last-run.json` is written (class `config`) only for failures after the lock is taken (venv, prerequisite check); for the pre-lock failures none is written (flock missing: one ERROR line in the log if the state dir exists, otherwise stderr only) | `config` or not written |
 | other | ingest | Crash, kill or timeout (for example 125 and above for signals) | `crash` |
 
 When exit 1, read `failure_class` and the log to tell a partial failure from a configuration error.
@@ -253,7 +256,7 @@ Test a new entry with `ingest/.venv/bin/python ingest/ingest.py --sources source
 | `WARN deno` in the log | deno missing or older than 2.3.0; optional, install it if YouTube challenge errors appear |
 | Exit 75 | A run is active; wait. If none is running, check `ps` for a leftover `run-ingest-local.sh` |
 | `missing env vars` in the log | A key from the list above is absent or empty in `.env` |
-| Exit 1, `.env` syntax error | Use `KEY=value` lines, no `export` |
+| Exit 1, `.env` syntax error | Fix the line number named in the log; rules in Prerequisites (no `export`, no spaces around `=`, no inline ` #`, no duplicate keys) |
 | Timer shows no NEXT | Not enabled: `systemctl --user enable --now cowlic-ingest.timer`; check the `daemon-reload` and `verify` steps |
 | Unit fails immediately with status 203 or 200 | Wrong repo path in `WorkingDirectory` / `ExecStart`; fix both, `daemon-reload` |
 | `ffmpeg` not found only under systemd | The unit's `PATH` lacks its directory; extend the `Environment=PATH=` line |
