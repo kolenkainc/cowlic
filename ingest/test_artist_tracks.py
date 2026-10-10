@@ -1,10 +1,12 @@
 """Tests for artist_tracks: a fake Spotify over an in-memory catalog, no network, no sleeping."""
 import contextlib
+import email.message
 import io
 import os
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
+import urllib.error
 import urllib.parse
 from unittest import mock
 
@@ -273,6 +275,130 @@ class Malformed(unittest.TestCase):
             run(fake)
         self.assertIn("403", str(cm.exception))
         self.assertNotIn(CANARY, str(cm.exception))
+
+
+class RecordingBody(io.BytesIO):
+    """An HTTP error body that records every read size; None (an unbounded read) is recorded as such."""
+
+    def __init__(self, data):
+        super().__init__(data)
+        self.sizes = []
+
+    def read(self, n=None):
+        self.sizes.append(n)
+        return super().read(n)
+
+
+def http_error(status, data, headers=None):
+    body = RecordingBody(data)
+    hdrs = email.message.Message()
+    for k, v in (headers or {}).items():
+        hdrs[k] = v
+    err = urllib.error.HTTPError("https://api.spotify.com/v1/x", status, "x", hdrs, body)
+    return err, body
+
+
+class ErrorReason(unittest.TestCase):
+    """What a Spotify 4xx tells us ends up in the error, cleaned, bounded and redacted."""
+
+    def fail_with(self, body, status=403, url=None):
+        script = {1: (status, {}, body)}
+        with self.assertRaises(at.ArtistTracksError) as cm:
+            make(FakeSpotify([], {}, script=script)).get(url or f"{at.API}/artists/{ART}/albums?market=US&limit=10")
+        return str(cm.exception)
+
+    def test_json_error_message_is_shown_with_status_and_path_only(self):
+        msg = self.fail_with({"error": {"status": 403, "message": "Check settings on developer.spotify.com/dashboard"}})
+        self.assertEqual(msg, f"Spotify request failed: HTTP 403 on /v1/artists/{ART}/albums: "
+                              "Check settings on developer.spotify.com/dashboard")
+        self.assertNotIn("market", msg)  # no query
+        self.assertNotIn("https://", msg)
+        self.assertNotIn("Bearer", msg)
+
+    def test_oauth_style_string_error_is_shown(self):
+        self.assertIn("invalid_client", self.fail_with({"error": "invalid_client"}, status=400))
+
+    def test_no_reason_keeps_the_short_form(self):
+        for body in ({}, {"error": {}}, {"error": {"message": 7}}, {"error": ["x"]}, {"error": {"message": "  "}}):
+            with self.subTest(body=body):
+                self.assertEqual(self.fail_with(body), f"Spotify request failed: HTTP 403 on /v1/artists/{ART}/albums")
+
+    def test_token_and_secret_in_the_message_are_redacted(self):
+        for secret in (CANARY, SECRET):
+            msg = self.fail_with({"error": {"message": f"bad {secret} here"}})
+            self.assertNotIn(secret, msg)
+            self.assertIn("bad *** here", msg)
+
+    def test_token_cut_by_the_length_limit_is_not_left_as_a_fragment(self):
+        pad = "p" * (ingest.REASON_MAX - 10)
+        msg = self.fail_with({"error": {"message": pad + CANARY}})
+        self.assertNotIn(CANARY[:6], msg)  # redacted whole before cutting, not cut into a visible prefix
+
+    def test_error_reason_redacts_on_its_own(self):  # not only through the caller's final redact
+        self.assertEqual(ingest.error_reason({"error": {"message": f"a {CANARY} b"}}, [CANARY]), "a *** b")
+
+    def test_control_characters_are_cleaned(self):
+        msg = self.fail_with({"error": {"message": "line1\nline2\r\x1b[31mred\x00\x07 tab\there‮"}})
+        self.assertTrue(msg.isprintable(), repr(msg))
+        self.assertNotIn("\x1b", msg)
+        self.assertIn("line1?line2?", msg)
+
+    def test_long_message_is_cut(self):
+        msg = self.fail_with({"error": {"message": "x" * 5000}})
+        reason = msg.split(": ", 2)[2]
+        self.assertEqual(reason, "x" * ingest.REASON_MAX + "...")
+
+    def test_exact_limit_is_not_marked_as_cut(self):
+        reason = self.fail_with({"error": {"message": "y" * ingest.REASON_MAX}}).split(": ", 2)[2]
+        self.assertEqual(reason, "y" * ingest.REASON_MAX)
+
+    def test_retry_logic_is_unchanged(self):
+        sleeps_fake = FakeSpotify([album(1)], {sid("L", 1): [track(1)]}, script={
+            1: (429, {"retry-after": "7"}, {"error": {"message": "slow down"}}), 2: (503, {}, {"error": {"message": "x"}})})
+        cat, songs = run(sleeps_fake)
+        self.assertEqual(len(songs), 1)
+        self.assertEqual(cat.sleeps, [7, 2.0])
+        fake = FakeSpotify([], {}, script={i: (503, {}, {"error": {"message": "down"}}) for i in range(1, 9)})
+        with self.assertRaisesRegex(at.ArtistTracksError, f"kept answering HTTP 503 after {at.MAX_RETRIES} retries") as cm:
+            make(fake).get(f"{at.API}/x")
+        self.assertNotIn("down", str(cm.exception))
+        self.assertEqual(len(fake.urls), at.MAX_RETRIES + 1)
+
+    # -- the real default_fetch: non-JSON body and the bounded read --
+
+    def fetch_error(self, data, status=403):
+        err, body = http_error(status, data)
+        self.addCleanup(err.close)
+        with mock.patch.object(at, "_OPEN", side_effect=err):
+            return at.default_fetch(f"{at.API}/x", {}, 5), body
+
+    def test_default_fetch_returns_the_json_error_body(self):
+        (status, _, parsed), _ = self.fetch_error(b'{"error": {"status": 403, "message": "nope"}}')
+        self.assertEqual((status, parsed["error"]["message"]), (403, "nope"))
+
+    def test_default_fetch_non_json_body_becomes_a_bounded_reason(self):
+        (status, _, parsed), _ = self.fetch_error(b"<html>Forbidden by gateway</html>")
+        self.assertEqual(status, 403)
+        self.assertEqual(ingest.error_reason(parsed, []), "<html>Forbidden by gateway</html>")
+
+    def test_default_fetch_empty_body_has_no_reason(self):
+        (_, _, parsed), _ = self.fetch_error(b"")
+        self.assertEqual(ingest.error_reason(parsed, []), "")
+
+    def test_default_fetch_reads_a_huge_body_only_up_to_the_bound(self):
+        (_, _, parsed), body = self.fetch_error(b"z" * 5_000_000)
+        self.assertEqual(body.sizes, [ingest.ERROR_BODY_MAX])  # one bounded read, never an unbounded one
+        self.assertLessEqual(len(ingest.error_reason(parsed, [])), ingest.REASON_MAX + 3)
+
+    def test_default_fetch_huge_json_object_is_bounded_too(self):
+        data = b'{"error": {"message": "' + b"q" * 5_000_000 + b'"}}'
+        (_, _, parsed), body = self.fetch_error(data)
+        self.assertEqual(body.sizes, [ingest.ERROR_BODY_MAX])
+        self.assertLessEqual(len(ingest.error_reason(parsed, [])), ingest.REASON_MAX + 3)
+
+    def test_default_fetch_invalid_utf8_body_does_not_raise(self):
+        (_, _, parsed), _ = self.fetch_error(b"\xff\xfe bad \x80")
+        self.assertIn("bad", ingest.error_reason(parsed, []))
 
 
 class Retries(unittest.TestCase):

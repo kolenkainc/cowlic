@@ -604,6 +604,63 @@ class Followed(unittest.TestCase):
             self.assertIn(word, msg)
         self.assertNotIn(CANARY_ACCESS, msg)
 
+    def fail_followed(self, status, body):
+        with self.assertRaises(su.UserAuthError) as cm:
+            su.fetch_followed(CANARY_ACCESS, FakeGet((status, body, {})))
+        return str(cm.exception)
+
+    def test_403_shows_the_spotify_reason(self):
+        msg = self.fail_followed(403, {"error": {"status": 403, "message": "Active premium subscription required"}})
+        self.assertIn("Development Mode", msg)  # the fixed hint stays
+        self.assertTrue(msg.endswith("Spotify said: Active premium subscription required"), msg)
+
+    def test_other_error_shows_status_path_and_reason_but_no_query(self):
+        msg = self.fail_followed(404, {"error": {"message": "Not found"}})
+        self.assertEqual(msg, "Spotify API error: HTTP 404 on /v1/me/following. Spotify said: Not found")
+        self.assertNotIn("limit", msg)
+        self.assertNotIn("Bearer", msg)
+
+    def test_no_reason_adds_no_said_clause(self):
+        self.assertNotIn("Spotify said", self.fail_followed(404, {}))
+        self.assertNotIn("Spotify said", self.fail_followed(403, {"error": {"message": 5}}))
+
+    def test_reason_is_redacted_cleaned_and_cut(self):
+        msg = self.fail_followed(403, {"error": {"message": f"x {CANARY_ACCESS} y"}})
+        self.assertNotIn(CANARY_ACCESS, msg)
+        self.assertTrue(msg.endswith("Spotify said: x *** y"), msg)
+        msg = self.fail_followed(500, {"error": {"message": "a\nb\x1b[31m\x00c"}})
+        self.assertTrue(msg.isprintable(), repr(msg))
+        self.assertIn("a?b?", msg)
+        msg = self.fail_followed(500, {"error": {"message": "w" * 9000}})
+        self.assertTrue(msg.endswith("w" * ingest.REASON_MAX + "..."), msg[-30:])
+        self.assertLess(len(msg), 300)
+
+    def test_default_get_error_body_is_read_bounded_and_not_json_becomes_a_reason(self):
+        import email.message
+        import io
+
+        class Body(io.BytesIO):
+            sizes: list
+
+            def read(self, n=None):
+                self.sizes.append(n)
+                return super().read(n)
+
+        def call(data):
+            body = Body(data)
+            body.sizes = []
+            hdrs = email.message.Message()
+            hdrs["Retry-After"] = "3"
+            err = urllib.error.HTTPError(su.API_BASE + "/x", 403, "x", hdrs, body)
+            self.addCleanup(err.close)
+            with mock.patch.object(su.urllib.request.OpenerDirector, "open", side_effect=err):
+                return su.default_get(su.API_BASE + "/x", {}, 1), body.sizes
+        (status, parsed, hdrs), sizes = call(b'{"error": {"message": "nope"}}')
+        self.assertEqual((status, parsed["error"]["message"], hdrs), (403, "nope", {"retry-after": "3"}))
+        (_, parsed, _), sizes = call(b"Forbidden by gateway " + b"z" * 5_000_000)
+        self.assertEqual(sizes, [ingest.ERROR_BODY_MAX])
+        self.assertTrue(ingest.error_reason(parsed, []).startswith("Forbidden by gateway"))
+
     def test_401_says_log_in_again(self):
         with self.assertRaisesRegex(su.UserAuthError, "401.*login"):
             su.fetch_followed(CANARY_ACCESS, FakeGet((401, {}, {})))
