@@ -13,7 +13,8 @@
 
 ## 2. Компоненты
 
-### 2.1 Ingest (GitHub Actions, cron)
+### 2.1 Ingest (owner's machine, scheduled local run)
+Ingest runs on the owner's own machine (cron or a systemd timer) from the same `ingest/ingest.py`, over the normal home connection. GitHub Actions no longer runs ingest: YouTube answers every download from GitHub-hosted runners with "Sign in to confirm you're not a bot" (observed in run 38056689770, see #15), so the workflow was removed. The bot check is not bypassed (no account cookies, proxies, PO-token tricks or client rotation). The machine needs ffmpeg, Deno and the Python dependencies, and reads its configuration from the local gitignored `.env`. The steps below are unchanged.
 - Список плейлистов/альбомов лежит в репозитории (`sources.yml`).
 - `spotdl` берёт метаданные из Spotify, аудио ищет на YouTube Music и вшивает теги и обложку.
 - Скрипт сравнивает `spotify_id` с D1 и обрабатывает только новые треки.
@@ -89,39 +90,35 @@ Worker только передаёт поток и не буферизует е�
 | # | Риск | Влияние | Решение |
 |---|---|---|---|
 | 1 | Bot API: `getFile` отдаёт файлы **до 20 МБ** (загрузка до 50 МБ) | FLAC и длинные миксы не скачаются | Для POC: mp3/opus/m4a ≤ 20 МБ, ingest пропускает или перекодирует крупные. Потом: свой Local Bot API server снимает лимит, но это уже сервер |
-| 2 | `spotdl` на раннерах GitHub часто блокируется/ограничивается YouTube (IP дата-центров), и ломается при изменениях YouTube | Ночной job падает | Проверить в POC (шаг 4) до того, как строить остальное. План Б: self-hosted runner на домашней машине или локальный запуск |
+| 2 | `spotdl` на раннерах GitHub часто блокируется/ограничивается YouTube (IP дата-центров), и ломается при изменениях YouTube | Ночной job падает | Observed: YouTube blocks GitHub-hosted runners ("Sign in to confirm you're not a bot", run 38056689770, #15). Mitigation: ingest runs on the owner's machine (decision in #62) and the GitHub workflow is removed. The bot check is not bypassed. A self-hosted runner was rejected: on a public repo it would run code of anyone able to trigger workflows on the owner's machine |
 | 3 | Лимиты Spotify API на метаданные (rate limit) | Ingest замедляется | Малые батчи, ретраи с backoff, кеш метаданных |
 | 4 | Telegram: `file_id` привязан к боту, при смене бота ломается | Потеря доступа к файлам | Хранить `message_id` и канал. Файлы можно переполучить, перепересылая из канала |
 | 5 | Лимиты бесплатных тарифов: Worker ~100k запросов/день, D1 ~5M чтений строк/день | Для одного пользователя с большим запасом | Мониторить. Кеш Symfonium снижает нагрузку |
 | 6 | Юридическое и ToS: получение аудио с YouTube через spotdl, хранение в Telegram | Нарушение условий сервисов, риск бана бота/аккаунта | Только личное использование, приватный канал, без публичного доступа. Решение принимает владелец проекта |
-| 7 | Безопасность: бот-токен и пароль Subsonic | Утечка = доступ к библиотеке | Секреты только в GitHub Secrets и Worker secrets, не логировать, не отдавать клиенту |
+| 7 | Безопасность: бот-токен и пароль Subsonic | Утечка = доступ к библиотеке | Секреты только в локальном `.env` и Worker secrets, не логировать, не отдавать клиенту |
 | 8 | Одно измерение здоровья: тихие поломки ночного job | Библиотека перестаёт обновляться | Статус job + уведомление в Telegram о падении |
 
 ## 4. Конфигурация и секреты
 
-Single-source rule: every secret and config value is edited only in the local gitignored `.env` (template: `.env.example`). `scripts/sync-secrets.sh` distributes it according to `scripts/secrets.manifest` (names only, no values). Never edit values in the GitHub or Cloudflare UI.
+Single-source rule: every secret and config value is edited only in the local gitignored `.env` (template: `.env.example`) on the owner's machine. Ingest reads it directly. `scripts/sync-secrets.sh` copies only the Worker secrets to Cloudflare according to `scripts/secrets.manifest` (names only, no values). GitHub is not used for secrets any more: the ingest workflow and its `ingest` environment are gone. Never edit values in the Cloudflare UI.
 
 | `.env` key | Where it lives | Purpose |
 |---|---|---|
-| `TG_BOT_TOKEN` | GH environment `ingest` secret, Worker secret | Bot API |
-| `TG_CHANNEL_ID` | GH environment `ingest` secret | Storage channel |
-| `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET` | GH environment `ingest` secrets | Metadata for spotdl |
-| `INGEST_CLOUDFLARE_API_TOKEN` | GH environment `ingest` secret `CLOUDFLARE_API_TOKEN` | Narrow token (D1:Edit only) for ingest writing to D1 over the REST API |
-| `CLOUDFLARE_ACCOUNT_ID`, `D1_DATABASE_ID` | GH environment `ingest` secrets | D1 REST API addressing |
-| `SUBSONIC_USER`, `SUBSONIC_PASSWORD` | Worker secrets | Client login |
-| `CLOUDFLARE_API_TOKEN` (optional) | `.env` only, never synced | Broad personal token for local wrangler/ad-hoc work |
+| `TG_BOT_TOKEN` | local `.env`, Worker secret | Bot API |
+| `TG_CHANNEL_ID` | local `.env` | Storage channel |
+| `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET` | local `.env` | Metadata for spotdl |
+| `INGEST_CLOUDFLARE_API_TOKEN` | local `.env` | Narrow token (D1:Edit only) for ingest writing to D1 over the REST API |
+| `CLOUDFLARE_ACCOUNT_ID`, `D1_DATABASE_ID` | local `.env` | D1 REST API addressing |
+| `SUBSONIC_USER`, `SUBSONIC_PASSWORD` | local `.env`, Worker secrets | Client login |
+| `CLOUDFLARE_API_TOKEN` (optional) | local `.env` only, never synced | Broad personal token for local wrangler/ad-hoc work |
 
-GitHub environment `ingest`: all ingest values, including the ids (`TG_CHANNEL_ID`, `CLOUDFLARE_ACCOUNT_ID`, `D1_DATABASE_ID`), are secrets of the environment `ingest`, not repo-level secrets or variables. Reasons: repo Variables are printed unmasked in the public run logs, and repo-level secrets can be read by any write-access user who dispatches a modified workflow from any branch. The environment is created by the owner and its deployment branches are restricted to `master` (Settings -> Environments -> ingest -> Deployment branches and tags -> Selected branches -> `master`), so only workflow runs from master get the values. The ingest workflow declares `environment: ingest` and reads `secrets.*` only. In `scripts/secrets.manifest` this is the target `gh-env-secret@ingest[:REMOTE_NAME]`; the script runs `gh secret set NAME --env ingest`.
+The ingest values are never synced anywhere. The GitHub environment secrets of the former workflow (`TG_BOT_TOKEN`, `TG_CHANNEL_ID`, `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `D1_DATABASE_ID` in the environment `ingest`) are unnecessary and can be removed by the owner together with the environment (ticket #75).
 
-Preflight: before the first write, for every environment found in the selected entries (independent of manifest order), the script runs `gh api repos/{owner}/{repo}/environments/ingest/secrets/public-key`, the endpoint `gh secret set --env` itself uses, so it also checks the permission the writes need. `gh` resolves owner and repo from the clone (the script `cd`s to the repo root). On failure it aborts with nothing synced and prints a distinguishable reason plus gh's first stderr line: 401 (not authenticated), 404 (environment missing or repo not visible), 403 (no permission), anything else (network). Worker-only selections (`--only SUBSONIC_USER`) skip this check. Limitations: environment names are limited to `[A-Za-z_][A-Za-z0-9_]*` (fine for `ingest`); `declare -A` needs bash >= 4 (Linux; stock macOS bash 3.2 will not work); the repo comes from the clone's `gh` default, so with a fork plus several remotes set `gh repo set-default` first (not pinned with `-R`, untested). Manifest entries with the same destination (target, environment and remote name) are rejected, so a broad token cannot silently overwrite the narrow one. The old repo-level targets `gh-secret` and `gh-variable` were removed from the script on purpose.
+Usage: `scripts/sync-secrets.sh --dry-run` (lists key, target, present/missing; never shows values), `scripts/sync-secrets.sh` (all), `scripts/sync-secrets.sh --only KEY`. Values travel only through stdin of `wrangler secret put`. Missing keys, unsupported `.env` syntax, unknown manifest targets (including the removed GitHub targets), duplicate destinations, missing `npx` or a missing `worker/wrangler.local.toml` abort before anything is synced. If a call fails midway, the script reports which entries were already synced; rerunning is safe (idempotent upserts), `--only KEY` retries one entry. Prerequisite: `npm ci` done in `worker/` (the script uses `npx --no-install`). `declare -A` needs bash >= 4 (Linux; stock macOS bash 3.2 will not work).
 
-Removing old repo-level entries, in this order: (1) run the sync; (2) `gh secret list --env ingest` shows all seven names (`TG_BOT_TOKEN`, `TG_CHANNEL_ID`, `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `CLOUDFLARE_ACCOUNT_ID`, `D1_DATABASE_ID`, `CLOUDFLARE_API_TOKEN`); (3) dispatch the ingest workflow once and see it pass; (4) only then delete the leftovers (nothing refreshes them any more): `gh secret delete NAME` for `TG_BOT_TOKEN`, `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `CLOUDFLARE_API_TOKEN`, and `gh variable delete NAME` for `TG_CHANNEL_ID`, `CLOUDFLARE_ACCOUNT_ID`, `D1_DATABASE_ID` (ignore "not found"). Finally check with `gh secret list` and `gh variable list` that no ingest value remains at repo level.
+Supported `.env` subset: `KEY=value`, optional `export `, optional matching quotes around the whole value. The value is taken verbatim (no escape processing, no expansion, no multiline), trailing whitespace is trimmed, the last duplicate key wins. A value starting with a space or an unquoted inline comment (` #`) is rejected with the line number (never the value). Test: `scripts/test-sync-secrets.sh` (fixture `.env` plus an npx shim, no network).
 
-Usage: `scripts/sync-secrets.sh --dry-run` (lists key, target, present/missing; never shows values), `scripts/sync-secrets.sh` (all), `scripts/sync-secrets.sh --only KEY`. Values travel only through stdin of `gh secret set` (with `--env ingest`) and `wrangler secret put`. Missing keys, unsupported `.env` syntax, unknown manifest targets, missing `gh`/`npx` or a missing `worker/wrangler.local.toml` abort before anything is synced. If a call fails midway, the script reports which entries were already synced; rerunning is safe (idempotent upserts), `--only KEY` retries one entry. Prerequisites: `gh` authenticated, and `npm ci` done in `worker/` (the script uses `npx --no-install`).
-
-Supported `.env` subset: `KEY=value`, optional `export `, optional matching quotes around the whole value. The value is taken verbatim (no escape processing, no expansion, no multiline), trailing whitespace is trimmed, the last duplicate key wins. A value starting with a space or an unquoted inline comment (` #`) is rejected with the line number (never the value). Test: `scripts/test-sync-secrets.sh` (fixture `.env` plus gh/npx shims, no network).
-
-Rotation: edit the one line in `.env`, run `scripts/sync-secrets.sh --only KEY` (`--only TG_BOT_TOKEN` writes both the environment secret and the Worker secret, because the key has two manifest lines), then check `gh secret list --env ingest`, `npx wrangler secret list -c wrangler.local.toml` (from `worker/`). Rotate the secret at its provider first (BotFather, Spotify dashboard, Cloudflare).
+Rotation: rotate the secret at its provider first (BotFather, Spotify dashboard, Cloudflare), edit the one line in `.env`, and for a Worker secret run `scripts/sync-secrets.sh --only KEY`, then check `npx wrangler secret list -c wrangler.local.toml` (from `worker/`). Ingest-only values need just the `.env` edit.
 
 Narrow Cloudflare token (`INGEST_CLOUDFLARE_API_TOKEN`): Cloudflare dashboard -> My Profile -> API Tokens -> Create Token -> Create Custom Token. Permission: Account -> D1 -> Edit. Account resources: Include -> the single account that owns the database. No zone permissions, no other account permissions. Put it in `.env` as `INGEST_CLOUDFLARE_API_TOKEN`; it must not be the broad personal token.
 
@@ -135,7 +132,6 @@ cowlic/
 │  └─ wrangler.toml
 ├─ ingest/              # Python: spotdl + загрузка в TG + запись в D1
 ├─ sources.yml          # плейлисты для синхронизации
-├─ .github/workflows/   # cron и ручной запуск
 └─ docs/
 ```
 

@@ -132,7 +132,6 @@ class RunTest(unittest.TestCase):
 # ---- fake spotdl: exercises spotdl_run / download / the Summary step without touching YouTube ----
 
 CID, SECRET = "cid0123456789abcdefCID", "Sec0123456789abcdefSECRET0123"
-WORKFLOW = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "ingest.yml"
 
 # argv: <subcommand> ... --client-id ID --client-secret SECRET. Behaviour comes from FAKE_MODE; it writes no mp3.
 FAKE_SPOTDL = r"""
@@ -285,122 +284,6 @@ class SpotdlOutputTest(FakeSpotdlCase):
             self.assertFalse(line.startswith("::"), line)
 
 
-def step_lines(name: str) -> list[str]:
-    """Lines of one workflow step (from its `- name:` line up to the next step), from the real workflow file."""
-    lines = WORKFLOW.read_text().splitlines()
-    start = next(i for i, ln in enumerate(lines) if ln.strip() == f"- name: {name}")
-    indent = len(lines[start]) - len(lines[start].lstrip())
-    end = next((i for i in range(start + 1, len(lines))
-                if lines[i].strip() and len(lines[i]) - len(lines[i].lstrip()) <= indent), len(lines))
-    return lines[start:end]
-
-
-def summary_script() -> str:
-    """Body of the Summary step's `run: |` block, taken from the real workflow file."""
-    lines = WORKFLOW.read_text().splitlines()
-    start = next(i for i, ln in enumerate(lines) if ln.strip() == "- name: Summary")
-    run = next(i for i in range(start, len(lines)) if lines[i].strip() == "run: |")
-    indent = len(lines[run]) - len(lines[run].lstrip())
-    body = []
-    for ln in lines[run + 1:]:
-        if ln.strip() and len(ln) - len(ln.lstrip()) <= indent:
-            break
-        body.append(ln)
-    return "\n".join(body)
-
-
-@unittest.skipUnless(shutil.which("bash"), "bash needed")
-class SummaryStepTest(unittest.TestCase):
-    def summary(self, log_text: str) -> str:
-        with tempfile.TemporaryDirectory() as d:
-            (Path(d) / "ingest.log").write_text(log_text)
-            out = Path(d) / "summary.md"
-            subprocess.run(["bash", "-c", summary_script()], check=True,
-                           env={"PATH": os.environ["PATH"], "RUNNER_TEMP": d, "GITHUB_STEP_SUMMARY": str(out),
-                                "JOB_STATUS": "failure"})
-            return out.read_text()
-
-    def test_block_message_from_surfaced_output_is_flagged(self):
-        case = SpotdlOutputTest("test_exit_zero_without_file_surfaces_block_message")
-        case.setUp()
-        try:
-            log_text = download_log(case.work, "block")
-        finally:
-            case.doCleanups()
-        self.assertIn("YouTube appears to block", self.summary(log_text))
-
-    def buried_summary(self, msg: str) -> str:
-        case = SpotdlOutputTest("test_exit_zero_without_file_surfaces_block_message")
-        case.setUp()
-        try:
-            return self.summary(download_log(case.work, "buried:" + msg))
-        finally:
-            case.doCleanups()
-
-    def test_buried_exception_is_classified_by_the_summary(self):
-        block = self.buried_summary("ERROR: [youtube] x: Sign in to confirm you're not a bot")
-        self.assertIn("YouTube appears to block", block)
-        self.assertNotIn("another reason", block)
-        runtime = self.buried_summary("ERROR: [youtube] x: n challenge solving failed: Some formats may be missing")
-        self.assertIn("No usable JavaScript runtime", runtime)
-        self.assertNotIn("YouTube appears to block", runtime)
-        other = self.buried_summary("ERROR: [youtube] x: Video unavailable. This video is private")
-        self.assertIn("another reason", other)
-        self.assertIn("Video unavailable. This video is private", other)  # visible on the ERROR line in the summary
-
-    def test_telegram_429_is_not_a_youtube_block(self):
-        text = self.summary("ERROR A - T: IngestError: 429: Too Many Requests: retry after 5\n")
-        self.assertNotIn("YouTube appears to block", text)
-
-    def test_backtick_lines_cannot_break_out_of_the_block(self):
-        text = self.summary("ERROR x\n````\n<script>alert(1)</script>\n# heading\n")
-        for needle in ("````", "<script>", "# heading"):
-            hits = [ln for ln in text.splitlines() if needle in ln]
-            self.assertTrue(hits)
-            for ln in hits:
-                self.assertTrue(ln.startswith("    "), ln)
-
-    BLOCK = "yt_dlp.utils.DownloadError: ERROR: [youtube] x: Sign in to confirm you're not a bot"
-    FAILED = "ERROR A - T: IngestError: expected exactly one mp3 after download; spotdl output (last lines):"
-    SPOTDL_DENO_WARNING = "Some YouTube downloads require Deno. Run spotdl --download-deno or install Deno"
-
-    def test_missing_runtime_is_reported_from_ingest_warning(self):
-        text = self.summary(f"WARN js runtime: deno not found on PATH; yt-dlp needs Deno\n{self.FAILED}\n")
-        self.assertIn("No usable JavaScript runtime", text)
-        self.assertNotIn("YouTube appears to block", text)
-        self.assertNotIn("another reason", text)
-
-    def test_missing_runtime_is_reported_from_yt_dlp_error(self):
-        for marker in ("n challenge solving failed: Some formats may be missing", "Signature solving failed",
-                       "No supported JavaScript runtime could be found"):
-            with self.subTest(marker):
-                text = self.summary(f"{self.FAILED}\nERROR: {marker}\n")
-                self.assertIn("No usable JavaScript runtime", text)
-
-    def test_block_and_runtime_messages_are_distinct(self):
-        block = self.summary(f"{self.FAILED}\n{self.BLOCK}\n")
-        self.assertIn("YouTube appears to block", block)
-        self.assertNotIn("No usable JavaScript runtime", block)
-        self.assertNotIn("another reason", block)
-
-    def test_other_download_error_has_its_own_message(self):
-        text = self.summary(f"{self.FAILED}\n[x] ERROR: [youtube] x: Video unavailable. This video is private\n")
-        self.assertIn("another reason", text)
-        self.assertNotIn("YouTube appears to block", text)
-        self.assertNotIn("No usable JavaScript runtime", text)
-
-    def test_spotdl_deno_warning_alone_is_not_a_missing_runtime(self):
-        # spotdl prints it for ANY failed download (the first dispatch failed with it for another cause)
-        text = self.summary(f"{self.FAILED}\n{self.SPOTDL_DENO_WARNING}\nAudioProviderError: YT-DLP download error\n")
-        self.assertNotIn("No usable JavaScript runtime", text)
-        self.assertIn("another reason", text)
-
-    def test_no_cause_message_without_download_failures(self):
-        text = self.summary("ingested: A - T\ndone: 1 new, 0 already present, 0 no match, 0 too big, 0 failed\n")
-        for needle in ("YouTube appears to block", "No usable JavaScript runtime", "another reason"):
-            self.assertNotIn(needle, text)
-
-
 def fake_deno(directory: Path, output: str) -> None:
     exe = directory / "deno"
     exe.write_text(f"#!/bin/sh\necho '{output}'\n")
@@ -427,29 +310,6 @@ class JsRuntimeTest(unittest.TestCase):
     def test_supported(self):
         for v in ("2.3.0", "2.9.5", "10.0.1"):
             self.assertIsNone(self.problem(f"deno {v} (stable, release, x86_64-unknown-linux-gnu)"), v)
-
-
-class InstallDenoStepTest(unittest.TestCase):
-    def setUp(self):
-        self.step = "\n".join(step_lines("Install Deno"))
-
-    def test_runs_before_ingest_and_has_no_secrets(self):
-        text = WORKFLOW.read_text()
-        self.assertLess(text.index("- name: Install Deno"), text.index("- name: Run ingest"))
-        self.assertNotIn("secrets.", self.step)
-        self.assertNotIn("TG_", self.step)
-
-    def test_release_is_pinned_and_checksum_verified(self):
-        self.assertRegex(self.step, r"DENO_VERSION=\d+\.\d+\.\d+\n")
-        self.assertRegex(self.step, r"DENO_SHA256=[0-9a-f]{64}\n")
-        self.assertIn("sha256sum --check --strict", self.step)
-        self.assertLess(self.step.index("sha256sum --check"), self.step.index("unzip"))
-        self.assertIn("set -euo pipefail", self.step)
-        self.assertNotIn("latest", self.step)
-
-    def test_pinned_version_meets_yt_dlp_minimum(self):
-        m = re.search(r"DENO_VERSION=(\d+)\.(\d+)\.(\d+)", self.step)
-        self.assertGreaterEqual(tuple(int(x) for x in m.groups()), ingest.MIN_DENO)
 
 
 if __name__ == "__main__":
