@@ -11,6 +11,7 @@
 #   describe_ingest_exit). The wrapper's own failures use the codes in the block below.
 # - After last-run.json: best-effort push of this run's redacted log to Grafana Cloud Loki (ship_grafana(); never
 #   changes the exit code, see docs/local-ingest.md).
+# - COWLIC_INGEST_ARGS (optional): allowlisted ingest caps (--max-new, --max-minutes, --pace-seconds), see parse_ingest_args.
 # Test: scripts/test-run-ingest-local.sh
 set +x
 set -uo pipefail
@@ -149,6 +150,39 @@ LOG_OFFSET="$({ wc -c < "$LOG"; } 2> /dev/null)" || LOG_OFFSET=0
 case "$LOG_OFFSET" in '' | *[!0-9]*) LOG_OFFSET=0 ;; esac
 log "start"
 
+# COWLIC_INGEST_ARGS (optional): extra ingest options, e.g. "--max-new 200 --max-minutes 90". Never eval'd, never
+# expanded by the shell: the value must first be made only of letters, digits, spaces and '-', is then split into
+# words with read -a (no globbing), and every word must be an allowlisted option followed by an integer in its range.
+# Anything else ends the run with EXIT_PREREQ before ingest starts. The log line never contains the rejected value.
+EXTRA_ARGS=()
+parse_ingest_args() {
+  local raw="${COWLIC_INGEST_ARGS-}" words=() i opt val max seen=" "
+  case "$raw" in *[![:space:]]*) ;; *) return 0 ;; esac  # unset, empty or blank: today's behaviour
+  if [ "${#raw}" -gt 200 ]; then log "ERROR COWLIC_INGEST_ARGS rejected: too long"; return 1; fi
+  case "$raw" in *[!A-Za-z0-9\ -]*) log "ERROR COWLIC_INGEST_ARGS rejected: only letters, digits, spaces and '-' are allowed"; return 1 ;; esac
+  read -r -a words <<<"$raw"
+  for ((i = 0; i < ${#words[@]}; i += 2)); do
+    opt="${words[i]}"; val="${words[i + 1]-}"
+    case "$opt" in
+      --max-new) max=1000000 ;;
+      --max-minutes) max=1440 ;;
+      --pace-seconds) max=3600 ;;
+      *) log "ERROR COWLIC_INGEST_ARGS rejected: unknown option (allowed: --max-new --max-minutes --pace-seconds)"; return 1 ;;
+    esac
+    case "$seen" in *" $opt "*) log "ERROR COWLIC_INGEST_ARGS rejected: $opt given twice"; return 1 ;; esac
+    seen="$seen$opt "
+    case "$val" in
+      '' | *[!0-9]* | 0*) log "ERROR COWLIC_INGEST_ARGS rejected: $opt needs a positive integer"; return 1 ;;
+    esac
+    if [ "${#val}" -gt 7 ] || [ "$val" -gt "$max" ]; then
+      log "ERROR COWLIC_INGEST_ARGS rejected: $opt out of range (1..$max)"; return 1
+    fi
+    EXTRA_ARGS+=("$opt" "$val")
+  done
+  log "extra ingest options from COWLIC_INGEST_ARGS:${seen% } (values validated)"
+}
+parse_ingest_args || finish "$EXIT_PREREQ"
+
 if [ ! -x "$VENV_PY" ]; then
   log "ERROR ingest/.venv not found. Run: python3 -m venv ingest/.venv && ingest/.venv/bin/pip install -r ingest/requirements.txt"
   finish "$EXIT_PREREQ"
@@ -173,7 +207,7 @@ fi
 # Pipe through tee for the log; the ingest exit code comes from PIPESTATUS, so tee cannot hide it.
 # -u: unbuffered, so a run killed by systemd's timeout still leaves its latest output in the log.
 # 9>&-: the lock descriptor is not inherited by ingest and its children.
-"$VENV_PY" -u "$ROOT/ingest/ingest.py" --sources "$ROOT/sources.yml" --result-json "$RESULT" 9>&- 2>&1 | tee -a "$LOG"
+"$VENV_PY" -u "$ROOT/ingest/ingest.py" --sources "$ROOT/sources.yml" --result-json "$RESULT" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 9>&- 2>&1 | tee -a "$LOG"
 rc=${PIPESTATUS[0]}
 
 log "finished: exit code $rc, $(describe_ingest_exit "$rc")"

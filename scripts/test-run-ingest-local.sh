@@ -298,5 +298,72 @@ assert "ship: a lock-blocked invocation ships nothing" "$([ "$rc" = 75 ] && [ ! 
 wait "$bg" || true
 unset STUB_SLEEP STUB_SHIP
 
+# COWLIC_INGEST_ARGS: allowlisted ingest options forwarded by the wrapper
+STUB_RC=0; unset STUB_SHIP STUB_RESULT; export STUB_RC
+base_args() { echo "-u $R/ingest/ingest.py --sources $R/sources.yml --result-json $S/cowlic/.ingest-result.json"; }
+new_case ia_unset; unset COWLIC_INGEST_ARGS; run
+assert "ingest args unset: command line is exactly today's" "$([ "$rc" = 0 ] && [ "$(cat "$STUB_ARGS_FILE")" = "$(base_args)" ] && echo 0 || echo 1)"
+for blank in "" "   " "  "; do
+  new_case ia_blank; COWLIC_INGEST_ARGS="$blank"; export COWLIC_INGEST_ARGS; run
+  assert "ingest args blank '$blank': same as unset" "$([ "$rc" = 0 ] && [ "$(cat "$STUB_ARGS_FILE")" = "$(base_args)" ] && echo 0 || echo 1)"
+done
+new_case ia_valid; COWLIC_INGEST_ARGS="--max-new 200 --max-minutes 90  --pace-seconds 7"; export COWLIC_INGEST_ARGS; run
+assert "ingest args valid: appended after the fixed arguments" "$([ "$rc" = 0 ] && [ "$(cat "$STUB_ARGS_FILE")" = "$(base_args) --max-new 200 --max-minutes 90 --pace-seconds 7" ] && echo 0 || echo 1)"
+assert "ingest args valid: option names logged" "$(grep -q 'extra ingest options from COWLIC_INGEST_ARGS: --max-new --max-minutes --pace-seconds' "$(LOGF)" && echo 0 || echo 1)"
+new_case ia_one; COWLIC_INGEST_ARGS="--max-new 1"; export COWLIC_INGEST_ARGS; run
+assert "ingest args valid: single option" "$([ "$rc" = 0 ] && grep -q -- '--result-json .* --max-new 1$' "$STUB_ARGS_FILE" && echo 0 || echo 1)"
+
+# every value below must be rejected: exit 78, ingest never started, last-run.json class config, no value in output
+ia_reject() { # name, value
+  new_case "ia_$1"; COWLIC_INGEST_ARGS="$2"; export COWLIC_INGEST_ARGS; run
+  assert "ingest args reject '$1': exit 78" "$([ "$rc" = 78 ] && echo 0 || echo 1)"
+  assert "ingest args reject '$1': ingest not started" "$([ ! -e "$STUB_ARGS_FILE" ] && echo 0 || echo 1)"
+  assert "ingest args reject '$1': clear log line" "$(grep -q 'COWLIC_INGEST_ARGS rejected' "$(LOGF)" && echo 0 || echo 1)"
+  assert "ingest args reject '$1': no side effect file" "$([ ! -e "$C/pwned" ] && [ ! -e "$R/pwned" ] && [ ! -e "$PWD/pwned" ] && echo 0 || echo 1)"
+  assert "ingest args reject '$1': value not in log or output" "$(grep -qE 'SENTINEL|pwned|bogus|rm |echo' "$(LOGF)" "$C/out" && echo 1 || echo 0)"
+}
+ia_reject unknown "--max-new 5 --bogus-SENTINEL 3"
+ia_reject unknown-ingest-option "--state-file /tmp/SENTINEL"
+ia_reject max-artists "--max-artists 5"
+ia_reject dry-run "--dry-run"
+ia_reject bare-word "SENTINEL"
+ia_reject positional "--max-new 5 https://open.spotify.com/playlist/SENTINEL"
+ia_reject equals-form "--max-new=5"
+ia_reject missing-value "--max-new"
+ia_reject value-is-option "--max-new --max-minutes"
+ia_reject non-integer "--max-new abc"
+ia_reject float "--max-minutes 1.5"
+ia_reject negative "--max-new -5"
+ia_reject zero "--max-new 0"
+ia_reject leading-zero "--max-new 007"
+ia_reject too-big "--max-new 1000001"
+ia_reject too-long-digits "--max-new 99999999999999999999"
+ia_reject minutes-range "--max-minutes 1441"
+ia_reject pace-range "--pace-seconds 3601"
+ia_reject duplicate "--max-new 5 --max-new 6"
+ia_reject semicolon "--max-new 5; touch $TMP/pwned"
+ia_reject command-subst "--max-new \$(touch $TMP/pwned)"
+ia_reject backticks "--max-new \`touch $TMP/pwned\`"
+ia_reject dollar-var "--max-new \$HOME"
+ia_reject pipe "--max-new 5 | tee $TMP/pwned"
+ia_reject amp "--max-new 5 & touch $TMP/pwned"
+ia_reject redirect "--max-new 5 > $TMP/pwned"
+ia_reject glob "--max-new *"
+ia_reject quotes "--max-new '5'"
+ia_reject dquotes '--max-new "5"'
+ia_reject backslash '--max-new 5\'
+ia_reject newline "$(printf -- '--max-new 5\n--max-minutes 90')"
+ia_reject newline-injection "$(printf -- '--max-new 5\ntouch %s/pwned' "$TMP")"
+ia_reject tab "$(printf -- '--max-new\t5')"
+ia_reject trailing-newline "$(printf -- '--max-new 5\n_')"
+ia_reject over-200-chars "$(printf -- '--max-new 5 %0190d' 0)"
+ia_reject nul-lookalike "--max-new 5%00"
+ia_reject unicode "--max-new 5 --max-minutes ５"
+[ ! -e "$TMP/pwned" ]; assert "no injection attempt created a file" "$?"
+# a rejected run still writes last-run.json with class config and exit 78
+new_case ia_lastrun; COWLIC_INGEST_ARGS="--bogus"; export COWLIC_INGEST_ARGS; run
+assert "ingest args rejected: last-run exit 78 class config" "$([ "$(jget exit_code)" = 78 ] && [ "$(jget failure_class)" = config ] && echo 0 || echo 1)"
+unset COWLIC_INGEST_ARGS
+
 if ((failures)); then echo "$failures check(s) failed"; exit 1; fi
 echo "All checks passed."

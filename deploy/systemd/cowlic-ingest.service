@@ -17,6 +17,10 @@ Type=oneshot
 WorkingDirectory=%h/projects/personal/kolenkainc/cowlic
 # deno (yt-dlp challenge solving) usually lives in ~/.deno/bin, ffmpeg in /usr/bin.
 Environment=PATH=%h/.deno/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Optional per-run caps for the wrapper (disabled; see docs/local-ingest.md, "The cap and the 21:10 timer").
+# Only --max-new N, --max-minutes M and --pace-seconds S with integer values are accepted; anything else makes
+# the wrapper exit 78 before ingest starts. Uncomment to enable:
+#Environment="COWLIC_INGEST_ARGS=--max-new 200 --max-minutes 90"
 ExecStart=%h/projects/personal/kolenkainc/cowlic/scripts/run-ingest-local.sh
 # Upper bound for a hung download; systemd then stops the run. 2 h is far above
 # a normal nightly run (a few new tracks, each ~1 min) yet ends a stuck one
