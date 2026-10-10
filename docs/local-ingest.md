@@ -265,6 +265,51 @@ Find the logs in Grafana (Explore, Loki data source of your stack):
 Set the time range to the last 24 hours or more (one run a day). Free tier retention is about 14 days. Whether
 the first live push works is verified by the owner in #108.
 
+### Run metrics (optional)
+
+Added in #105, decided in #106. Right after the log push the same step sends ONE line of Influx line protocol
+(plain text, `POST /api/v1/push/influx/write`, no new dependency) with a few numbers about the run. It needs two
+more keys in `.env` (names only); the token is the same one, and it needs the `metrics:write` scope in addition:
+
+- `INGEST_GRAFANA_PROM_URL`: the Prometheus (metrics) URL of your stack (`https://prometheus-....grafana.net`; the
+  path `/api/v1/push/influx/write` is added if missing). Same rule: https and a `*.grafana.net` host only.
+- `INGEST_GRAFANA_PROM_USER`: the metrics user (instance id; a different id from the Loki one).
+
+Both absent: no metrics, nothing is logged about them. Only one of them, or the log step not configured: no
+metrics. Failure isolation is the same as for the logs: the metrics push has its own 5 s request timeout and 15 s
+deadline inside the wrapper's 30 s limit, is never retried, and its result only changes the one status line in
+`ingest.log` (for example `grafana: loki push ok (HTTP 204); metrics push failed (HTTP 401)`). Because the log
+push comes first, a log push that hangs for its full deadline can leave the metrics push without time; the next
+run is the retry. The values come from the same validated fields of `last-run.json` as the summary line (no
+summary, no metrics) and go through a last check that refuses a body containing the token.
+
+Metrics are integer gauges (the value of the last run; they are not counters), tags `job="cowlic-ingest"` and
+`host`; nothing per track, playlist or failure class as a label. The name is `cowlic_ingest_<field>` (Influx
+measurement `cowlic_ingest`, one series per field, about 15 series in total; the final names are confirmed in the
+first live push, #108):
+
+| Metric | Meaning |
+|---|---|
+| `cowlic_ingest_last_run_timestamp_seconds` | `finished_at` of the run, Unix seconds |
+| `cowlic_ingest_success` | 1 if the exit code was 0, else 0 |
+| `cowlic_ingest_exit_code` | the wrapper exit code |
+| `cowlic_ingest_duration_seconds` | finished minus started |
+| `cowlic_ingest_added`, `_skipped`, `_no_match`, `_too_big`, `_failed`, `_not_attempted` | the run's counts (absent when ingest produced no result) |
+| `cowlic_ingest_failure_partial`, `_config`, `_youtube_sign_in`, `_crash` | 1 for the failure class of the run, else 0 (all 0 means `none`) |
+
+Find them in Grafana (Explore, Prometheus data source of your stack):
+
+```promql
+cowlic_ingest_success                                  # 1 after a good run, 0 after a failed one
+time() - cowlic_ingest_last_run_timestamp_seconds      # seconds since the last run finished
+cowlic_ingest_added                                    # tracks added by the last run
+cowlic_ingest_failure_youtube_sign_in == 1             # runs stopped by the YouTube bot check
+```
+
+The metrics carry the push time, so a night without a run shows as a gap, not as a repeated old value; use
+`last_run_timestamp_seconds` to tell. No alert rules and no dashboard JSON are committed (the owner builds panels
+in the Grafana UI if wanted). Free tier: 10k active series, this uses about 15; metrics retention about 14 days.
+
 ## Per-run limits and the local state file
 
 Added in #119 (the base for the artist source in #121). Without the options below a run behaves as before:

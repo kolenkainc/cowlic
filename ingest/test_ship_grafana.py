@@ -2,6 +2,7 @@
 validate_url is patched to point at the fake server only where a request must actually be sent; its own rules
 are tested directly, and main() with a foreign host must send nothing."""
 import base64
+import calendar
 import contextlib
 import io
 import json
@@ -51,7 +52,8 @@ class Fake:
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
         self.srv.daemon_threads = True
         self.port = self.srv.server_address[1]
-        self.url = f"http://127.0.0.1:{self.port}/loki/api/v1/push"
+        self.base = f"http://127.0.0.1:{self.port}"
+        self.url = f"{self.base}/loki/api/v1/push"
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
 
     def close(self):
@@ -94,7 +96,8 @@ class Base(unittest.TestCase):
     def run_ship(self, fake, offset=0, env=None, **patches):
         """ship() against the fake; returns captured stdout."""
         out = io.StringIO()
-        with contextlib.redirect_stdout(out), mock.patch.object(sg, "validate_url", return_value=fake.url):
+        point = lambda raw, path=sg.PUSH_PATH: fake.base + path  # noqa: E731 - each push goes to its own path
+        with contextlib.redirect_stdout(out), mock.patch.object(sg, "validate_url", side_effect=point):
             with mock.patch.multiple(sg, MAX_LINES=sg.MAX_LINES, **patches):
                 sg.ship(str(self.log), offset, str(self.lr), env=env or self.env(), redact=fake_redact)
         return out.getvalue()
@@ -245,6 +248,194 @@ class PayloadTests(Base):
         self.assertLessEqual(len(lines), sg.MAX_LINES + 1)  # + run_summary
         self.assertTrue(any("lines omitted" in ln for ln in lines))
         self.assertIn("line 2999", lines)  # the tail (finish line) survives the cap
+
+
+PROM_USER = "7654321"
+FIELD_NAMES = {"last_run_timestamp_seconds", "success", "exit_code", "duration_seconds", "added", "skipped",
+               "no_match", "too_big", "failed", "not_attempted", "failure_partial", "failure_config",
+               "failure_youtube_sign_in", "failure_crash"}
+
+
+def parse_influx(body: bytes):
+    """measurement, tags, fields of a one-line Influx payload (no escaping is expected in ours)."""
+    text = body.decode()
+    assert text.endswith("\n") and text.count("\n") == 1, text
+    head, fields = text.strip().split(" ")
+    meas, *tags = head.split(",")
+    return meas, dict(t.split("=") for t in tags), dict(f.split("=") for f in fields.split(","))
+
+
+class MetricsTests(Base):
+    def env(self, fake=None):
+        return {**super().env(), "INGEST_GRAFANA_PROM_URL": f"https://{HOST}", "INGEST_GRAFANA_PROM_USER": PROM_USER}
+
+    def setUp(self):
+        super().setUp()
+        self.log.write_text("a line\n")
+
+    def metrics_requests(self, f):
+        return [r for r in f.requests if r["path"] == sg.METRICS_PATH]
+
+    def test_payload_format(self):
+        f = self.fake()
+        out = self.run_ship(f)
+        (r,) = self.metrics_requests(f)
+        self.assertEqual(r["headers"]["Content-Type"], "text/plain")
+        self.assertEqual(r["headers"]["Authorization"],
+                         "Basic " + base64.b64encode(f"{PROM_USER}:{CANARY_TOKEN}".encode()).decode())
+        meas, tags, fields = parse_influx(r["body"])
+        self.assertEqual(meas, "cowlic_ingest")
+        self.assertEqual(set(tags), {"job", "host"})  # nothing per track, per playlist or per class
+        self.assertEqual(tags["job"], "cowlic-ingest")
+        self.assertEqual(set(fields), FIELD_NAMES)
+        for v in fields.values():
+            self.assertRegex(v, r"^\d+i$")  # integers only: Influx strings are dropped by the server
+        self.assertEqual(fields["added"], "2i")
+        self.assertEqual(fields["skipped"], "1i")
+        self.assertEqual(fields["success"], "1i")
+        self.assertEqual(fields["exit_code"], "0i")
+        self.assertEqual(fields["duration_seconds"], "159i")
+        self.assertEqual(fields["last_run_timestamp_seconds"], f"{calendar.timegm((2026, 10, 10, 19, 12, 40))}i")
+        self.assertTrue(all(fields[k] == "0i" for k in fields if k.startswith("failure_")))
+        self.assertEqual(out.strip(), "grafana: loki push ok (HTTP 204); metrics push ok (HTTP 204)")
+
+    def test_failed_run_values(self):
+        self.lr.write_text(json.dumps({**LAST_RUN, "exit_code": 3, "failure_class": "youtube-sign-in"}))
+        f = self.fake()
+        self.run_ship(f)
+        _, _, fields = parse_influx(self.metrics_requests(f)[0]["body"])
+        self.assertEqual((fields["success"], fields["exit_code"], fields["failure_youtube_sign_in"],
+                          fields["failure_crash"]), ("0i", "3i", "1i", "0i"))
+
+    def test_result_null_has_no_count_fields(self):
+        self.lr.write_text(json.dumps({**LAST_RUN, "result": None}))
+        f = self.fake()
+        self.run_ship(f)
+        _, _, fields = parse_influx(self.metrics_requests(f)[0]["body"])
+        self.assertNotIn("added", fields)
+        self.assertIn("success", fields)
+
+    def test_payload_has_no_secret_or_free_text(self):
+        # the playlist url, log text, the token, both users and the host name of the stack stay out of the body
+        self.log.write_text(f"line with {CANARY_LINE_SECRET}\n")
+        f = self.fake()
+        self.run_ship(f)
+        body = self.metrics_requests(f)[0]["body"].decode()
+        for s in (CANARY_TOKEN, CANARY_USER, PROM_USER, CANARY_LINE_SECRET, "spotify", "line with", HOST, "http"):
+            self.assertNotIn(s, body)
+        self.assertNotIn(base64.b64encode(f"{PROM_USER}:{CANARY_TOKEN}".encode()).decode(), body)
+
+    def test_final_guard_blocks_a_secret(self):
+        f = self.fake()
+        with mock.patch.object(sg, "metrics_line", return_value=f"x f={CANARY_TOKEN}\n"):
+            out = self.run_ship(f)
+        self.assertEqual(self.metrics_requests(f), [])
+        self.assertIn("metrics skipped (secret found in payload, not sent)", out)
+
+    def test_not_asked_for_without_keys(self):
+        f = self.fake()
+        out = self.run_ship(f, env={k: v for k, v in self.env().items() if "PROM" not in k})
+        self.assertEqual(self.metrics_requests(f), [])
+        self.assertEqual(out.strip(), "grafana: loki push ok (HTTP 204)")
+
+    def test_one_key_alone_sends_nothing(self):
+        for drop in ("INGEST_GRAFANA_PROM_URL", "INGEST_GRAFANA_PROM_USER"):
+            f = self.fake()
+            out = self.run_ship(f, env={k: v for k, v in self.env().items() if k != drop})
+            self.assertEqual(self.metrics_requests(f), [])
+            self.assertIn("metrics skipped (not configured)", out)
+
+    def test_bad_credential_format(self):
+        for v in ("a:b", "u\r\nX: 1", " padded"):
+            with self.assertRaises(sg.ShipError):
+                sg.read_metrics_config({**self.env(), "INGEST_GRAFANA_PROM_USER": v}, CANARY_TOKEN)
+
+    def test_url_rules_and_path(self):
+        self.assertEqual(sg.validate_url("https://prometheus-prod-01.grafana.net", sg.METRICS_PATH),
+                         "https://prometheus-prod-01.grafana.net/api/v1/push/influx/write")
+        self.assertEqual(sg.validate_url("https://x.grafana.net/api/v1/push/influx/write", sg.METRICS_PATH),
+                         "https://x.grafana.net/api/v1/push/influx/write")
+        for bad in ("https://evil.com", "http://x.grafana.net", "https://x.grafana.net/loki/api/v1/push",
+                    "https://x.grafana.net/api/v1/push/influx/write?x=1", "https://u:p@x.grafana.net"):
+            with self.assertRaises(sg.ShipError, msg=bad):
+                sg.validate_url(bad, sg.METRICS_PATH)
+        with self.assertRaises(sg.ShipError):  # the metrics path is not accepted for the log push
+            sg.validate_url("https://x.grafana.net/api/v1/push/influx/write")
+
+    def test_foreign_metrics_host_sends_nothing(self):
+        f = self.fake()
+        sent = []  # the real URL validation runs; post is replaced so that nothing can leave the machine
+        env = {**self.env(), "INGEST_GRAFANA_PROM_URL": "https://evil.example.com"}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(
+                sg, "post", side_effect=lambda url, *a, **k: sent.append(url) or "ok (HTTP 204)"):
+            sg.ship(str(self.log), 0, str(self.lr), env=env, redact=fake_redact)
+        self.assertEqual(sent, [f"https://{HOST}/loki/api/v1/push"])  # the log push only
+        self.assertIn("metrics skipped (host is not a *.grafana.net host)", out.getvalue())
+        self.assertNotIn("evil", out.getvalue())
+        self.assertEqual(f.requests, [])
+
+    def test_failures_only_change_the_status_line(self):
+        for code in (401, 429, 500):
+            f = self.fake(code)
+            out = self.run_ship(f)
+            self.assertIn(f"metrics push failed (HTTP {code})", out)
+            self.assertEqual(len(self.metrics_requests(f)), 1, "no retry")
+            for s in (CANARY_TOKEN, CANARY_USER, PROM_USER, HOST):
+                self.assertNotIn(s, out)
+            self.assertEqual(out.splitlines()[0].count("grafana:"), 1)  # one line carries both results
+
+    def test_metrics_failure_while_logs_ok(self):
+        f = self.fake()
+        real = sg.post
+
+        def flaky(url, body, auth, opener=None, content_type="application/json"):
+            if content_type == "text/plain":
+                return "failed (URLError)"
+            return real(url, body, auth, opener, content_type)
+        with mock.patch.object(sg, "post", side_effect=flaky):
+            out = self.run_ship(f)
+        self.assertEqual(out.strip(), "grafana: loki push ok (HTTP 204); metrics push failed (URLError)")
+
+    def test_unexpected_exception_in_metrics_is_contained(self):
+        f = self.fake()
+        with mock.patch.object(sg, "metrics_line", side_effect=RuntimeError(f"boom {CANARY_TOKEN}")):
+            out = self.run_ship(f)
+        self.assertEqual(out.strip(), "grafana: loki push ok (HTTP 204); metrics failed (RuntimeError)")
+        self.assertNotIn(CANARY_TOKEN, out)
+
+    def test_no_last_run_means_no_metrics(self):
+        self.lr.write_text("garbage")
+        f = self.fake()
+        out = self.run_ship(f)
+        self.assertEqual(self.metrics_requests(f), [])
+        self.assertIn("metrics skipped (no last-run.json for this run)", out)
+
+    def test_nan_in_last_run_means_no_metrics(self):
+        self.lr.write_text(json.dumps(LAST_RUN).replace('"added": 2', '"added": NaN'))
+        f = self.fake()
+        self.run_ship(f)
+        self.assertEqual(self.metrics_requests(f), [])
+
+    def test_timeout_and_deadline(self):
+        f = self.fake("hang")
+        t = time.monotonic()
+        out = self.run_ship(f, REQUEST_TIMEOUT_S=30, OVERALL_DEADLINE_S=0.5)
+        self.assertLess(time.monotonic() - t, 6)
+        self.assertIn("metrics push failed (deadline)", out)
+
+    def test_redirect_not_followed(self):
+        f = self.fake("redirect")
+        out = self.run_ship(f)
+        self.assertIn("metrics push failed (HTTP 302)", out)
+        self.assertNotIn("/elsewhere", [r["path"] for r in f.requests])
+
+    def test_main_exits_zero_whatever_happens(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.dict(os.environ, self.env(), clear=True), \
+                mock.patch("tg_check.load_env"), mock.patch.object(sg, "ship", side_effect=RuntimeError("x")):
+            rc = sg.main(["--log", str(self.log), "--offset", "0", "--last-run", str(self.lr)])
+        self.assertEqual(rc, 0)
 
 
 class SliceTests(Base):
