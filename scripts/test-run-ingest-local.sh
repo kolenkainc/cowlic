@@ -17,11 +17,24 @@ new_case() {
   C="$TMP/$1"; R="$C/root"; S="$C/state"
   mkdir -p "$R/scripts" "$R/ingest/.venv/bin" "$S"
   cp "$ROOT/scripts/run-ingest-local.sh" "$R/scripts/"
-  printf '#!/bin/sh\n[ -z "${STUB_PREREQ_FAIL:-}" ] || { echo "MISSING  stub: fix it"; exit 1; }\necho "All prerequisites present."\n' > "$R/scripts/check-local-prereqs.sh"
+  # Stub prereqs: STUB_PREREQ_FAIL = another prerequisite missing (fatal); STUB_DENO_MISSING = only deno
+  # missing: WARN with --deno-optional (exit 0), MISSING without it (exit 1), like the real script.
+  cat > "$R/scripts/check-local-prereqs.sh" <<'SH'
+#!/bin/sh
+echo "$@" > "$STUB_PREREQ_ARGS_FILE"
+[ -z "${STUB_PREREQ_FAIL:-}" ] || { echo "MISSING  stub: fix it"; exit 1; }
+if [ -n "${STUB_DENO_MISSING:-}" ]; then
+  if [ "${1:-}" = --deno-optional ]; then echo "WARN     deno: not on PATH"; else echo "MISSING  deno: not on PATH"; exit 1; fi
+fi
+echo "All prerequisites present."
+SH
+  export STUB_PREREQ_ARGS_FILE="$C/prereq_args"
+  # Stub python variant below also reports whether the lock fd 9 leaked into the child.
   # Stub python: records its args, prints a line, optionally sleeps, exits with STUB_RC.
   cat > "$R/ingest/.venv/bin/python" <<'PY'
 #!/bin/sh
 echo "$@" > "$STUB_ARGS_FILE"
+if [ -e /proc/self/fd/9 ]; then echo leaked > "$STUB_ARGS_FILE.fd9"; fi
 echo "stub ingest output"
 [ -z "${STUB_SLEEP:-}" ] || sleep "$STUB_SLEEP"
 exit "${STUB_RC:-0}"
@@ -41,6 +54,17 @@ assert "ingest gets --sources sources.yml" "$(grep -q -- "ingest.py --sources $R
 assert "log has ingest output" "$(grep -q 'stub ingest output' "$(LOGF)" && echo 0 || echo 1)"
 assert "log has start and finished lines" "$(grep -q 'finished: exit code 0, ok' "$(LOGF)" && echo 0 || echo 1)"
 assert "state dir is private" "$([ "$(stat -c %a "$S/cowlic")" = 700 ] && echo 0 || echo 1)"
+
+assert "python runs unbuffered (-u)" "$(grep -q -- '^-u ' "$STUB_ARGS_FILE" && echo 0 || echo 1)"
+assert "prereqs called with --deno-optional" "$(grep -qx -- '--deno-optional' "$STUB_PREREQ_ARGS_FILE" && echo 0 || echo 1)"
+assert "lock fd not inherited by ingest" "$([ ! -e "$STUB_ARGS_FILE.fd9" ] && echo 0 || echo 1)"
+
+# 1b. only deno missing: ingest still runs, warning logged, exit 0
+new_case deno; STUB_DENO_MISSING=1; export STUB_DENO_MISSING; run
+assert "deno missing: exit 0" "$([ "$rc" = 0 ] && echo 0 || echo 1)"
+assert "deno missing: ingest ran" "$([ -s "$STUB_ARGS_FILE" ] && echo 0 || echo 1)"
+assert "deno missing: warning in log" "$(grep -q 'prerequisites: WARN     deno' "$(LOGF)" && echo 0 || echo 1)"
+unset STUB_DENO_MISSING
 
 # 2. non-zero ingest exit codes pass through (including one through the pipe to tee)
 for code in 1 3 42; do
@@ -76,6 +100,14 @@ assert "failed prereqs exit 78" "$([ "$rc" = 78 ] && echo 0 || echo 1)"
 assert "failed prereqs logged" "$(grep -q 'MISSING  stub' "$(LOGF)" && echo 0 || echo 1)"
 assert "failed prereqs did not start ingest" "$([ ! -e "$STUB_ARGS_FILE" ] && echo 0 || echo 1)"
 unset STUB_PREREQ_FAIL
+new_case prereq2; STUB_PREREQ_FAIL=1; STUB_DENO_MISSING=1; export STUB_PREREQ_FAIL STUB_DENO_MISSING; run
+assert "other missing prereq plus deno: still 78" "$([ "$rc" = 78 ] && echo 0 || echo 1)"
+unset STUB_PREREQ_FAIL STUB_DENO_MISSING
+
+# 5b. unset HOME and XDG_STATE_HOME: clear message, exit 78
+new_case nohome; rc=0
+env -u HOME -u XDG_STATE_HOME bash "$R/scripts/run-ingest-local.sh" > "$C/out" 2>&1 || rc=$?
+assert "no HOME: exit 78 with message" "$([ "$rc" = 78 ] && grep -q 'neither XDG_STATE_HOME nor HOME' "$C/out" && echo 0 || echo 1)"
 
 # 6. rotation by size, keeping at most COWLIC_LOG_KEEP files
 new_case rot; mkdir -p "$S/cowlic"

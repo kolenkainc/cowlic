@@ -14,6 +14,10 @@ set +x
 set -uo pipefail
 umask 077
 
+if [ -z "${XDG_STATE_HOME:-}" ] && [ -z "${HOME:-}" ]; then
+  echo "run-ingest-local: neither XDG_STATE_HOME nor HOME is set; cannot place the log" >&2
+  exit 78  # EXIT_PREREQ (defined below)
+fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cowlic"
 LOG="$STATE_DIR/ingest.log"
@@ -79,17 +83,24 @@ fi
 
 PREREQ="$ROOT/scripts/check-local-prereqs.sh"
 if [ -x "$PREREQ" ]; then
-  prereq_out="$("$PREREQ" 2>&1)"
+  # deno is optional here: ingest.py runs without it and only logs a warning, so a deno problem is a WARN line.
+  prereq_out="$("$PREREQ" --deno-optional 2>&1)"
   prereq_rc=$?
   if ((prereq_rc != 0)); then
     log "ERROR prerequisites check failed:"
     printf '%s\n' "$prereq_out" | tee -a "$LOG"
     exit "$EXIT_PREREQ"
   fi
+  # Log the warnings only (the "ok" lines are noise on every run).
+  while IFS= read -r line; do
+    case "$line" in WARN*) log "prerequisites: $line" ;; esac
+  done <<<"$prereq_out"
 fi
 
 # Pipe through tee for the log; the ingest exit code comes from PIPESTATUS, so tee cannot hide it.
-"$VENV_PY" "$ROOT/ingest/ingest.py" --sources "$ROOT/sources.yml" 2>&1 | tee -a "$LOG"
+# -u: unbuffered, so a run killed by systemd's timeout still leaves its latest output in the log.
+# 9>&-: the lock descriptor is not inherited by ingest and its children.
+"$VENV_PY" -u "$ROOT/ingest/ingest.py" --sources "$ROOT/sources.yml" 9>&- 2>&1 | tee -a "$LOG"
 rc=${PIPESTATUS[0]}
 
 log "finished: exit code $rc, $(describe_ingest_exit "$rc")"

@@ -58,6 +58,21 @@ assert "deno 2.10.0 accepted over 2.3.0" "$([ "$RC" = 0 ]; echo $?)"
 new_case v23; set_deno v23 2.3.0; run v23
 assert "deno 2.3.0 accepted (boundary)" "$([ "$RC" = 0 ]; echo $?)"
 
+# --deno-optional: deno problems become WARN and keep exit 0; other problems stay fatal.
+run_opt() { set +e; OUT="$(PATH="$TMP/$1/bin" CHECK_REPO_ROOT="$TMP/$1/root" "$BASH_BIN" "$SCRIPT" --deno-optional 2>&1)"; RC=$?; set -e; }
+new_case dopt_missing; rm "$TMP/dopt_missing/bin/deno"; run_opt dopt_missing
+assert "--deno-optional, deno missing: exit 0" "$([ "$RC" = 0 ]; echo $?)"
+assert "--deno-optional, deno missing: WARN line" "$(grep -q 'WARN     deno' <<<"$OUT"; echo $?)"
+assert "--deno-optional, deno missing: no MISSING" "$(! grep -q MISSING <<<"$OUT"; echo $?)"
+new_case dopt_old; set_deno dopt_old 2.2.9; run_opt dopt_old
+assert "--deno-optional, deno too old: exit 0 and WARN" "$([ "$RC" = 0 ] && grep -q 'WARN     deno' <<<"$OUT"; echo $?)"
+new_case dopt_ok; run_opt dopt_ok
+assert "--deno-optional, deno present: exit 0, no WARN" "$([ "$RC" = 0 ] && ! grep -q WARN <<<"$OUT"; echo $?)"
+new_case dopt_noff; rm "$TMP/dopt_noff/bin/deno" "$TMP/dopt_noff/bin/ffmpeg"; run_opt dopt_noff
+assert "--deno-optional, ffmpeg missing still fatal" "$([ "$RC" = 1 ] && grep -q 'MISSING  ffmpeg' <<<"$OUT"; echo $?)"
+new_case dopt_bad; set +e; OUT="$(PATH="$TMP/dopt_bad/bin" CHECK_REPO_ROOT="$TMP/dopt_bad/root" "$BASH_BIN" "$SCRIPT" --nope 2>&1)"; RC=$?; set -e
+assert "unknown option: exit 2" "$([ "$RC" = 2 ]; echo $?)"
+
 new_case noff; rm "$TMP/noff/bin/ffmpeg"; run noff
 assert "ffmpeg missing: exit 1" "$([ "$RC" = 1 ]; echo $?)"
 assert "ffmpeg missing: message" "$(grep -q 'MISSING  ffmpeg' <<<"$OUT"; echo $?)"
