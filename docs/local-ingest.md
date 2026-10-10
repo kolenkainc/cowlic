@@ -649,9 +649,106 @@ Rules (a violation ends the run with exit 78 before ingest starts, with one log 
 
 With a cap of 200 a night, about 2,500 tracks take about 13 nights and 40,000 about 200.
 
+## Last.fm match-rate report (the gate before the Last.fm source)
+
+Before any Last.fm track is downloaded (umbrella #102, ticket #153) measure how well the Last.fm path would work.
+`ingest/lastfm_report.py` is the sibling of `match_report.py` above, with the same CSV rules, throttle and gate
+(#92: matched >= 80% AND wrong <= 2%). It makes read-only Last.fm calls and YouTube Music searches only: no
+download, no upload, no Telegram, no D1 write, no cookies, no Spotify. It is NOT part of the 21:10 run and does not
+touch `sources.yml`: the nightly timer must not use the `lastfm_artists` section (see the next section); the bootstrap
+that does the real first run comes in Release 3 (#163), and this report is the go / no-go gate before its first
+session. The owner runs it by hand; the first run is the owner's (#154).
+
+Setup: `LASTFM_API_KEY=<key>` in the local `.env` (name only here; never in a command line, a log or the CSV). The
+Last.fm profile must be public (listening data private gives error 17, a clear message, no CSV). The user name is
+given on the command line and is not printed.
+
+```sh
+ingest/.venv/bin/python ingest/lastfm_report.py --lastfm-user <name> \
+    [--years 5] [--artists 100] [--sample-artists 10] [--max-tracks 150] [--max-minutes 45] \
+    [--min-interval 1.0] [--check-stored] [--out match-report-lastfm-NAME.csv]
+ingest/.venv/bin/python ingest/lastfm_report.py --summarize match-report-lastfm-NAME.csv   # offline, after labelling
+```
+
+What a run does, in order:
+
+1. Ranks the top `--artists` artists (default 100) of the last `--years` (default 5) from the weekly charts: about 53
+   calls per year, about 261 for 5 years, 1 call per second, so about 5 minutes before anything else happens.
+2. Takes `--sample-artists` of them (default 10, at most 50) evenly spaced over the ranking (ranks 1, 11, 21, ...),
+   so the sample covers the head and the tail of the 100, not only the favourites. Enumerates their tracks (the 20
+   most popular albums per artist, at most 30 Last.fm calls each) and collapses duplicate recordings.
+3. Takes a deterministic sample of at most `--max-tracks` tracks (default 150, at most 1000) shared between the
+   artists and matches each one the way the pipeline would: with the Last.fm duration (+-3 s) when Last.fm has one,
+   by title and artist only when it has none (the title-only mode).
+4. With `--check-stored` it also reads the stored tracks from D1 (one parameterless read-only SELECT, the same one
+   the pipeline uses for the cross-source dedupe) and marks sampled tracks that are already stored under another id
+   (`stored`; those are not searched and are left out of the match rate). It needs `CLOUDFLARE_ACCOUNT_ID`,
+   `D1_DATABASE_ID` and `INGEST_CLOUDFLARE_API_TOKEN` in `.env` (the ingest token is write-capable, which is why the
+   check is opt-in and read-only by construction). Without them, or when D1 fails, the report prints one
+   `stored check: skipped (...)` line and goes on; it never fails because of it.
+
+Hard caps (all of them stop the run, write the CSV and exit 2): `--max-tracks` tracks, so at most 4 x that many
+YouTube searches; `--max-minutes` wall time (default 45, at most 240; checked between tracks and artists, so the
+ranking itself, about 5 minutes, always completes unless the call budget stops it); a Last.fm budget (ranking bound plus
+30 calls per sampled artist, shown in the summary); at least 1 s between two searches (`--min-interval`, never
+faster); a stop after 3 failed searches in a row or 3 failed artists in a row. A YouTube sign-in challenge stops the
+run at once and is not bypassed (no cookies, proxies, PO-token tricks or client rotation, decision #62). With the
+defaults a run takes roughly 15-25 minutes. Do not run it in a loop.
+
+Output: `match-report-lastfm-<UTC time>.csv` in the current directory (the name must match `match-report*.csv`, which is
+gitignored; an existing file is never overwritten; UTF-8 with BOM, mode 0600). Titles are untrusted text: control
+characters are stripped and a cell starting with `=`, `+`, `-` or `@` gets a leading apostrophe. Do not commit it.
+Columns: `artist_rank, artist, title, lastfm_duration_s, mode, matched_title, matched_artists, matched_duration_s,
+duration_delta_s, similarity, status, reason, pattern, reviewed`.
+
+- `mode` is `duration` or `title-only` (the mode the track was tried in). `status` is `matched`, `no_match` (the
+  matched columns then show the closest YouTube result), `stored` or `error`. `reason` for a `no_match` row: `title`
+  (nothing similar enough), `duration` (duration mode: right title, duration off by more than 3 s),
+  `artist_variant_or_length` (title-only mode: the title fit but the artist, a live/remix/cover word or a length
+  outside 60-600 s rejected it), `no_results`. `pattern` is the same failing-pattern tag as in the Spotify report.
+- Title-only matches have no duration check, so they are the risky ones: `matched_artists` and `matched_duration_s`
+  are there for the eyeball check. Thresholds of that mode (`ingest/match.py`): title similarity >= 0.93, artist
+  similarity >= 0.6 against any returned artist name (the 0.6 is loose; judge it on the numbers), candidate length
+  60-600 s, and none of the variant words (live, remix, edit, acoustic, cover, ...) that the requested title lacks.
+  The duration mode keeps title >= 0.85 and +-3 s.
+
+The summary on stdout gives: artists ranked and sampled; tracks listed and unique; the share WITH and WITHOUT a
+Last.fm duration (how often Last.fm gives none, overall and in the sample); Last.fm calls and YouTube searches
+against their budgets; the stored check line; matched / no_match / stored / error overall and per mode, so the
+title-only matches are never mixed into the duration ones; the match rate overall and per mode
+(`matched / (matched + no_match)`); the wrong rate overall and per mode; the verdict; the failing patterns; the 15
+title-only matches with the lowest title similarity; the 15 lowest-similarity failures; and a per-artist table.
+Exit code 0 normally, 2 if the run stopped early or an artist failed (the CSV is still written), 1 for invalid input
+or a missing or malformed key.
+
+How to label and read it:
+
+1. Open the CSV. In the `reviewed` column write `ok` or `wrong` for matched rows: open the matched video on
+   https://music.youtube.com (a live, remix or cover version, or another artist's track with the same title, is
+   `wrong`). Label EVERY `title-only` matched row if there are fewer than about 50, else a random 50 of them, and a
+   random 50 of the `duration` matched rows. Any other value is counted as unrecognised and ignored; rows that are
+   not `matched` are ignored.
+2. Run `--summarize` on the labelled file (offline, needs no key). It prints the same figures with the wrong rates:
+   `wrong / (ok + wrong)` overall, for `duration` and for `title-only`. The title-only mode is judged on its own
+   wrong rate: it has to be <= 2% by itself even when the overall rate is fine. A mode with matched rows but no labels
+   keeps the verdict at "not a go yet". A sample under 30 compared tracks, or under 30 labelled rows in a mode, is only
+   a hint, and the summary says so. Rate below 80% with a good wrong rate means tuning the matcher by the most
+   frequent failing pattern; a high wrong rate in the title-only mode means raising its thresholds or turning it off.
+3. Write the numbers and the decision in #154. Check also: how many tracks Last.fm gives no duration for (a high share
+   means most matches are title-only), and the per-artist lines (one artist at 20% in an otherwise good sample is a
+   finding).
+
+Last.fm terms followed by this report and by the source (ingest/lastfm.py, clause numbers [R], to be re-checked
+against https://www.last.fm/api/tos): non-commercial use only (this is a private library); no use of Last.fm audio,
+images or artwork (names, playcounts, album and track names only; the report never reads covers); credit Last.fm with a
+link wherever its data is shown to other people; caching follows the HTTP headers (nothing is cached); at most 1
+call per second with bounded backoff. The 5-year window is the sum of the weekly artist charts that lie completely
+inside it (`user.getWeeklyChartList` + one `user.getWeeklyArtistChart` per week), because the other methods have no
+from/to range.
+
 ## Last.fm artists (your most listened artists, no playlist)
 
-Added in #152 (short version; the full runbook is #153). `sources.yml` can have a `lastfm_artists:` section. A run
+Added in #152 (the report that gates it is the section above). `sources.yml` can have a `lastfm_artists:` section. A run
 then also takes your top artists by listening over the last years from Last.fm and ingests their tracks through the
 same pipeline as a playlist (cap, state file, pacing and the YouTube sign-in stop apply unchanged). It is opt-in:
 a file without the section, or with `enabled: false`, behaves exactly as before. It may be combined with playlists
@@ -681,7 +778,17 @@ JSON gets an additive `lastfm_artists` object (counts only, including `dropped_s
 counted in `matched_title_only` and logged as `(matched by title only)`.
 
 The 21:10 nightly timer must not use the `lastfm_artists` section (the first run is slow and unbounded by default);
-a separate bootstrap process comes in Release 3 (#163, #168).
+a separate bootstrap process comes in Release 3 (#163, #168). Do not enable the section in the nightly `sources.yml`
+to try it: measure first with the report above, and take the dry run and the first capped session from the bootstrap
+runbook when it exists (#170).
+
+Ids and dedupe: Last.fm has no track ids, so a track gets `lfm:` + the first 16 hex digits of a SHA-256 of the
+normalised artist and title (the album is not part of it, so one title on two albums is one track). A track whose
+artist, title and duration (+-3 s; artist and title only when a side has no duration) are already stored under another
+id, say from a Spotify playlist, is dropped before any search (counted as `dropped_stored`). A track without a Last.fm
+duration is matched in the title-only mode (thresholds in the report section), and counted as `matched_title_only`.
+Terms of use of the Last.fm data and the no-bypass rule for the YouTube bot check: see the report section and
+"YouTube sign-in failure (exit 3)".
 
 Known limitations:
 
