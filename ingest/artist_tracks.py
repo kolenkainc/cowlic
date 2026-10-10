@@ -28,6 +28,7 @@ Spotify docs relied on (read 2026-10-10):
 """
 import argparse
 import base64
+import http.client
 import json
 import os
 import re
@@ -110,7 +111,7 @@ def default_fetch(url: str, headers: dict, timeout: float) -> tuple[int, dict, d
             status, hdrs, raw = r.status, r.headers, r.read()
     except urllib.error.HTTPError as e:
         status, hdrs, raw = e.code, e.headers, e.read()
-    except (urllib.error.URLError, OSError) as e:  # includes timeouts; the class name only
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as e:  # includes timeouts; the class name only
         raise ArtistTracksError(f"network error talking to Spotify ({type(e).__name__})") from None
     try:
         body = json.loads(raw)
@@ -130,7 +131,7 @@ def client_credentials_token(client_id: str, client_secret: str, timeout: float 
             status, raw = r.status, r.read()
     except urllib.error.HTTPError as e:
         status, raw = e.code, e.read()
-    except (urllib.error.URLError, OSError) as e:
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
         raise ArtistTracksError(f"network error getting a Spotify token ({type(e).__name__})") from None
     try:
         body = json.loads(raw)

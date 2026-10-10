@@ -367,7 +367,7 @@ decision and the top failing patterns in #112. Do not commit the CSV.
 |---|---|---|---|
 | 0 | ingest | Everything done; new tracks added, others already present | `none` |
 | 1 | ingest | Some track or playlist failed, or sources/`.env` invalid | `partial` or `config` |
-| 2 | ingest | Bad command-line usage (only when calling ingest directly) | none written |
+| 2 | ingest | Bad command-line usage (only when calling ingest directly), or `followed_artists` is enabled but the Spotify user login is missing or rejected (nothing ran; the result file, if requested, says `config`) | none written, or `config` |
 | 3 | ingest | YouTube asked to sign in; rest of the run skipped | `youtube-sign-in` |
 | 75 | wrapper | Another run holds the lock; nothing ran | not written |
 | 78 | wrapper | A required prerequisite or the venv is missing, or (before the lock) `flock` is missing, the state dir is unusable, neither `HOME` nor `XDG_STATE_HOME` is set, or `cd` to the repo fails; nothing ran. `last-run.json` is written (class `config`) only for failures after the lock is taken (venv, prerequisite check); for the pre-lock failures none is written (flock missing: one ERROR line in the log if the state dir exists, otherwise stderr only) | `config` or not written |
@@ -403,6 +403,102 @@ with `?si=...`. The playlist or album must be public. Private playlists and Like
 invalid line fails the whole run (exit 1, class `config`). URLs are public data; never put secrets in the file.
 Test a new entry with `ingest/.venv/bin/python ingest/ingest.py --sources sources.yml --dry-run`.
 
+## Followed artists (all artists you follow, no playlist)
+
+Added in #121. `sources.yml` can have a `followed_artists:` section. A run then also takes the artists the owner
+follows on Spotify, lists each artist's releases and tracks, removes duplicate recordings across releases
+(single + album + deluxe, `ingest/dedupe.py`) and feeds the result into the same per-track pipeline as a
+playlist. Nothing is created or changed on Spotify: the login scope is `user-follow-read` (read only) and no
+playlist is made anywhere. The D1 schema is unchanged.
+
+**It is off until you add the section.** The repo's `sources.yml` has no such section, so the nightly timer run
+behaves exactly as before until the owner opts in (a file without the section is parsed and run as before).
+
+### Format
+
+The playlist list stays as it is. The section is added next to it. Strict, dependency-free: indentation is exactly
+two spaces for keys and four for the `exclude` items; whole-line `#` comments and blank lines are allowed; no
+inline comments, no other YAML. Unknown or repeated keys, a bad value, a repeated id or a repeated section fail
+the whole run with exit 1 (class `config`) before anything runs.
+
+```yaml
+# (commented example, put it at the end of sources.yml when you opt in)
+# followed_artists:
+#   enabled: true          # false turns the source off without deleting the section; default true
+#   max_artists: 50        # artists started per run, 1..10000; default: no limit
+#   rescan_days: 7         # a fully scanned artist is looked at again after this many days, 0..3650; default 7
+#   groups: album,single   # Spotify release groups: album, single, compilation, appears_on; default album,single
+#   market: US             # ISO 3166-1 alpha-2, upper case; default US
+#   exclude:               # artist ids that are never ingested
+#     - <22-character artist id>
+```
+
+(Remove the leading `# ` of every line of the section to enable it.) The first-run recipe below lists your followed
+artists with their ids: `python ingest/spotify_user.py followed` prints `name<TAB>id`. A file with only the
+section and no playlist is valid; a file with `enabled: false` and no playlist is not (nothing to do).
+Not supported (deliberately, to keep the parser strict and small): exclude by name, a title filter (`skip_titles`),
+other keys.
+
+### What a run does
+
+1. Reads the followed list (read scope, token refreshed from `SPOTIFY_USER_REFRESH_TOKEN`). Repeated artist ids
+   across pages are dropped. Ids on `exclude` are skipped.
+2. Playlists first (if any), then the artists in the order Spotify returns them. An artist scanned to the end
+   less than `rescan_days` ago is skipped without any Spotify call.
+3. Per artist: enumerate releases and tracks (Client Credentials, the same `SPOTIFY_CLIENT_ID/SECRET`), collapse
+   duplicate recordings (earliest release wins; a recording already stored under another release is not
+   downloaded again), then the normal per-track pipeline: already stored tracks are skipped, tracks in cooldown
+   are skipped, the rest are matched, downloaded (paced, with backoff) and stored.
+4. When the artist's last track was handled the day is recorded in the state file (`"artists"` key, ids and
+   dates only). An artist stopped by the cap, the time limit or a sign-in challenge is not recorded: the next run
+   starts there again and adds only what is missing. A track that failed in an otherwise complete scan is
+   retried through its normal cooldown (`--retry-failed-days`) when the artist is rescanned, not by the artist
+   record. An artist whose enumeration fails (Spotify error) is logged (`ERROR artist <name>: enumeration
+   failed`), counted, not recorded (so the next run retries it), the others go on, and the exit code is 1.
+5. Everything from the sections above applies unchanged: `--max-new` (shared with the playlists), `--max-minutes`,
+   cooldowns, pacing and backoff, and the YouTube sign-in stop (the first challenge ends the whole run, exit 3).
+   `max_artists` counts artists started in this run (including one whose enumeration failed), not the skipped
+   ones, so a run with `max_artists: 50` works through the list in batches over several nights.
+
+The log gets one line per artist with counts (`artist <name>: listed N, unique N, dropped N` and the result) and
+one `followed artists: ...` line; `last-run.json` -> `result` gets a `followed_artists` object (status, track
+counts and artist counts `listed, excluded, skipped_recent, deferred, scanned, failed, not_started`) and its
+track counts are part of `counts`. Counts only: no artist id or name is written there.
+
+### First run (owner steps, #111 and #113)
+
+Not run by the author (no network or login was used while building this). Do these on the laptop, in order:
+
+1. Once: `ingest/.venv/bin/python ingest/spotify_user.py login`, open the printed URL, approve (scope
+   `user-follow-read`). The refresh token is stored in `.env` as `SPOTIFY_USER_REFRESH_TOKEN` (valid about 6 months;
+   run `login` again on `invalid_grant`). This is the owner ticket #111.
+2. Optional check: `ingest/.venv/bin/python ingest/spotify_user.py followed` lists the followed artists and the total.
+3. Add the section to `sources.yml` (see above) in a branch/PR with `max_artists` small, e.g. 5, and the ids of
+   artists you do not want in `exclude`.
+4. Dry run, nothing is downloaded or stored and the artist state is not written (it still reads D1, Spotify and
+   YouTube Music, and counts matches against the cap):
+   `ingest/.venv/bin/python ingest/ingest.py --sources sources.yml --dry-run --max-new 20 --state-file /tmp/dry-state.json`
+5. First capped run by hand: `ingest/.venv/bin/python ingest/ingest.py --sources sources.yml --max-new 50 --max-minutes 60`,
+   then read the log and `last-run.json`-style result (`--result-json /tmp/r.json`). Repeat; a re-run adds only new
+   tracks. This is the owner ticket #113.
+
+Without `SPOTIFY_USER_REFRESH_TOKEN` (or with a rejected one) the run does nothing: it logs one `ERROR` line with
+the fix and exits with code 2 (class `config`; before any playlist is run, so fix the login or set
+`enabled: false`). A sources file without the section never needs the login.
+
+### The cap and the 21:10 timer
+
+The wrapper `scripts/run-ingest-local.sh` does not forward ingest options yet, so the timer run has NO cap and no
+time limit: with the section enabled and a big followed list, the first night would try to ingest everything
+(about 5-10 s pause plus the download per track; the unit stops at `TimeoutStartSec=2h`, and a run killed by that
+timeout writes no `last-run.json`). Until the wrapper forwards options, either run the backlog by hand with the
+options above, or set `max_artists` small in `sources.yml` so a night stays short. Progress is kept either way: a
+killed run keeps what the state file and D1 already hold, and the next run continues. Follow-up for the wrapper
+(not done here): let `run-ingest-local.sh` append extra ingest arguments from one environment variable, for
+example `COWLIC_INGEST_ARGS="--max-new 200 --max-minutes 90"` set in the unit with `Environment=`, expanded
+unquoted into the command line, with a test in `scripts/test-run-ingest-local.sh`. With a cap of 200 a night,
+about 2,500 tracks take about 13 nights and 40,000 about 200.
+
 ## Troubleshooting
 
 | Symptom | Likely cause and fix |
@@ -416,4 +512,6 @@ Test a new entry with `ingest/.venv/bin/python ingest/ingest.py --sources source
 | Unit fails immediately with status 203 or 200 | Wrong repo path in `WorkingDirectory` / `ExecStart`; fix both, `daemon-reload` |
 | `ffmpeg` not found only under systemd | The unit's `PATH` lacks its directory; extend the `Environment=PATH=` line |
 | Timer did not run last night | Machine was off or you were logged out; see Persistent and linger above; check `finished_at` in `last-run.json` |
+| Exit 2, log says `SPOTIFY_USER_REFRESH_TOKEN is not set` or `invalid_grant` | `followed_artists` is on but there is no valid Spotify login: `ingest/.venv/bin/python ingest/spotify_user.py login` (once; valid about 6 months), or set `enabled: false` in the section |
+| `ERROR artist <name>: enumeration failed` | Spotify error for that artist (rate limit, 5xx, network); exit 1, the others went on, the artist is retried by the next run |
 | Track skipped as `no_match` or `too_big` | No acceptable YouTube Music match (title and duration within 3 s), or the mp3 exceeds Telegram's 20 MB limit (about 10 minutes at 256k) |

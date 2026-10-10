@@ -15,7 +15,7 @@
 
 ### 2.1 Ingest (owner's machine, scheduled local run)
 Ingest runs on the owner's own machine (cron or a systemd timer) from the same `ingest/ingest.py`, over the normal home connection. GitHub Actions no longer runs ingest: YouTube answers every download from GitHub-hosted runners with "Sign in to confirm you're not a bot" (observed in run 38056689770, see #15), so the workflow was removed. The bot check is not bypassed (no account cookies, proxies, PO-token tricks or client rotation). The machine needs ffmpeg, Deno and the Python dependencies, and reads its configuration from the local gitignored `.env`. Observability is logs only (no notifications, decision #72): a redacted rotating log and `last-run.json`, see [local-ingest.md](local-ingest.md). The steps below are unchanged.
-- Список плейлистов/альбомов лежит в репозитории (`sources.yml`).
+- Список плейлистов/альбомов лежит в репозитории (`sources.yml`). Необязательная секция `followed_artists:` (с версии Release 2, #121) добавляет все треки артистов, на которых подписан владелец: список подписок читается пользовательским токеном (только `user-follow-read`, никаких плейлистов не создаётся и не меняется), треки каждого артиста перечисляются через Client Credentials (`ingest/artist_tracks.py`), дубликаты записей между релизами схлопываются (`ingest/dedupe.py`), затем те же самые шаги для каждого трека. Прогресс по артистам хранится в локальном файле состояния (артист, просканированный до конца, пересматривается не чаще раза в `rescan_days`, по умолчанию 7), на артистов действуют те же лимит `--max-new`, пауза/backoff и остановка на первом запросе входа YouTube. Без этой секции в `sources.yml` поведение прежнее. Формат и запуск: [local-ingest.md](local-ingest.md).
 - `spotdl` берёт метаданные из Spotify, аудио ищет на YouTube Music и вшивает теги и обложку.
 - Скрипт сравнивает `spotify_id` с D1 и обрабатывает только новые треки.
 - Аудио уходит в приватный Telegram-канал через Bot API (`sendDocument`/`sendAudio`).
@@ -139,7 +139,7 @@ cowlic/
 ## 6. Решения для POC
 - **Формат:** только mp3. Битрейт задаётся в spotdl (`--bitrate`), для укладки в лимит 20 МБ подойдёт 192-256k (трек на 8 минут при 256k ≈ 15 МБ). Ingest пропускает файлы > 20 МБ.
 - **Пользователь:** один. Единственная пара `SUBSONIC_USER`/`SUBSONIC_PASSWORD`, без таблицы пользователей.
-- **Источник списка треков:** плейлисты Spotify, перечисленные в `sources.yml`. Доступ через Client ID/Secret (Client Credentials flow), это даёт **только публичные плейлисты и альбомы**. Лайки (Liked Songs) и приватные плейлисты требуют OAuth с пользовательским токеном и в POC не входят. Обходной путь: сделать нужный плейлист публичным.
+- **Источник списка треков:** плейлисты Spotify, перечисленные в `sources.yml`. Доступ через Client ID/Secret (Client Credentials flow), это даёт **только публичные плейлисты и альбомы**. Лайки (Liked Songs) и приватные плейлисты требуют OAuth с пользовательским токеном и в POC не входят. Обходной путь: сделать нужный плейлист публичным. Release 2 добавляет второй источник: артисты, на которых подписан владелец (секция `followed_artists` в `sources.yml`, пользовательский токен только на чтение списка подписок, см. раздел 2.1). Плейлисты при этом не создаются.
 
 ## 7. Открытые вопросы
 - Нужны ли лайки и приватные плейлисты после POC (тогда добавляем OAuth с refresh token в GH Secrets)?
