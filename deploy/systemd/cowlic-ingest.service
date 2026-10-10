@@ -1,0 +1,23 @@
+# User unit: one local ingest run. Started by cowlic-ingest.timer.
+# Install and enable instructions live in the runbook (docs/local-ingest.md, #67).
+#
+# - Secrets are NOT set here: the wrapper reads .env itself (no EnvironmentFile=).
+# - No Restart= and no OnFailure=: a failed run is not retried and sends no
+#   notification; see the log and the last-run status file instead.
+# - Overlap protection is the wrapper's flock (#64); no second locking here.
+# - The path below assumes the repo is checked out at
+#   ~/projects/personal/kolenkainc/cowlic; adjust WorkingDirectory and
+#   ExecStart together if it lives elsewhere.
+[Unit]
+Description=cowlic local ingest (Spotify playlists to Telegram and D1)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/personal/kolenkainc/cowlic
+# deno (yt-dlp challenge solving) usually lives in ~/.deno/bin, ffmpeg in /usr/bin.
+Environment=PATH=%h/.deno/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/projects/personal/kolenkainc/cowlic/scripts/run-ingest-local.sh
+# Upper bound for a hung download; systemd then stops the run. 2 h is far above
+# a normal nightly run (a few new tracks, each ~1 min) yet ends a stuck one
+# well before the next 21:10 slot.
+TimeoutStartSec=2h
