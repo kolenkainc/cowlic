@@ -259,6 +259,34 @@ error, logs none). The same value is `stop_reason` in `last-run.json` -> `result
   later playlists are `not_attempted`. A limit stop is not a failure: `failure_class` stays `none`.
 - New count `cooldown` (per playlist and in `counts`): tracks skipped because of the state file.
 
+## Pacing and backoff
+
+Added in #120. Reason: yt-dlp documents about 300 videos per hour for a guest YouTube session and recommends a
+5-10 s pause between downloads; running flat out (about 300-400 tracks an hour) is at that limit, so it is not
+the default.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--pace-seconds S` | 5 | Pause between downloads, counted from the end of the previous download (time spent on matching in between counts). 0 = no pause |
+| `--pace-jitter-seconds J` | 5 | A random 0..J seconds is added to every pause, so the pause is 5-10 s by default. 0 = a fixed pause |
+| `--retry-attempts N` | 3 | Attempts in total (1 try + 2 retries) for a transient error. 1 = no retry |
+
+- The pause is only taken before a download: not before the first one of a run, and never for tracks that are
+  already present, in cooldown, without a match, or in `--dry-run` (no download happens there). It counts as wall
+  clock for `--max-minutes`. Waits use a monotonic clock.
+- Backoff: after a transient error the wait doubles, 10 s then 20 s, never more than 120 s. Transient means HTTP
+  429 or 5xx (also "Too Many Requests", "Service Unavailable", "Bad Gateway", "Gateway Timeout") in the error of
+  a download, of the YouTube Music search (also network errors there) or of the Spotify playlist fetch. After the
+  last attempt the error counts as an ordinary track failure (cooldown, see above) or a failed playlist.
+- The YouTube sign-in challenge is never retried and is not paced around: the first one ends the whole run
+  (exit 3, see below), the tracks and the cap are not touched afterwards, and what the state file learned before it
+  stays. Nothing here bypasses a YouTube check (#62).
+- These defaults also apply to plain playlist runs (the timer): a run is slower by 5-10 s per downloaded track
+  after the first. Use `--pace-seconds 0 --pace-jitter-seconds 0` for the old speed.
+- yt-dlp's own sleep options (`--sleep-interval` and friends) are not used: spotdl accepts yt-dlp options through
+  `--yt-dlp-args` and passes them to its `YoutubeDL` object (read in spotdl's source, not run), but ingest starts
+  one spotdl process per track, and yt-dlp's sleeps live inside one process, so the pause is done by ingest.
+
 ## Exit codes
 
 | Code | From | Meaning | `failure_class` |

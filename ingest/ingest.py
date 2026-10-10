@@ -3,6 +3,7 @@
 Usage: python ingest/ingest.py (PLAYLIST_URL | --sources sources.yml) [--dry-run] [--result-json PATH]
                                [--max-new N] [--max-minutes M] [--state-file PATH]
                                [--retry-no-match-days D] [--retry-failed-days D]
+                               [--pace-seconds S] [--pace-jitter-seconds J] [--retry-attempts N]
 One playlist failing does not stop the others; the exit code is 1 if any playlist or track failed.
 Limits (off unless given) and the local state file (cooldown for no_match/failed tracks): docs/local-ingest.md.
 
@@ -17,6 +18,7 @@ import datetime
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -444,7 +446,7 @@ def process_track(song: dict, deps: Deps, existing: set, covers: dict, work: Pat
     return "new"
 
 
-def real_deps(ytm) -> Deps:
+def real_deps(ytm, throttle: "Throttle | None" = None) -> Deps:
     def find(song):
         return find_match(ytm, song["name"], primary_artist(song), song.get("album_name"), int(song["duration"]))
 
@@ -472,7 +474,96 @@ def real_deps(ytm) -> Deps:
         photo = fetch_cover(song["cover_url"], tdir / "cover.jpg")
         return largest_photo_file_id(tg_upload("sendPhoto", "photo", photo, "image/jpeg")["photo"])
 
-    return Deps(find, download, audio, cover, d1_batch, tg_delete)
+    return harden_deps(Deps(find, download, audio, cover, d1_batch, tg_delete), throttle)
+
+
+# ---- pacing and backoff (#120) ----
+# Documented facts (assessment #92 section 4): about 300 videos per hour for a guest YouTube session, a pause of
+# 5-10 s between downloads recommended, HTTP 429 means "blocked for overuse" and is usually a soft block. So:
+# a pause between downloads (default 5 s + up to 5 s of jitter) and exponential backoff with a cap and a bounded
+# number of attempts for TRANSIENT errors only (HTTP 429/5xx, network errors of the YouTube Music search). The
+# YouTube sign-in challenge is never retried and never paced around: it ends the run (YouTubeSignInRequired).
+# Nothing here bypasses a YouTube check: no cookies, proxies, PO tokens or client rotation (#62).
+DEFAULT_PACE_SECONDS = 5.0
+DEFAULT_PACE_JITTER_SECONDS = 5.0
+DEFAULT_ATTEMPTS = 3          # attempts in total per operation (1 try + 2 retries)
+BACKOFF_BASE_SECONDS = 10.0   # waits before retry n: base * 2**(n-1), at most BACKOFF_CAP_SECONDS
+BACKOFF_CAP_SECONDS = 120.0
+TRANSIENT_TEXT = re.compile(
+    r"(?i)HTTP(?: Error| status:)?:? ?(?:429|5\d\d)\b|too many requests|service unavailable|bad gateway|gateway time-?out")
+
+
+def transient_text(e: Exception) -> bool:
+    """429/5xx in the (already redacted) message of spotdl, yt-dlp or ytmusicapi."""
+    return bool(TRANSIENT_TEXT.search(str(e)))
+
+
+def transient_search(e: Exception) -> bool:
+    """YouTube Music search: HTTP 429/5xx or a network error (requests errors are OSErrors)."""
+    return isinstance(e, OSError) or transient_text(e)
+
+
+class Throttle:
+    """Pause between downloads and bounded exponential backoff. `sleep`, `clock` (monotonic) and `rng` are
+    injectable so tests run instantly. pace 0 and jitter 0 disable the pause; attempts 1 disables retries."""
+
+    def __init__(self, pace_seconds: float = DEFAULT_PACE_SECONDS, jitter_seconds: float = DEFAULT_PACE_JITTER_SECONDS,
+                 attempts: int = DEFAULT_ATTEMPTS, base: float = BACKOFF_BASE_SECONDS, cap: float = BACKOFF_CAP_SECONDS,
+                 sleep: Callable[[float], None] | None = None, clock: Callable[[], float] = time.monotonic,
+                 rng: Callable[[], float] | None = None):
+        self.pace, self.jitter, self.attempts, self.base, self.cap = pace_seconds, jitter_seconds, attempts, base, cap
+        self.sleep = sleep or time.sleep
+        self.clock = clock
+        self.rng = rng or random.random
+        self.last_download_end: float | None = None
+
+    def pause_before_download(self) -> None:
+        """Wait until pace (+ jitter) seconds have passed since the previous download ended; none before the first."""
+        if self.last_download_end is None:
+            return
+        gap = self.pace + (self.rng() * self.jitter if self.jitter else 0.0)
+        wait = gap - (self.clock() - self.last_download_end)
+        if wait > 0:
+            self.sleep(wait)
+
+    def download_finished(self) -> None:
+        self.last_download_end = self.clock()
+
+    def call(self, fn: Callable[[], object], transient: Callable[[Exception], bool], what: str):
+        """fn() with up to `attempts` tries; only errors `transient` accepts are retried, after base*2**n seconds
+        (capped). The sign-in challenge is never retried. The last error is raised unchanged."""
+        attempt = 1
+        while True:
+            try:
+                return fn()
+            except YouTubeSignInRequired:
+                raise
+            except Exception as e:  # re-raised below unless transient; nothing is swallowed
+                if attempt >= self.attempts or not transient(e):
+                    raise
+                wait = min(self.cap, self.base * 2 ** (attempt - 1))
+                log(f"transient error in {what} ({type(e).__name__}), attempt {attempt} of {self.attempts}; "
+                    f"retrying in {wait:g} s")
+                self.sleep(wait)
+                attempt += 1
+
+
+def harden_deps(deps: Deps, throttle: Throttle | None) -> Deps:
+    """Deps whose search retries transient errors and whose download is paced and retried (see Throttle)."""
+    if throttle is None:
+        return deps
+
+    def find(song):
+        return throttle.call(lambda: deps.find_match(song), transient_search, "YouTube Music search")
+
+    def download(song, m, tdir):
+        throttle.pause_before_download()
+        try:
+            return throttle.call(lambda: deps.download(song, m, tdir), transient_text, "download")
+        finally:
+            throttle.download_finished()
+
+    return Deps(find, download, deps.upload_audio, deps.upload_cover, deps.d1_batch, deps.delete_message)
 
 
 # ---- per-run limits and local state (#119) ----
@@ -819,6 +910,14 @@ def main() -> int:
                     help=f"do not retry a no_match track for D days (0 = always retry; default {DEFAULT_RETRY_NO_MATCH_DAYS})")
     ap.add_argument("--retry-failed-days", type=non_negative_int, metavar="D", default=DEFAULT_RETRY_FAILED_DAYS,
                     help=f"do not retry a failed track for D days (0 = always retry; default {DEFAULT_RETRY_FAILED_DAYS})")
+    ap.add_argument("--pace-seconds", type=non_negative_float, metavar="S", default=DEFAULT_PACE_SECONDS,
+                    help=f"pause at least S seconds between downloads (0 = none; default {DEFAULT_PACE_SECONDS:g})")
+    ap.add_argument("--pace-jitter-seconds", type=non_negative_float, metavar="J", default=DEFAULT_PACE_JITTER_SECONDS,
+                    help="add a random 0..J seconds to every pause (0 = fixed pause; default "
+                         f"{DEFAULT_PACE_JITTER_SECONDS:g}, so 5-10 s together with --pace-seconds)")
+    ap.add_argument("--retry-attempts", type=positive_int, metavar="N", default=DEFAULT_ATTEMPTS,
+                    help="attempts in total for a transient error (HTTP 429/5xx, network) with exponential backoff "
+                         f"(1 = no retry; default {DEFAULT_ATTEMPTS}). The YouTube sign-in challenge is never retried")
     args = ap.parse_args()
     if bool(args.playlist_url) == bool(args.sources):
         ap.error("give exactly one of PLAYLIST_URL or --sources FILE")
@@ -846,6 +945,10 @@ def positive_int(text: str) -> int:
 
 def non_negative_int(text: str) -> int:
     return _bounded(text, int, 0, 36500)
+
+
+def non_negative_float(text: str) -> float:
+    return _bounded(text, float, 0, 3600)
 
 
 def positive_float(text: str) -> float:
@@ -886,10 +989,13 @@ def execute(args: argparse.Namespace, state: dict) -> int:
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
 
+        throttle = Throttle(args.pace_seconds, args.pace_jitter_seconds, args.retry_attempts)
+
         def fetch_songs(url: str) -> list[dict]:
             save = work / "list.spotdl"
             save.unlink(missing_ok=True)
-            spotdl_run(["save", url, "--save-file", str(save)], work)
+            throttle.call(lambda: spotdl_run(["save", url, "--save-file", str(save)], work), transient_text,
+                          "Spotify playlist fetch")
             return json.loads(save.read_text(encoding="utf-8"))
 
         limits = RunLimits(args.max_new, args.max_minutes)
@@ -897,7 +1003,7 @@ def execute(args: argparse.Namespace, state: dict) -> int:
         track_state = RunState.load(args.state_file or default_state_path(),
                                     {"no_match": args.retry_no_match_days, "failed": args.retry_failed_days})
         try:
-            results = run_playlists(urls, fetch_songs, real_deps(YTMusic()), existing, covers, work, args.dry_run,
+            results = run_playlists(urls, fetch_songs, real_deps(YTMusic(), throttle), existing, covers, work, args.dry_run,
                                     limits, track_state)
         except YouTubeSignInRequired as e:
             state["interrupted"] = e
