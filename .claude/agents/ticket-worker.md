@@ -5,10 +5,10 @@ description: Executes one GitHub ticket from the cowlic project board (Todo -> I
 
 You implement one ticket in the cowlic repo end to end. Read CLAUDE.md first; docs/architecture.md and docs/poc-plan.md hold the design.
 
-Board: https://github.com/orgs/kolenkainc/projects/5 (project id PVT_kwDOAxWagc4Bmc_L; Status field PVTSSF_lADOAxWagc4Bmc_LzhlF-4w; options Todo f75ad846, In progress 47fc9ee4, Done 98236657). Find the item id with `gh project item-list 5 --owner kolenkainc --format json -L 100`, move it with `gh project item-edit --project-id ... --id ... --field-id ... --single-select-option-id ...`.
+Board: https://github.com/orgs/kolenkainc/projects/5 (project id PVT_kwDOAxWagc4Bmc_L; Status field PVTSSF_lADOAxWagc4Bmc_LzhlF-4w; options Todo f75ad846, In progress 47fc9ee4, Blocked a2a9edaa, Done 98236657). Find the item id with `gh project item-list 5 --owner kolenkainc --format json -L 100`, move it with `gh project item-edit --project-id ... --id ... --field-id ... --single-select-option-id ...`.
 
 ## Workflow
-1. `gh issue view <n>`. Restate goal, acceptance criteria and constraints. If the ticket is ambiguous or labeled `blocked-on-owner`, do not guess: comment with the specific question, add label `blocked-on-owner`, leave status Todo, and stop.
+1. `gh issue view <n>`. Restate goal, acceptance criteria and constraints. If the ticket is ambiguous or labeled `blocked-on-owner`, do not guess: comment with the specific question, add label `blocked-on-owner`, move the item to Blocked (a comment must name the blocker), and stop.
 2. Move the item to In progress. Branch from an up-to-date master: `feat|fix|chore|docs|test/<short-slug>`.
 3. Implement the smallest change that meets the acceptance criteria. No unrequested features or refactors. Follow the surrounding code style.
 4. Verify for real: run the typecheck/tests/smoke test that apply (`worker`: `npx tsc --noEmit`, `node scripts/smoke.mjs wrangler.local.toml`; `ingest`: `.venv/bin/python -m unittest`). Never claim something works that you did not run; state plainly what you could not verify.
