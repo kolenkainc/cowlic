@@ -307,8 +307,33 @@ cowlic_ingest_failure_youtube_sign_in == 1             # runs stopped by the You
 ```
 
 The metrics carry the push time, so a night without a run shows as a gap, not as a repeated old value; use
-`last_run_timestamp_seconds` to tell. No alert rules and no dashboard JSON are committed (the owner builds panels
-in the Grafana UI if wanted). Free tier: 10k active series, this uses about 15; metrics retention about 14 days.
+`last_run_timestamp_seconds` to tell. No alert rules are committed. Free tier: 10k active series, this uses about
+15; metrics retention about 14 days.
+
+#### Dashboard
+
+`deploy/grafana/cowlic-ingest-dashboard.json` is a ready-to-import dashboard (#156). It holds no stack URL, id,
+token or data source uid; the two data sources are import inputs.
+
+Import: in Grafana go to Dashboards -> New -> Import, upload the JSON file, pick your stack's Prometheus data
+source for `DS_PROMETHEUS` and the Loki one for `DS_LOKI`, then Import. Set the time range to 24 hours or more
+(the default is 7 days): there is one run a day, so a shorter range shows nothing. The `Host` variable filters by
+the `host` label.
+
+Panels:
+
+- Stat row, last run: `Last run` (OK or FAILED from `cowlic_ingest_success`), `Since the last run finished`
+  (`time() - cowlic_ingest_last_run_timestamp_seconds`; yellow after 26 h, red after 50 h), `Exit code`, `Added`,
+  `Failed`, `Duration`.
+- `Tracks per run`: added, skipped, no match, too big, failed and not attempted, one point per run.
+- `Run duration` and `Success (1) / failure (0) per run`: one point per run.
+- `Failure class of each run`: state timeline of `cowlic_ingest_failure_partial`, `_config`, `_youtube_sign_in`,
+  `_crash`.
+- Logs (Loki, `job="cowlic-ingest"`): `Run summary lines` (the `run_summary` line of each run), `Warnings and
+  errors` (`level` warn or error) and `All run logs`.
+
+The query names follow the table above and the log labels above; they were checked against `ingest/ship_grafana.py`
+and this runbook, not against a live stack. The live import is confirmed by the owner (#108).
 
 ## Per-run limits and the local state file
 

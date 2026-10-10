@@ -1,0 +1,353 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus (metrics)",
+      "description": "The Prometheus data source of your Grafana Cloud stack that receives the Influx push",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    },
+    {
+      "name": "DS_LOKI",
+      "label": "Loki (logs)",
+      "description": "The Loki data source of your Grafana Cloud stack that receives the log push",
+      "type": "datasource",
+      "pluginId": "loki",
+      "pluginName": "Loki"
+    }
+  ],
+  "__requires": [
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" },
+    { "type": "datasource", "id": "loki", "name": "Loki", "version": "1.0.0" },
+    { "type": "panel", "id": "stat", "name": "Stat", "version": "" },
+    { "type": "panel", "id": "timeseries", "name": "Time series", "version": "" },
+    { "type": "panel", "id": "state-timeline", "name": "State timeline", "version": "" },
+    { "type": "panel", "id": "logs", "name": "Logs", "version": "" }
+  ],
+  "annotations": { "list": [] },
+  "description": "cowlic local ingest: run metrics (Influx push, cowlic_ingest_*) and run logs (Loki job=cowlic-ingest). Runs once a day, so use a time range of 24 hours or more.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Last run",
+      "description": "1 = the last run exited with code 0, 0 = it failed",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "last_over_time(cowlic_ingest_success{host=~\"$host\"}[7d])",
+          "instant": true,
+          "legendFormat": "{{host}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "FAILED", "color": "red", "index": 0 }, "1": { "text": "OK", "color": "green", "index": 1 } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] },
+          "color": { "mode": "thresholds" }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "center", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Since the last run finished",
+      "description": "Seconds since the last run finished. The timer runs once a day: yellow after 26 h, red after 50 h (the machine was off or the timer did not fire).",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 5, "w": 5, "x": 4, "y": 0 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "time() - last_over_time(cowlic_ingest_last_run_timestamp_seconds{host=~\"$host\"}[30d])",
+          "instant": true,
+          "legendFormat": "{{host}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 1,
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 93600 }, { "color": "red", "value": 180000 } ] },
+          "color": { "mode": "thresholds" }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "center", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Exit code",
+      "description": "0 ok; 1 failed or partial; 2 usage/config; 3 YouTube asked to sign in; 78 prerequisites missing. Runs that were locked out (75) write no result and are not pushed.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 5, "w": 3, "x": 9, "y": 0 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "last_over_time(cowlic_ingest_exit_code{host=~\"$host\"}[7d])",
+          "instant": true,
+          "legendFormat": "{{host}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] },
+          "color": { "mode": "thresholds" }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "center", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Added (last run)",
+      "description": "New tracks stored by the last run",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 5, "w": 3, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "last_over_time(cowlic_ingest_added{host=~\"$host\"}[7d])",
+          "instant": true,
+          "legendFormat": "{{host}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "blue", "value": null } ] },
+          "color": { "mode": "thresholds" }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "center", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Failed (last run)",
+      "description": "Tracks that failed in the last run (download, upload or D1 write)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 5, "w": 3, "x": 15, "y": 0 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "last_over_time(cowlic_ingest_failed{host=~\"$host\"}[7d])",
+          "instant": true,
+          "legendFormat": "{{host}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] },
+          "color": { "mode": "thresholds" }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "center", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Duration (last run)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "last_over_time(cowlic_ingest_duration_seconds{host=~\"$host\"}[7d])",
+          "instant": true,
+          "legendFormat": "{{host}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 3600 }, { "color": "red", "value": 7200 } ] },
+          "color": { "mode": "thresholds" }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "center", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Tracks per run",
+      "description": "Counts of the last run, one point per run (one push per run)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_added{host=~\"$host\"}", "legendFormat": "added", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_skipped{host=~\"$host\"}", "legendFormat": "skipped (already present)", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_no_match{host=~\"$host\"}", "legendFormat": "no match", "refId": "C" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_too_big{host=~\"$host\"}", "legendFormat": "too big", "refId": "D" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_failed{host=~\"$host\"}", "legendFormat": "failed", "refId": "E" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_not_attempted{host=~\"$host\"}", "legendFormat": "not attempted", "refId": "F" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": { "drawStyle": "points", "pointSize": 8, "showPoints": "always", "lineWidth": 1, "spanNulls": false },
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "failed" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] },
+          { "matcher": { "id": "byName", "options": "added" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } } ] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi", "sort": "none" } }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Run duration",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_duration_seconds{host=~\"$host\"}", "legendFormat": "{{host}}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "points", "pointSize": 8, "showPoints": "always", "lineWidth": 1, "spanNulls": false },
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } }
+    },
+    {
+      "id": 9,
+      "type": "state-timeline",
+      "title": "Failure class of each run",
+      "description": "1 = the run ended in this class. All four at 0 means the run had no failure class.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 13 },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_failure_partial{host=~\"$host\"}", "legendFormat": "partial", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_failure_config{host=~\"$host\"}", "legendFormat": "config", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_failure_youtube_sign_in{host=~\"$host\"}", "legendFormat": "youtube sign-in", "refId": "C" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_failure_crash{host=~\"$host\"}", "legendFormat": "crash", "refId": "D" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "-", "color": "green", "index": 0 }, "1": { "text": "YES", "color": "red", "index": 1 } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] },
+          "color": { "mode": "thresholds" },
+          "custom": { "fillOpacity": 80, "lineWidth": 0 }
+        },
+        "overrides": []
+      },
+      "options": { "mergeValues": true, "showValue": "auto", "rowHeight": 0.9, "alignValue": "center", "legend": { "showLegend": false }, "tooltip": { "mode": "single", "sort": "none" } }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Success (1) / failure (0) per run",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 13 },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_success{host=~\"$host\"}", "legendFormat": "{{host}}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "decimals": 0,
+          "custom": { "drawStyle": "points", "pointSize": 8, "showPoints": "always", "lineWidth": 1, "spanNulls": false },
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } }
+    },
+    {
+      "id": 11,
+      "type": "logs",
+      "title": "Run summary lines (one per run)",
+      "description": "Needs the run_summary line that the shipper sends after each run",
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 20 },
+      "targets": [
+        { "datasource": { "type": "loki", "uid": "${DS_LOKI}" }, "expr": "{job=\"cowlic-ingest\", host=~\"$host\"} |= \"run_summary\"", "queryType": "range", "refId": "A" }
+      ],
+      "options": { "showTime": true, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
+    },
+    {
+      "id": 12,
+      "type": "logs",
+      "title": "Warnings and errors",
+      "description": "Lines with level warn or error, including the run_summary line of a failed run",
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 27 },
+      "targets": [
+        { "datasource": { "type": "loki", "uid": "${DS_LOKI}" }, "expr": "{job=\"cowlic-ingest\", host=~\"$host\", level=~\"warn|error\"}", "queryType": "range", "refId": "A" }
+      ],
+      "options": { "showTime": true, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
+    },
+    {
+      "id": 13,
+      "type": "logs",
+      "title": "All run logs",
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 36 },
+      "targets": [
+        { "datasource": { "type": "loki", "uid": "${DS_LOKI}" }, "expr": "{job=\"cowlic-ingest\", host=~\"$host\"}", "queryType": "range", "refId": "A" }
+      ],
+      "options": { "showTime": true, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
+    }
+  ],
+  "refresh": "",
+  "schemaVersion": 39,
+  "tags": ["cowlic", "ingest"],
+  "templating": {
+    "list": [
+      {
+        "name": "host",
+        "label": "Host",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "definition": "label_values(cowlic_ingest_success, host)",
+        "query": { "query": "label_values(cowlic_ingest_success, host)", "refId": "StandardVariableQuery" },
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".+",
+        "multi": false,
+        "current": { "selected": true, "text": "All", "value": "$__all" },
+        "sort": 1
+      }
+    ]
+  },
+  "time": { "from": "now-7d", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "cowlic ingest",
+  "version": 1
+}
