@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Distribute secrets from the local .env to GitHub (secrets/variables) and Worker secrets.
+# Distribute secrets from the local .env to GitHub environment secrets and Worker secrets.
 # Ingest values go to the GitHub environment "ingest" (gh secret set --env), see scripts/secrets.manifest.
 # Usage: scripts/sync-secrets.sh [--dry-run] [--only KEY]
 # Values are never printed: they travel only through stdin of gh / wrangler.
