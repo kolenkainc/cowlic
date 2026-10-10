@@ -492,7 +492,7 @@ def main() -> int:
         ap.error("give exactly one of PLAYLIST_URL or --sources FILE")
     try:
         if args.sources:
-            urls = parse_sources(args.sources.read_text(encoding="utf-8"))
+            urls = parse_sources(args.sources.read_text(encoding="utf-8-sig"))
         else:
             urls = [validate_playlist_url(args.playlist_url)]
     except (IngestError, OSError, UnicodeDecodeError) as e:

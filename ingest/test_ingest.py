@@ -16,6 +16,8 @@ import ingest
 GOOD_URL = "https://open.spotify.com/playlist/1HNODBooDQImveVtlDdJL4"
 GOOD_URL2 = "https://open.spotify.com/playlist/" + "b" * 22
 GOOD_URL3 = "https://open.spotify.com/album/" + "c" * 22
+# valid prefix, bad tail: only an end-anchored full match rejects these
+END_ANCHOR_BAD = (GOOD_URL + "/", GOOD_URL + "x", GOOD_URL + "?a b", GOOD_URL + "?a;b", GOOD_URL + "?")
 
 SONG = {"name": "T", "artists": ["A"], "album_artist": "A", "album_name": "Al", "year": 2020,
         "song_id": "sp1", "track_number": 3, "disc_number": 1, "duration": 200}
@@ -475,7 +477,8 @@ class SourcesTest(unittest.TestCase):
                     "- https://open.spotify.com/track/" + "a" * 22,
                     f"- {GOOD_URL} # trailing comment",
                     f"- {GOOD_URL} {GOOD_URL2}",
-                    f"{GOOD_URL}", "key: value", f"-{GOOD_URL}"):
+                    f"{GOOD_URL}", "key: value", f"-{GOOD_URL}",
+                    *(f"- {u}" for u in END_ANCHOR_BAD)):
             with self.subTest(bad=bad), self.assertRaisesRegex(ingest.IngestError, "sources line 2"):
                 ingest.parse_sources(f"- {GOOD_URL}\n{bad}\n")
 
@@ -490,8 +493,9 @@ class SourcesTest(unittest.TestCase):
 
     def test_cli_url_uses_the_same_validation(self):
         self.assertEqual(ingest.validate_playlist_url(GOOD_URL), GOOD_URL)
-        with self.assertRaises(ingest.IngestError):
-            ingest.validate_playlist_url("https://example.invalid/playlist")
+        for bad in ("https://example.invalid/playlist", *END_ANCHOR_BAD):
+            with self.subTest(bad=bad), self.assertRaises(ingest.IngestError):
+                ingest.validate_playlist_url(bad)
 
 
 class RunPlaylistsTest(unittest.TestCase):
@@ -539,6 +543,8 @@ class RunPlaylistsTest(unittest.TestCase):
             p.write_text(f"- {GOOD_URL}\n- {GOOD_URL2}\n", encoding="utf-8")
             self.assertEqual(self.run_main(["--sources", str(p)])[0], 0)
             self.assertEqual(self.run_main(["--sources", str(p)], fetch_fails=True)[0], 1)
+            p.write_bytes(b"\xef\xbb\xbf" + f"- {GOOD_URL}\n".encode())  # BOM must not break line 1
+            self.assertEqual(self.run_main(["--sources", str(p)])[0], 0)
             p.write_text(f"- {GOOD_URL}\n- nonsense\n", encoding="utf-8")
             code, out = self.run_main(["--sources", str(p)])
             self.assertEqual(code, 1)
