@@ -44,7 +44,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "last_over_time(cowlic_ingest_success{host=~\"$host\"}[7d])",
+          "expr": "last_over_time(cowlic_ingest_success{host=~\"$host\"}[14d])",
           "instant": true,
           "legendFormat": "{{host}}",
           "refId": "A"
@@ -66,13 +66,13 @@
       "id": 2,
       "type": "stat",
       "title": "Since the last run finished",
-      "description": "Seconds since the last run finished. The timer runs once a day: yellow after 26 h, red after 50 h (the machine was off or the timer did not fire).",
+      "description": "Seconds since the last run finished. The timer runs once a day: yellow after 26 h, red after 50 h (the machine was off or the timer did not fire). No data means more than 14 days without a run (metrics retention is about 14 days).",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "h": 5, "w": 5, "x": 4, "y": 0 },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "time() - last_over_time(cowlic_ingest_last_run_timestamp_seconds{host=~\"$host\"}[30d])",
+          "expr": "time() - last_over_time(cowlic_ingest_last_run_timestamp_seconds{host=~\"$host\"}[14d])",
           "instant": true,
           "legendFormat": "{{host}}",
           "refId": "A"
@@ -93,13 +93,13 @@
       "id": 3,
       "type": "stat",
       "title": "Exit code",
-      "description": "0 ok; 1 failed or partial; 2 usage/config; 3 YouTube asked to sign in; 78 prerequisites missing. Runs that were locked out (75) write no result and are not pushed.",
+      "description": "0 ok; 1 failed or partial; 2 usage/config; 3 YouTube asked to sign in; 78 prerequisites or venv missing (only when it happens after the lock is taken). A run that is locked out (75) or stops on an early 78 writes no result and is not pushed.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "h": 5, "w": 3, "x": 9, "y": 0 },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "last_over_time(cowlic_ingest_exit_code{host=~\"$host\"}[7d])",
+          "expr": "last_over_time(cowlic_ingest_exit_code{host=~\"$host\"}[14d])",
           "instant": true,
           "legendFormat": "{{host}}",
           "refId": "A"
@@ -125,7 +125,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "last_over_time(cowlic_ingest_added{host=~\"$host\"}[7d])",
+          "expr": "last_over_time(cowlic_ingest_added{host=~\"$host\"}[14d])",
           "instant": true,
           "legendFormat": "{{host}}",
           "refId": "A"
@@ -151,7 +151,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "last_over_time(cowlic_ingest_failed{host=~\"$host\"}[7d])",
+          "expr": "last_over_time(cowlic_ingest_failed{host=~\"$host\"}[14d])",
           "instant": true,
           "legendFormat": "{{host}}",
           "refId": "A"
@@ -176,7 +176,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "last_over_time(cowlic_ingest_duration_seconds{host=~\"$host\"}[7d])",
+          "expr": "last_over_time(cowlic_ingest_duration_seconds{host=~\"$host\"}[14d])",
           "instant": true,
           "legendFormat": "{{host}}",
           "refId": "A"
@@ -197,16 +197,16 @@
       "id": 7,
       "type": "timeseries",
       "title": "Tracks per run",
-      "description": "Counts of the last run, one point per run (one push per run)",
+      "description": "Counts of each run: one pushed sample per run, shown with last_over_time over the chart interval so that every run is drawn",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_added{host=~\"$host\"}", "legendFormat": "added", "refId": "A" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_skipped{host=~\"$host\"}", "legendFormat": "skipped (already present)", "refId": "B" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_no_match{host=~\"$host\"}", "legendFormat": "no match", "refId": "C" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_too_big{host=~\"$host\"}", "legendFormat": "too big", "refId": "D" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_failed{host=~\"$host\"}", "legendFormat": "failed", "refId": "E" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_not_attempted{host=~\"$host\"}", "legendFormat": "not attempted", "refId": "F" }
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "last_over_time(cowlic_ingest_added{host=~\"$host\"}[$__interval])", "legendFormat": "added", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "last_over_time(cowlic_ingest_skipped{host=~\"$host\"}[$__interval])", "legendFormat": "skipped (already present)", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "last_over_time(cowlic_ingest_no_match{host=~\"$host\"}[$__interval])", "legendFormat": "no match", "refId": "C" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "last_over_time(cowlic_ingest_too_big{host=~\"$host\"}[$__interval])", "legendFormat": "too big", "refId": "D" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "last_over_time(cowlic_ingest_failed{host=~\"$host\"}[$__interval])", "legendFormat": "failed", "refId": "E" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "last_over_time(cowlic_ingest_not_attempted{host=~\"$host\"}[$__interval])", "legendFormat": "not attempted", "refId": "F" }
       ],
       "fieldConfig": {
         "defaults": {
@@ -229,7 +229,7 @@
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_duration_seconds{host=~\"$host\"}", "legendFormat": "{{host}}", "refId": "A" }
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "last_over_time(cowlic_ingest_duration_seconds{host=~\"$host\"}[$__interval])", "legendFormat": "{{host}}", "refId": "A" }
       ],
       "fieldConfig": {
         "defaults": {
@@ -249,10 +249,10 @@
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "h": 7, "w": 12, "x": 0, "y": 13 },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_failure_partial{host=~\"$host\"}", "legendFormat": "partial", "refId": "A" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_failure_config{host=~\"$host\"}", "legendFormat": "config", "refId": "B" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_failure_youtube_sign_in{host=~\"$host\"}", "legendFormat": "youtube sign-in", "refId": "C" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_failure_crash{host=~\"$host\"}", "legendFormat": "crash", "refId": "D" }
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "last_over_time(cowlic_ingest_failure_partial{host=~\"$host\"}[$__interval])", "legendFormat": "partial", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "last_over_time(cowlic_ingest_failure_config{host=~\"$host\"}[$__interval])", "legendFormat": "config", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "last_over_time(cowlic_ingest_failure_youtube_sign_in{host=~\"$host\"}[$__interval])", "legendFormat": "youtube sign-in", "refId": "C" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "last_over_time(cowlic_ingest_failure_crash{host=~\"$host\"}[$__interval])", "legendFormat": "crash", "refId": "D" }
       ],
       "fieldConfig": {
         "defaults": {
@@ -274,7 +274,7 @@
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "h": 7, "w": 12, "x": 12, "y": 13 },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "cowlic_ingest_success{host=~\"$host\"}", "legendFormat": "{{host}}", "refId": "A" }
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "last_over_time(cowlic_ingest_success{host=~\"$host\"}[$__interval])", "legendFormat": "{{host}}", "refId": "A" }
       ],
       "fieldConfig": {
         "defaults": {

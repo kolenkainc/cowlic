@@ -324,7 +324,12 @@ Panels:
 
 - Stat row, last run: `Last run` (OK or FAILED from `cowlic_ingest_success`), `Since the last run finished`
   (`time() - cowlic_ingest_last_run_timestamp_seconds`; yellow after 26 h, red after 50 h), `Exit code`, `Added`,
-  `Failed`, `Duration`.
+  `Failed`, `Duration`. They take the latest value of the last 14 days (the metrics retention); "No data" means
+  more than 14 days without a run. Runs that write no `last-run.json` (locked out with 75, or an early 78) push
+  nothing.
+- The per-run panels below wrap each series in `last_over_time(...[$__interval])`: a run pushes one sample, and
+  a plain range query would draw it only for its 5 minute lookback, so some runs would be missing at a coarse
+  step.
 - `Tracks per run`: added, skipped, no match, too big, failed and not attempted, one point per run.
 - `Run duration` and `Success (1) / failure (0) per run`: one point per run.
 - `Failure class of each run`: state timeline of `cowlic_ingest_failure_partial`, `_config`, `_youtube_sign_in`,
