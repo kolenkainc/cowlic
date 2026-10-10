@@ -206,6 +206,59 @@ The wrapper takes `flock -n` on `ingest.lock`. If a run is active, a second invo
 exits 75 and does not touch the log or `last-run.json`. This is normal if you start a manual run while the timer
 run is still going: wait for it to finish.
 
+## Per-run limits and the local state file
+
+Added in #119 (the base for the artist source in #121). Without the options below a run behaves as before:
+no cap and no time limit. The wrapper does not forward options yet; use them when calling ingest directly:
+
+```sh
+ingest/.venv/bin/python ingest/ingest.py --sources sources.yml --max-new 200 --max-minutes 90
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--max-new N` | none (no cap) | Stop after N tracks were attempted in this run. Counted: new, too big, failed (and dry-run matches). Not counted: tracks already in the library, tracks in cooldown, tracks with no match (no download was tried) |
+| `--max-minutes M` | none (no limit) | Wall clock. No new track is started after M minutes (a download in progress finishes) |
+| `--state-file PATH` | `${XDG_STATE_HOME:-$HOME/.local/state}/cowlic/ingest-state.json` | Where the state is kept |
+| `--retry-no-match-days D` | 30 | Do not retry a `no_match` track for D days (0 = retry every run) |
+| `--retry-failed-days D` | 3 | Do not retry a `failed` track for D days (0 = retry every run) |
+
+The limits are checked before each track that would be worked on and before each next playlist is fetched. When
+one is hit the run ends normally (exit code unchanged: 0 unless something failed), logs one line
+`stopped: cap|time: ...` with counts, and the next run picks up the rest (already stored tracks are skipped).
+
+### State file
+
+`ingest-state.json` sits next to the log in the state directory (outside the repo; `ingest-state.json` is also in
+`.gitignore`). It remembers, per Spotify track id, that the track ended `no_match` or `failed` and the date
+(UTC) after which it may be tried again:
+
+```json
+{"version": 1, "tracks": {"<22-char spotify id>": {"status": "no_match", "retry_after": "2026-11-09"}}}
+```
+
+- Tracks in cooldown are skipped without any YouTube work, logged as `skipped (cooldown, retry later): <label>`
+  (the same label ingest logs for other skipped tracks), and do not use the cap.
+- A track that later ends `new`, `exists` or `too_big` is removed from the state. A sign-in challenge is not a
+  track failure and is not recorded. A `--dry-run` reads the state but never writes it.
+- Only ids, a status word and a date are stored: no titles, artists or URLs. Mode 0600 (directory 0700).
+- Written atomically after every change (temp file + fsync + rename), so a killed run keeps what it learned and a
+  failed write leaves the previous file intact (one `WARN could not write the state file` line per run).
+- A missing file starts empty. A corrupted or unknown file starts empty with `WARN state file is corrupted ...`
+  and is replaced at the next change; malformed single entries are ignored with a WARN. Ingest never fails
+  because of the state file. To reset all cooldowns, delete the file.
+
+### Why a run stopped
+
+The log ends every run with `stop reason: done|cap|time|sign-in` (a run that never started, such as a config
+error, logs none). The same value is `stop_reason` in `last-run.json` -> `result` (`null` when nothing ran):
+
+- `done`: all playlists were worked through. `cap` / `time`: a limit ended the run early. `sign-in`: the
+  YouTube sign-in stop (exit 3).
+- A playlist that was cut short by a limit has `status: "stopped"` and `not_attempted` = tracks not looked at;
+  later playlists are `not_attempted`. A limit stop is not a failure: `failure_class` stays `none`.
+- New count `cooldown` (per playlist and in `counts`): tracks skipped because of the state file.
+
 ## Exit codes
 
 | Code | From | Meaning | `failure_class` |

@@ -1,7 +1,10 @@
 """Sync public Spotify playlists into the library: match -> download -> Telegram -> D1.
 
 Usage: python ingest/ingest.py (PLAYLIST_URL | --sources sources.yml) [--dry-run] [--result-json PATH]
+                               [--max-new N] [--max-minutes M] [--state-file PATH]
+                               [--retry-no-match-days D] [--retry-failed-days D]
 One playlist failing does not stop the others; the exit code is 1 if any playlist or track failed.
+Limits (off unless given) and the local state file (cooldown for no_match/failed tracks): docs/local-ingest.md.
 
 Env (or ./.env): TG_BOT_TOKEN, TG_CHANNEL_ID, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET,
 INGEST_CLOUDFLARE_API_TOKEN (narrow, D1:Edit only), CLOUDFLARE_ACCOUNT_ID, D1_DATABASE_ID. Secrets are never
@@ -10,6 +13,7 @@ The .env syntax is documented in docs/architecture.md section 4.
 Tracks whose spotify_id is already in D1 are skipped, so re-running adds nothing.
 """
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -18,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -470,11 +475,167 @@ def real_deps(ytm) -> Deps:
     return Deps(find, download, audio, cover, d1_batch, tg_delete)
 
 
-def run(songs: list[dict], deps: Deps, existing: set, covers: dict, work: Path, dry: bool) -> dict:
-    counts = {"new": 0, "exists": 0, "no_match": 0, "too_big": 0, "dry_run": 0, "failed": 0}
+# ---- per-run limits and local state (#119) ----
+
+def atomic_write_json(path: Path, obj: object) -> None:
+    """Temp file in the same directory (fsynced) + rename, mode 0600, parent directory 0700 when created. On any
+    failure the previous file is untouched and the temp file is removed; raises OSError."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+STATE_VERSION = 1
+STATE_MAX_BYTES = 50 * 1024 * 1024  # a bigger file is not ours: treated as corrupted
+COOLDOWN_STATUSES = ("no_match", "failed")
+DEFAULT_RETRY_NO_MATCH_DAYS = 30  # a track YouTube Music has no match for rarely gains one within weeks
+DEFAULT_RETRY_FAILED_DAYS = 3     # failures (YouTube, Telegram, D1 hiccups) are more often transient
+
+
+def default_state_path() -> Path:
+    """Next to the wrapper's log: ${XDG_STATE_HOME:-$HOME/.local/state}/cowlic/ingest-state.json."""
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return Path(base) / "cowlic" / "ingest-state.json"
+
+
+def utc_today() -> datetime.date:
+    return datetime.datetime.now(datetime.timezone.utc).date()
+
+
+class RunState:
+    """Local, gitignored memory of tracks not to retry yet: {spotify_id: {status, retry_after}}. Only ids, a status
+    word and a date are stored (no titles). Never raises: a missing or corrupted file starts empty (WARN), a failed
+    write is logged once and the previous file stays (atomic_write_json). Written after every change, so a killed
+    run keeps what it learned."""
+
+    def __init__(self, path: Path | None = None, retry_days: dict | None = None,
+                 today: Callable[[], datetime.date] = utc_today):
+        self.path = path
+        days = retry_days or {}
+        self.retry_days = {"no_match": days.get("no_match", DEFAULT_RETRY_NO_MATCH_DAYS),
+                           "failed": days.get("failed", DEFAULT_RETRY_FAILED_DAYS)}
+        self.today = today
+        self.entries: dict[str, dict] = {}
+        self._write_warned = False
+
+    @classmethod
+    def load(cls, path: Path, retry_days: dict | None = None,
+             today: Callable[[], datetime.date] = utc_today) -> "RunState":
+        st = cls(path, retry_days, today)
+        try:
+            with open(path, "rb") as f:
+                raw = f.read(STATE_MAX_BYTES + 1)
+        except FileNotFoundError:
+            return st
+        except OSError as e:
+            log(f"WARN state file unreadable ({type(e).__name__}); starting with an empty state")
+            return st
+        try:
+            if len(raw) > STATE_MAX_BYTES:
+                raise ValueError("too big")
+            data = json.loads(raw.decode("utf-8"))
+            if not isinstance(data, dict) or data.get("version") != STATE_VERSION or not isinstance(data.get("tracks"), dict):
+                raise ValueError("unexpected structure")
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            log("WARN state file is corrupted or not understood; starting with an empty state "
+                "(it is replaced at the next change)")
+            return st
+        dropped = 0
+        for sid, e in data["tracks"].items():
+            try:
+                due = datetime.date.fromisoformat(e["retry_after"])
+                ok = SPOTIFY_ID.fullmatch(sid) and e["status"] in COOLDOWN_STATUSES
+            except (KeyError, TypeError, ValueError):
+                ok = False
+            if not ok:
+                dropped += 1
+            elif due > st.today():  # expired entries are dropped: the track is tried again
+                st.entries[sid] = {"status": e["status"], "retry_after": due.isoformat()}
+        if dropped:
+            log(f"WARN state file: ignored {dropped} malformed entr{'y' if dropped == 1 else 'ies'}")
+        return st
+
+    def in_cooldown(self, sid: str) -> bool:
+        e = self.entries.get(sid)
+        return bool(e) and datetime.date.fromisoformat(e["retry_after"]) > self.today()
+
+    def record(self, sid: str, status: str) -> None:
+        """Remember a no_match/failed track; a retry period of 0 days remembers nothing."""
+        days = self.retry_days[status]
+        if days <= 0 or not SPOTIFY_ID.fullmatch(sid):
+            return
+        self.entries[sid] = {"status": status, "retry_after": (self.today() + datetime.timedelta(days=days)).isoformat()}
+        self.save()
+
+    def clear(self, sid: str) -> None:
+        if self.entries.pop(sid, None) is not None:
+            self.save()
+
+    def save(self) -> None:
+        if self.path is None:
+            return
+        try:
+            atomic_write_json(self.path, {"version": STATE_VERSION, "tracks": self.entries})
+        except OSError as e:
+            if not self._write_warned:  # once per run; the in-memory state still applies to this run
+                log(f"WARN could not write the state file ({type(e).__name__}); cooldowns may be lost")
+                self._write_warned = True
+
+
+class RunLimits:
+    """Per-run budget: --max-new N counts tracks attempted in this run (new, too_big, failed, dry-run; not exists,
+    cooldown or no_match, where no download was tried) and --max-minutes M is wall clock. None = unlimited.
+    stop_reason is None | "cap" | "time"; stopped_url and not_attempted say where it happened."""
+
+    def __init__(self, max_new: int | None = None, max_minutes: float | None = None,
+                 clock: Callable[[], float] = time.monotonic):
+        self.max_new, self.clock = max_new, clock
+        self.deadline = None if max_minutes is None else clock() + max_minutes * 60
+        self.attempted = 0
+        self.stop_reason: str | None = None
+        self.stopped_url: str | None = None
+        self.not_attempted = 0  # tracks of the playlist in progress that were not looked at
+
+    def exhausted(self) -> str | None:
+        if self.max_new is not None and self.attempted >= self.max_new:
+            return "cap"
+        if self.deadline is not None and self.clock() >= self.deadline:
+            return "time"
+        return None
+
+    def stop(self, reason: str, not_attempted: int = 0) -> None:
+        self.stop_reason, self.not_attempted = reason, not_attempted
+
+
+def run(songs: list[dict], deps: Deps, existing: set, covers: dict, work: Path, dry: bool,
+        limits: RunLimits | None = None, state: RunState | None = None) -> dict:
+    counts = {"new": 0, "exists": 0, "no_match": 0, "too_big": 0, "dry_run": 0, "failed": 0, "cooldown": 0}
     unique = dedupe(songs)
     for i, song in enumerate(unique):
         label = f"{(song.get('artists') or ['?'])[0]} - {song.get('name', '?')}"
+        sid = song.get("song_id") or ""
+        if sid not in existing:
+            if state and state.in_cooldown(sid):  # does not use the cap
+                counts["cooldown"] += 1
+                log(f"skipped (cooldown, retry later): {label}")
+                continue
+            reason = limits.exhausted() if limits else None
+            if reason:
+                limits.stop(reason, len(unique) - i)
+                break
         try:
             status = process_track(song, deps, existing, covers, work, dry)
         except YouTubeSignInRequired as e:
@@ -484,8 +645,19 @@ def run(songs: list[dict], deps: Deps, existing: set, covers: dict, work: Path, 
             detail = f": {e}" if isinstance(e, IngestError) else ""
             log(f"ERROR {label}: {type(e).__name__}{detail}")
             counts["failed"] += 1
+            if limits:
+                limits.attempted += 1
+            if state and not dry:
+                state.record(sid, "failed")
             continue
         counts[status] += 1
+        if limits and status in ("new", "too_big", "dry_run"):
+            limits.attempted += 1
+        if state and not dry:
+            if status == "no_match":
+                state.record(sid, "no_match")
+            elif status in ("new", "exists", "too_big"):
+                state.clear(sid)
         if status == "exists":
             log(f"skipped (already present): {label}")
         elif status in ("no_match", "too_big"):
@@ -499,16 +671,24 @@ COUNT_KEYS = ("new", "exists", "no_match", "too_big", "failed")
 
 
 def summary(counts: dict) -> str:
+    cooldown = counts.get("cooldown", 0)
     return (f"{counts['new']} new, {counts['exists']} already present, {counts['no_match']} no match, "
-            f"{counts['too_big']} too big, {counts['failed']} failed")
+            f"{counts['too_big']} too big, {counts['failed']} failed" + (f", {cooldown} in cooldown" if cooldown else ""))
 
 
 def run_playlists(urls: list[str], fetch_songs: Callable[[str], list[dict]], deps: Deps, existing: set,
-                  covers: dict, work: Path, dry: bool) -> dict[str, dict | None]:
+                  covers: dict, work: Path, dry: bool, limits: RunLimits | None = None,
+                  state: RunState | None = None) -> dict[str, dict | None]:
     """Runs every playlist; one failing playlist does not hide the others. Prints one result line per playlist.
-    Returns url -> counts, or None when the playlist could not be fetched (counts also hold failed tracks)."""
+    Returns url -> counts, or None when the playlist could not be fetched (counts also hold failed tracks).
+    When `limits` is exhausted the rest of the run is skipped (limits.stop_reason says why) and logged."""
     results: dict[str, dict | None] = {}
     for n, url in enumerate(urls):
+        if limits and not limits.stop_reason and (reason := limits.exhausted()):
+            limits.stop(reason)  # before the next playlist is even fetched
+        if limits and limits.stop_reason:
+            log_limit_stop(limits, len(urls) - n)
+            break
         try:
             try:
                 songs = fetch_songs(url)
@@ -518,14 +698,26 @@ def run_playlists(urls: list[str], fetch_songs: Callable[[str], list[dict]], dep
                 log(f"playlist {url}: FAILED: {type(e).__name__}: {e}")
                 results[url] = None
                 continue
-            results[url] = run(songs, deps, existing, covers, work, dry)
+            results[url] = run(songs, deps, existing, covers, work, dry, limits, state)
         except YouTubeSignInRequired as e:
             e.playlists_not_attempted = len(urls) - n - 1
             e.results = results
             log_interrupted(url, results, e)
             raise
         log(f"playlist {url}: {summary(results[url])}")
+        if limits and limits.stop_reason:  # stopped inside this playlist
+            limits.stopped_url = url
+            log_limit_stop(limits, len(urls) - n - 1)
+            break
     return results
+
+
+def log_limit_stop(limits: RunLimits, playlists_not_started: int) -> None:
+    """Counts only: why the run stopped early and how much was left."""
+    what = (f"--max-new {limits.max_new} reached ({limits.attempted} attempted)" if limits.stop_reason == "cap"
+            else "--max-minutes limit reached")
+    log(f"stopped: {limits.stop_reason}: {what}; {limits.not_attempted} track(s) of the current playlist and "
+        f"{playlists_not_started} playlist(s) not started; the next run continues")
 
 
 def log_interrupted(url: str, results: dict, e: YouTubeSignInRequired) -> None:
@@ -542,17 +734,30 @@ def log_interrupted(url: str, results: dict, e: YouTubeSignInRequired) -> None:
 # Only counts, class names, status words and playlist URLs WITHOUT query (already validated); never an id, token or
 # a message text. failure_class: none | partial (some track/playlist failed) | config (bad sources/env, nothing
 # ran) | youtube-sign-in. A crash writes no file at all; the wrapper reports that as `crash`.
-RESULT_COUNT_KEYS = ("added", "skipped", "no_match", "too_big", "failed", "not_attempted")
+# Added in #119 (additive): `stop_reason` (cap | time | sign-in | done; null when nothing ran), per-playlist status
+# `stopped` (a --max-new/--max-minutes limit ended the run inside it) and the count `cooldown` (tracks skipped
+# because the state file says retry later).
+RESULT_COUNT_KEYS = ("added", "skipped", "no_match", "too_big", "failed", "not_attempted", "cooldown")
 
 
 def _result_counts(c: dict | None, not_attempted: int = 0) -> dict:
     c = c or {}
     return {"added": c.get("new", 0), "skipped": c.get("exists", 0), "no_match": c.get("no_match", 0),
-            "too_big": c.get("too_big", 0), "failed": c.get("failed", 0), "not_attempted": not_attempted}
+            "too_big": c.get("too_big", 0), "failed": c.get("failed", 0), "not_attempted": not_attempted,
+            "cooldown": c.get("cooldown", 0)}
+
+
+def stop_reason(results: dict | None, interrupted: YouTubeSignInRequired | None, limits: RunLimits | None) -> str | None:
+    """Why the run ended: sign-in, cap, time, or done (it ran through); None when it never started running."""
+    if interrupted:
+        return "sign-in"
+    if limits and limits.stop_reason:
+        return limits.stop_reason
+    return "done" if results is not None else None
 
 
 def build_result(urls: list[str], results: dict | None, interrupted: YouTubeSignInRequired | None,
-                 exit_code: int) -> dict:
+                 exit_code: int, limits: RunLimits | None = None) -> dict:
     """Result dict for --result-json. `results` is url -> counts (None = unreadable playlist); with `interrupted`
     the finished playlists come from interrupted.results, the one after them is the interrupted one."""
     done = interrupted.results if interrupted else (results or {})
@@ -561,6 +766,8 @@ def build_result(urls: list[str], results: dict | None, interrupted: YouTubeSign
         item = {"url": url.split("?", 1)[0]}
         if url in done and done[url] is None:
             item.update(status="unreadable", **_result_counts(None))
+        elif limits and limits.stopped_url == url and url in done:
+            item.update(status="stopped", **_result_counts(done[url], limits.not_attempted))
         elif url in done:
             item.update(status="done", **_result_counts(done[url]))
         elif interrupted and n == len(done):
@@ -580,25 +787,17 @@ def build_result(urls: list[str], results: dict | None, interrupted: YouTubeSign
         cls = "partial"
     else:
         cls = "config"
-    return {"failure_class": cls, "exit_code": exit_code, "playlists": playlists, "counts": counts}
+    return {"failure_class": cls, "exit_code": exit_code, "stop_reason": stop_reason(results, interrupted, limits),
+            "playlists": playlists, "counts": counts}
 
 
 def write_result(path: Path, result: dict) -> None:
     """Atomic (temp file + rename in the same directory), mode 0600. A write failure is logged, never silent, and
     does not change the exit code."""
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(result, f)
-            f.write("\n")
-        os.replace(tmp, path)
+        atomic_write_json(path, result)
     except OSError as e:
         log(f"WARN could not write the result file: {type(e).__name__}")
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 def main() -> int:
@@ -608,14 +807,52 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="match only; download and upload nothing")
     ap.add_argument("--result-json", type=Path, metavar="PATH",
                     help="write the structured result (counts, failure class) to PATH at the end of the run")
+    ap.add_argument("--max-new", type=positive_int, metavar="N", default=None,
+                    help="stop after N tracks were attempted in this run (new, too big, failed; not skipped, "
+                         "cooldown or no-match tracks). Default: no cap")
+    ap.add_argument("--max-minutes", type=positive_float, metavar="M", default=None,
+                    help="stop starting new tracks after M minutes of wall clock. Default: no time limit")
+    ap.add_argument("--state-file", type=Path, metavar="PATH", default=None,
+                    help="local state (cooldown of no_match/failed tracks). Default: "
+                         "${XDG_STATE_HOME:-$HOME/.local/state}/cowlic/ingest-state.json")
+    ap.add_argument("--retry-no-match-days", type=non_negative_int, metavar="D", default=DEFAULT_RETRY_NO_MATCH_DAYS,
+                    help=f"do not retry a no_match track for D days (0 = always retry; default {DEFAULT_RETRY_NO_MATCH_DAYS})")
+    ap.add_argument("--retry-failed-days", type=non_negative_int, metavar="D", default=DEFAULT_RETRY_FAILED_DAYS,
+                    help=f"do not retry a failed track for D days (0 = always retry; default {DEFAULT_RETRY_FAILED_DAYS})")
     args = ap.parse_args()
     if bool(args.playlist_url) == bool(args.sources):
         ap.error("give exactly one of PLAYLIST_URL or --sources FILE")
-    state: dict = {"urls": [], "results": None, "interrupted": None}
+    state: dict = {"urls": [], "results": None, "interrupted": None, "limits": None}
     code = execute(args, state)
     if args.result_json:
-        write_result(args.result_json, build_result(state["urls"], state["results"], state["interrupted"], code))
+        write_result(args.result_json, build_result(state["urls"], state["results"], state["interrupted"], code,
+                                                    state["limits"]))
     return code
+
+
+def _bounded(text: str, kind: type, low: float, high: float):
+    try:
+        v = kind(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text[:20]!r}") from None
+    if not low <= v <= high:  # also rejects nan and inf
+        raise argparse.ArgumentTypeError(f"must be between {low:g} and {high:g}")
+    return v
+
+
+def positive_int(text: str) -> int:
+    return _bounded(text, int, 1, 10**9)
+
+
+def non_negative_int(text: str) -> int:
+    return _bounded(text, int, 0, 36500)
+
+
+def positive_float(text: str) -> float:
+    v = _bounded(text, float, 0, 10**6)
+    if v <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return v
 
 
 def execute(args: argparse.Namespace, state: dict) -> int:
@@ -655,19 +892,26 @@ def execute(args: argparse.Namespace, state: dict) -> int:
             spotdl_run(["save", url, "--save-file", str(save)], work)
             return json.loads(save.read_text(encoding="utf-8"))
 
+        limits = RunLimits(args.max_new, args.max_minutes)
+        state["limits"] = limits
+        track_state = RunState.load(args.state_file or default_state_path(),
+                                    {"no_match": args.retry_no_match_days, "failed": args.retry_failed_days})
         try:
-            results = run_playlists(urls, fetch_songs, real_deps(YTMusic()), existing, covers, work, args.dry_run)
+            results = run_playlists(urls, fetch_songs, real_deps(YTMusic()), existing, covers, work, args.dry_run,
+                                    limits, track_state)
         except YouTubeSignInRequired as e:
             state["interrupted"] = e
             log(f"ERROR {FAILURE_YOUTUBE_SIGN_IN}: YouTube asks to sign in (bot check); skipping the rest of the "
                 f"run (remaining tracks and playlists), not retrying; manual action needed: wait and re-run later, "
                 f"do not add cookies; exit code {EXIT_YOUTUBE_SIGN_IN}")
+            log(f"stop reason: {stop_reason({}, e, limits)}")
             return EXIT_YOUTUBE_SIGN_IN
     state["results"] = results
     ok = [c for c in results.values() if c is not None]
-    total = {k: sum(c[k] for c in ok) for k in ("new", "exists", "no_match", "too_big", "failed")}
+    total = {k: sum(c.get(k, 0) for c in ok) for k in (*COUNT_KEYS, "cooldown")}
     broken = len(results) - len(ok)
     log(f"done: {summary(total)}" + (f"; {broken} playlist(s) could not be read" if broken else ""))
+    log(f"stop reason: {stop_reason(results, None, limits)}")
     return 1 if broken or total["failed"] else 0
 
 
