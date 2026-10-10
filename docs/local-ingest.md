@@ -58,7 +58,8 @@ only) and is the only Cloudflare token ingest uses; ingest never reads the broad
 Nothing about ingest is stored in GitHub (the old `ingest` environment secrets are removed in #75). The repo is
 public: never paste values into issues, PRs or logs. Every value that ingest loads from `.env` is hidden from the
 spotdl child process by construction (the child gets the outer environment only, whatever a key is called; a variable
-already set in the outer environment keeps its outer value and still passes).
+already set in the outer environment keeps its outer value and still passes, except the fixed list of known secret
+names in `SPOTDL_HIDDEN_ENV`, which is always hidden).
 
 ## Run once by hand
 
