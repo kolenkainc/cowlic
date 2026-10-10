@@ -50,6 +50,15 @@ class TitleOnlyTest(unittest.TestCase):
                     "Under Pressure Nightcore"):
             self.assertIsNone(find([res(bad)]), bad)
 
+    def test_variant_marker_rejects_even_when_the_title_similarity_passes(self):
+        # in a long title one extra word stays above the 0.93 threshold: only the marker check can reject it
+        base = "The Ballad Of Many Words Which Goes On For Quite A While Here And Even Longer Than You Think"
+        for marker in ("Live", "Remix", "Cover", "Acoustic", "Karaoke", "Sped Up", "Slowed", "Nightcore", "Instrumental"):
+            variant = f"{base} ({marker})"
+            self.assertGreaterEqual(match.similarity(base, variant), match.TITLE_ONLY_TITLE_MIN_SIMILARITY, marker)
+            self.assertIsNone(find([res(variant)], title=base), marker)
+        self.assertIsNotNone(find([res(f"{base} (Remastered)")], title=base))
+
     def test_variant_word_in_the_requested_title_is_allowed(self):
         c = find([res("Live and Let Die", ("Wings",))], title="Live and Let Die", artist="Wings")
         self.assertIsNotNone(c)
