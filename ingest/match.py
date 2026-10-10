@@ -39,6 +39,24 @@ def similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, normalize(a), normalize(b)).ratio()
 
 
+# Title-only mode (#151): for a track WITHOUT a usable duration (Last.fm gives almost none). The +-3 s check is what
+# protects the duration path from a wrong video, so this mode compensates: a stricter title threshold (0.93 against
+# 0.85: tolerates "Song - Remastered 2011" style noise, not a different title), a MANDATORY artist check (the
+# Latin/Cyrillic transliteration compare, so a Cyrillic spelling does not veto), a sanity range for the candidate's
+# duration (600 s is also about the 20 MB Telegram limit), and no variant marker the requested title lacks.
+# Trust trade-off accepted by the owner in #147: more wrong-video risk than the duration path.
+TITLE_ONLY_TITLE_MIN_SIMILARITY = 0.93
+TITLE_ONLY_ARTIST_MIN_SIMILARITY = 0.6
+TITLE_ONLY_MIN_DURATION_S = 60
+TITLE_ONLY_MAX_DURATION_S = 600
+MODE_TITLE_ONLY = "title-only"
+MODE_DURATION = "duration"
+# Same words as dedupe._NOT_SAME plus "live" (dedupe imports this module, so it cannot be imported from there; a test
+# keeps the two in step).
+_VARIANT_WORDS = {"live", "remix", "mix", "rmx", "edit", "acoustic", "instrumental", "demo", "cover", "karaoke",
+                  "rework", "reprise", "vip", "dub", "flip", "bootleg", "slowed", "sped", "nightcore", "remake"}
+
+
 @dataclass
 class Candidate:
     video_id: str
@@ -46,6 +64,7 @@ class Candidate:
     artists: str
     duration_s: int
     score: float
+    mode: str = MODE_DURATION  # MODE_TITLE_ONLY when the match was made without a duration (#151)
 
 
 def queries(title: str, artist: str, album: str | None) -> list[str]:
@@ -69,10 +88,34 @@ def score(title: str, artist: str, duration_s: int, result: dict) -> Candidate |
                      t_sim + 0.3 * a_sim - 0.02 * abs(dur - duration_s))
 
 
-def find_match(ytmusic, title: str, artist: str, album: str | None, duration_s: int) -> Candidate | None:
+def score_title_only(title: str, artist: str, result: dict) -> Candidate | None:
+    """Scoring without a requested duration (see the constants above). None unless every check passes."""
+    dur = result.get("duration_seconds")
+    if isinstance(dur, bool) or not isinstance(dur, (int, float)) \
+            or not TITLE_ONLY_MIN_DURATION_S <= dur <= TITLE_ONLY_MAX_DURATION_S:
+        return None
+    result_title = result.get("title")
+    if not isinstance(result_title, str):
+        return None
+    t_sim = similarity(title, result_title)
+    if t_sim < TITLE_ONLY_TITLE_MIN_SIMILARITY:
+        return None
+    if set(normalize(result_title).split()) & (_VARIANT_WORDS - set(normalize(title).split())):
+        return None  # live, remix, cover, ...: a different recording than the requested one
+    names = [a["name"] for a in result.get("artists") or [] if isinstance(a.get("name"), str)]
+    joined = ", ".join(names)
+    a_sim = max(similarity(a, y) for a in (artist, transliterate_to_cyrillic(artist)) for y in [joined, *names])
+    if a_sim < TITLE_ONLY_ARTIST_MIN_SIMILARITY:
+        return None
+    return Candidate(result["videoId"], result_title, joined, int(dur), t_sim + a_sim, MODE_TITLE_ONLY)
+
+
+def find_match(ytmusic, title: str, artist: str, album: str | None, duration_s: int | None) -> Candidate | None:
+    """With a duration (any non-zero value) the +-3 s path below, unchanged. With None or 0 the title-only mode."""
+    scorer = (lambda r: score(title, artist, duration_s, r)) if duration_s else (lambda r: score_title_only(title, artist, r))
     for q in queries(title, artist, album):
         found = [c for r in ytmusic.search(q, filter="songs", limit=10) if r.get("videoId")
-                 and (c := score(title, artist, duration_s, r))]
+                 and (c := scorer(r))]
         if found:
             return max(found, key=lambda c: c.score)
     return None
