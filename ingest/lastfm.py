@@ -165,10 +165,11 @@ class LastfmClient:
         self._fetch, self._sleep, self._clock = fetch, sleep, clock
         self._interval, self._max_calls, self._backoff, self._out = min_interval, max_calls, backoff_base, out
         self.calls = 0
+        self._user = ""  # user name of the call in flight: redacted from every message
         self._last: float | None = None
 
     def _err(self, msg: str, code: int | None = None) -> LastfmError:
-        e = LastfmError(redact(msg, [self._key, urllib.parse.quote(self._key)]))
+        e = LastfmError(redact(msg, [self._key, urllib.parse.quote(self._key), self._user]))
         e.code = code
         return e
 
@@ -194,7 +195,11 @@ class LastfmClient:
             raise self._err(f"method {method!r} is not an allowed read-only method")
         where = method
         if week is not None:
-            where += f" (week {int(week[0])} of {int(week[1])})"  # ints only: nothing untrusted reaches the text
+            if not (isinstance(week, tuple) and len(week) == 2
+                    and all(isinstance(i, int) and not isinstance(i, bool) for i in week)):
+                raise self._err("week must be a tuple of two integers (ordinal, total)")
+            where += f" (week {week[0]} of {week[1]})"  # ints only: nothing untrusted reaches the text
+        self._user = params.get("user", "")
         query = {"method": method, **params, "api_key": self._key, "format": "json"}
         url = f"{API}?{urllib.parse.urlencode(query)}"
         for attempt in range(MAX_RETRIES + 1):
@@ -208,7 +213,7 @@ class LastfmClient:
             except LastfmError as e:
                 if last or isinstance(e, ResponseTooLarge):  # an oversized body is not retried
                     raise self._err(str(e)) from None
-                self._wait(attempt, "network error")
+                self._wait(attempt, "network error", where)
                 continue
             finally:
                 self._last = self._clock()
@@ -218,14 +223,15 @@ class LastfmClient:
                     raise self._err(f"malformed Last.fm error answer (HTTP {status})")
                 if code in RETRYABLE_CODES:
                     if last:
-                        raise self._err(f"{ERROR_MESSAGES.get(code, f'Last.fm error {code}')} in {where} after {MAX_RETRIES} retries")
-                    self._wait(attempt, f"error {code}")
+                        raise self._err((f"Last.fm {where} failed: {ERROR_MESSAGES[code]} after {MAX_RETRIES} retries" if code in ERROR_MESSAGES
+                                  else f"Last.fm error {code} in {where} after {MAX_RETRIES} retries"))
+                    self._wait(attempt, f"error {code}", where)
                     continue
-                raise self._err(self._api_text(code, body, where, params.get("user", "")), code)
+                raise self._err(self._api_text(code, body, where), code)
             if status >= 500 or status == 429:
                 if last:
                     raise self._err(f"Last.fm kept answering HTTP {status} after {MAX_RETRIES} retries")
-                self._wait(attempt, f"HTTP {status}")
+                self._wait(attempt, f"HTTP {status}", where)
                 continue
             if status != 200:
                 raise self._err(f"Last.fm request failed: HTTP {status} on {method}")
@@ -234,17 +240,19 @@ class LastfmClient:
             return body
         raise self._err("Last.fm request failed after retries")  # unreachable, keeps the contract explicit
 
-    def _wait(self, attempt: int, why: str) -> None:
+    def _wait(self, attempt: int, why: str, where: str) -> None:
         secs = self._backoff * 2 ** attempt
-        self._out(f"Last.fm {why}, waiting {secs:g} s before retry {attempt + 1}/{MAX_RETRIES}")
+        self._out(f"Last.fm {why} in {where}, waiting {secs:g} s before retry {attempt + 1}/{MAX_RETRIES}")
         self._sleep(secs)
 
-    def _api_text(self, code: int, body: dict, where: str, user: str = "") -> str:
+    def _api_text(self, code: int, body: dict, where: str) -> str:
         """Message for an API error code; names the method (`where`), never the key, user name or URL."""
         if code in ERROR_MESSAGES:
-            return f"{ERROR_MESSAGES[code]} in {where}"
+            return f"Last.fm {where} failed: {ERROR_MESSAGES[code]}"
         msg = body.get("message")
-        reason = clean_text(redact(msg, [self._key, user]), REASON_MAX) if isinstance(msg, str) else ""
+        reason = ""
+        if isinstance(msg, str):  # clean first (it joins characters split by zero-width ones), then redact, then cut
+            reason = clean_text(redact(clean_text(msg, 4 * REASON_MAX), [self._key, self._user]), REASON_MAX)
         return f"Last.fm error {code} in {where}" + (f": {reason}" if reason else "")
 
 

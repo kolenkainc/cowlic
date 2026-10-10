@@ -278,13 +278,13 @@ class ClientTests(unittest.TestCase):
     def test_other_codes_are_still_not_retried_and_name_the_method(self):
         for code in (6, 10, 17, 26, 99):
             c, _ = make(Fake([], errors=[(200, {"error": code})]))
-            with self.assertRaisesRegex(lf.LastfmError, "in user.getWeeklyChartList"):
+            with self.assertRaisesRegex(lf.LastfmError, "user.getWeeklyChartList"):
                 c.call("user.getWeeklyChartList", user=USER)
             self.assertEqual(c.calls, 1)
 
     def test_error_29_exhaustion_names_the_method(self):
         c, _ = make(Fake([], errors=[(200, {"error": 29})] * 10))
-        with self.assertRaisesRegex(lf.LastfmError, "rate limit exceeded .* in user.getWeeklyChartList after 3 retries"):
+        with self.assertRaisesRegex(lf.LastfmError, "user.getWeeklyChartList failed: rate limit exceeded .* after 3 retries"):
             c.call("user.getWeeklyChartList", user=USER)
 
     def test_week_ordinal_without_dates(self):
@@ -310,6 +310,44 @@ class ClientTests(unittest.TestCase):
                 self.assertNotIn(secret, msg)
             self.assertIn("(week 3 of 9)", msg)
             self.assertLess(len(msg), 400)
+
+    def test_split_secrets_do_not_survive_cleaning(self):
+        for sep in ("\u200b", "\x00", "\n", "\u2060"):
+            split = lambda t: sep.join(t)  # every character separated
+            hostile = f"bad {split(USER)} x {split(KEY)} y"
+            c, _ = make(Fake([], errors=[(200, {"error": 99, "message": hostile})]))
+            with self.assertRaises(lf.LastfmError) as cm:
+                c.call("user.getWeeklyChartList", user=USER)
+            flat = "".join(ch for ch in str(cm.exception) if ch.isalnum() or ch == "_").lower()
+            self.assertNotIn(USER.lower(), flat, repr(sep))
+            self.assertNotIn(KEY.lower(), flat, repr(sep))
+
+    def test_final_pass_redacts_the_user_name_everywhere(self):
+        c, _ = make(Fake([]))
+        c._user = USER
+        self.assertNotIn(USER, str(c._err(f"oops {USER}")))
+
+    def test_week_is_not_sent_and_the_query_is_fixed(self):
+        fake = Fake([])
+        c, _ = make(fake)
+        c.call("user.getWeeklyArtistChart", week=(1, 2), user=USER, **{"from": "1", "to": "2"})
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(fake.urls[0]).query))
+        self.assertEqual(set(q), {"method", "user", "from", "to", "api_key", "format"})
+
+    def test_bad_week_is_rejected_without_a_request(self):
+        for bad in (("x", 1), (None, 1), (1,), (1, 2, 3), [1, 2], (True, 2), 5):
+            c, _ = make(Fake([]))
+            with self.assertRaises(lf.LastfmError):
+                c.call("user.getWeeklyArtistChart", week=bad, user=USER)
+            self.assertEqual(c.calls, 0)
+
+    def test_retry_progress_line_names_the_method(self):
+        lines = []
+        c, _ = make(Fake([], errors=[(200, {"error": 8})]), out=lines.append)
+        c.call("user.getWeeklyChartList", user=USER)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("error 8 in user.getWeeklyChartList", lines[0])
+        self.assertNotIn(USER, lines[0])
 
     def test_http_5xx_and_network_errors_retry(self):
         c, _ = make(Fake([], errors=[(503, {}), lf.LastfmError("network error talking to Last.fm (TimeoutError)")]))
