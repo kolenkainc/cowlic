@@ -90,23 +90,60 @@ DEBUG_RECORD = re.compile(r"^\[[^\]]+\]\s+DEBUG\s+\S+ - (?P<msg>.*?)(?:\s+\S+\.p
 EXC_SUMMARY = re.compile(r"^(?:[\w.]+\.)?\w*(?:Error|Exception): \S")  # last line of a printed Python traceback
 MAX_CAUSES = 3
 GENERIC_FAILURE = "YT-DLP download error"  # spotdl's own wrapper message; it names no cause
+ENCODED_DELIM = re.compile(r"%3[Ff]|%23")  # percent-encoded ? and #: decoded so the query is recognised and stripped
 URL_QUERY = re.compile(r"(?<=\S)[?#]\S+")  # query string or fragment of a URL: signed googlevideo links carry ip, sig, pot
+VIDEO_ID_PARAM = re.compile(r"(?:^|&)v=([A-Za-z0-9_-]{1,20})(?=&|$)")  # YouTube watch id: public, kept
+IP_PARAM = re.compile(r"(?i)(?<![A-Za-z0-9])ip=[^\s&;/]+")  # ip=1.2.3.4 or ;ip=...
+_H = r"[0-9A-Fa-f]{1,4}"
+IPV4 = re.compile(r"(?<![\w.])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?![\w.])")
+IPV6 = re.compile(  # full form, or compressed form (it contains "::"); a bare 13:10:00 timestamp is not matched
+    rf"(?<![\w:.-])(?:(?:{_H}:){{7}}{_H}|(?:{_H}:){{1,7}}:(?:{_H}(?::{_H}){{0,6}})?|::{_H}(?::{_H}){{0,6}})(?![\w:.-])"
+)
 OPAQUE_TOKEN = re.compile(r"[A-Za-z0-9_+=-]{24,}")  # long base64/hex/url-safe run: a token, not readable text
+JOINED_RUN = re.compile(r"[A-Za-z0-9_+=-]+(?:[./][A-Za-z0-9_+=-]+)+")  # pieces joined by . or / (JWT, signed paths)
+
+
+def _query(m: re.Match) -> str:
+    text = m.group(0)
+    if text[0] != "?":
+        return "?<stripped>"
+    v = VIDEO_ID_PARAM.search(text[1:])
+    return f"?v={v[1]}&<stripped>" if v and "&" in text else (f"?v={v[1]}" if v else "?<stripped>")
+
+
+def _opaque_piece(piece: str) -> bool:
+    return len(piece) >= 8 and any(c.isdigit() for c in piece) and any(c.isalpha() for c in piece)
+
+
+def _joined(m: re.Match) -> str:
+    run = m.group(0)
+    pieces = re.split(r"[./]", run)
+    # hostnames and readable paths stay; a run whose opaque-looking pieces add up to 16+ characters is a token
+    if len(run) >= 24 and sum(len(x) for x in pieces if _opaque_piece(x)) >= 16:
+        return "<token>"
+    return run
 
 
 def scrub_cause(ln: str) -> str:
-    """A cause line is public log text: drop URL query strings and fragments and mask long opaque tokens."""
-    return OPAQUE_TOKEN.sub("<token>", URL_QUERY.sub("?<stripped>", ln))
+    """Log text is public: drop URL query strings and fragments (keeping a YouTube v=<id>), mask ip= values and
+    bare IPv4/IPv6 addresses, and mask long opaque tokens (also ones joined by . or /)."""
+    ln = ENCODED_DELIM.sub(lambda m: "?" if m[0][2] in "Ff" else "#", ln)
+    ln = URL_QUERY.sub(_query, ln)
+    ln = IP_PARAM.sub("ip=<ip>", ln)
+    ln = IPV6.sub("<ip>", IPV4.sub("<ip>", ln))
+    ln = JOINED_RUN.sub(_joined, ln)
+    return OPAQUE_TOKEN.sub("<token>", ln)
 
 
 def clean_lines(text: str, secrets: list[str]) -> list[str]:
     """Output lines, redacted first, then whitespace-collapsed (rich pads lines to the console width), with
-    empty lines, debug noise and rich traceback-box lines dropped and each line capped at LINE_MAX."""
+    empty lines, debug noise and rich traceback-box lines dropped, URLs and tokens scrubbed (scrub_cause) and
+    each line capped at LINE_MAX. Every log path (tail, cause lines, summaries) goes through here."""
     lines = []
     for ln in redact(text, secrets).splitlines():
         ln = " ".join(ln.split())
         if ln and ln[0] not in BOX_START and not any(n in ln for n in SPOTDL_DEBUG_NOISE):
-            lines.append(ln[:LINE_MAX])
+            lines.append(scrub_cause(ln[:LINE_MAX * 4])[:LINE_MAX])  # pre-cap bounds regex work
     return lines
 
 
