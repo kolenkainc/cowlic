@@ -147,6 +147,9 @@ cid, secret = a[a.index("--client-id") + 1], a[a.index("--client-secret") + 1]
 mode = os.environ["FAKE_MODE"]
 if mode == "block":
     print("yt_dlp.utils.DownloadError: ERROR: [youtube] x: Sign in to confirm you're not a bot", file=sys.stderr)
+elif mode == "block_nonzero":
+    print("yt_dlp.utils.DownloadError: ERROR: [youtube] x: Sign in to confirm you're not a bot", file=sys.stderr)
+    sys.exit(1)
 elif mode == "noisy":
     for i in range(100):
         print(f"line {i}")
@@ -603,6 +606,39 @@ class YouTubeSignInTest(FakeSpotdlCase):
         self.assertEqual(searched, [sid(1), sid(2), sid(1), sid(2)])
         self.assertEqual(fetched, [GOOD_URL, GOOD_URL2])
 
+    def test_nonzero_spotdl_exit_with_the_challenge_is_recognised(self):
+        os.environ["FAKE_MODE"] = "block_nonzero"
+        with self.assertRaises(ingest.YouTubeSignInRequired):
+            ingest.spotdl_run(["download", "x"], self.work)
+
+    def test_counts_and_not_attempted_are_logged_and_carried(self):
+        # playlist 1 (3 tracks) is fine; playlist 2 (4 tracks): track 1 new, track 2 challenged; playlist 3 untouched
+        urls = [GOOD_URL, GOOD_URL2, GOOD_URL3]
+        songs = {GOOD_URL: [song(1), song(2), song(3)], GOOD_URL2: [song(4), song(5), song(6), song(7)]}
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(out):
+            f = Fakes(Path(d))
+            deps = f.deps()
+            inner = deps.download
+
+            def download(s, m, tdir):
+                if s["song_id"] == sid(5):
+                    raise ingest.YouTubeSignInRequired("x")
+                return inner(s, m, tdir)
+
+            deps.download = download
+            with self.assertRaises(ingest.YouTubeSignInRequired) as cm:
+                ingest.run_playlists(urls, lambda u: songs[u], deps, set(), {}, Path(d), False)
+        e = cm.exception
+        self.assertEqual((e.counts["new"], e.counts["failed"]), (1, 0))
+        self.assertEqual((e.tracks_not_attempted, e.playlists_not_attempted), (2, 1))
+        text = out.getvalue()
+        self.assertIn(f"playlist {GOOD_URL}: 3 new", text)
+        self.assertIn(f"playlist {GOOD_URL2}: interrupted by youtube-sign-in: 1 new", text)
+        self.assertIn("so far: 4 new, 0 already present, 0 no match, 0 too big, 0 failed; not attempted: 2 more "
+                      "track(s) of the current playlist (plus the track that was challenged), 1 playlist(s) "
+                      "not started", text)
+
     def test_detection_matches_real_captured_lines(self):
         for line in ("ERROR: [youtube] x: Sign in to confirm you're not a bot",
                      "[13:10:01] DEBUG MainThread - ERROR: [youtube] x: Sign in to confirm you’re not a bot. "
@@ -638,6 +674,9 @@ class YouTubeSignInTest(FakeSpotdlCase):
         self.assertNotIn(code, (0, 1, 2))
         lines = [ln for ln in out.splitlines() if "youtube-sign-in" in ln]
         self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("ERROR youtube-sign-in:"))
+        self.assertIn("wait and re-run later", lines[0])
+        self.assertIn("do not add cookies", lines[0])
         self.assertEqual(ingest.FAILURE_YOUTUBE_SIGN_IN, "youtube-sign-in")
         self.assertNotIn("done:", out)
 

@@ -45,12 +45,21 @@ class IngestError(Exception):
 
 class YouTubeSignInRequired(IngestError):
     """YouTube answered with its bot check ("Sign in to confirm you're not a bot"). Not a per-track failure: it ends
-    the whole run (no retry, no bypass), see run() and main()."""
+    the whole run (no retry, no bypass), see run() and main(). run()/run_playlists() log the counts and attach
+    them here (counts of the playlist in progress, tracks and playlists not attempted) for the status file (#31)."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.counts: dict | None = None  # counts of the playlist in progress, challenged track not included
+        self.tracks_not_attempted = 0    # tracks after the challenged one in the playlist in progress
+        self.playlists_not_attempted = 0  # playlists after the one in progress (not even fetched)
 
 
 # Distinct process exit code and failure class for this outcome (1 = other failures, 2 = bad usage).
 EXIT_YOUTUBE_SIGN_IN = 3
 FAILURE_YOUTUBE_SIGN_IN = "youtube-sign-in"
+# Owner decision (#62): the bot check is only DETECTED and reported. No cookies, proxies, PO-token tricks or client
+# rotation are added or planned; the owner waits and re-runs later.
 # yt-dlp's wording, as captured in the cause lines: "ERROR: [youtube] <id>: Sign in to confirm you're not a bot.
 # Use --cookies-from-browser ...". The apostrophe may be straight, curly or missing.
 SIGN_IN_CHALLENGE = re.compile(r"sign in to confirm (?:that )?you.?re not a bot", re.IGNORECASE)
@@ -341,6 +350,8 @@ def spotdl_run(args: list[str], cwd: Path) -> tuple[list[str], str]:
     lines = clean_lines(r.stdout + "\n" + r.stderr, [cid, secret])
     tail = "\n".join(lines[-TAIL_LINES:])
     if r.returncode != 0:
+        if is_sign_in_challenge(cause_lines(lines) + lines[-TAIL_LINES:]):
+            raise YouTubeSignInRequired("YouTube asks to sign in (bot check)")
         raise IngestError(f"spotdl {args[0]} failed with exit code {r.returncode}: {tail}")
     return cause_lines(lines), tail
 
@@ -460,11 +471,13 @@ def real_deps(ytm) -> Deps:
 
 def run(songs: list[dict], deps: Deps, existing: set, covers: dict, work: Path, dry: bool) -> dict:
     counts = {"new": 0, "exists": 0, "no_match": 0, "too_big": 0, "dry_run": 0, "failed": 0}
-    for song in dedupe(songs):
+    unique = dedupe(songs)
+    for i, song in enumerate(unique):
         label = f"{(song.get('artists') or ['?'])[0]} - {song.get('name', '?')}"
         try:
             status = process_track(song, deps, existing, covers, work, dry)
-        except YouTubeSignInRequired:
+        except YouTubeSignInRequired as e:
+            e.counts, e.tracks_not_attempted = counts, len(unique) - i - 1
             raise  # ends the run, not just this track
         except (IngestError, OSError, KeyError, ValueError, IndexError, TypeError) as e:
             detail = f": {e}" if isinstance(e, IngestError) else ""
@@ -481,6 +494,9 @@ def run(songs: list[dict], deps: Deps, existing: set, covers: dict, work: Path, 
     return counts
 
 
+COUNT_KEYS = ("new", "exists", "no_match", "too_big", "failed")
+
+
 def summary(counts: dict) -> str:
     return (f"{counts['new']} new, {counts['exists']} already present, {counts['no_match']} no match, "
             f"{counts['too_big']} too big, {counts['failed']} failed")
@@ -491,18 +507,33 @@ def run_playlists(urls: list[str], fetch_songs: Callable[[str], list[dict]], dep
     """Runs every playlist; one failing playlist does not hide the others. Prints one result line per playlist.
     Returns url -> counts, or None when the playlist could not be fetched (counts also hold failed tracks)."""
     results: dict[str, dict | None] = {}
-    for url in urls:
+    for n, url in enumerate(urls):
         try:
-            songs = fetch_songs(url)
-        except YouTubeSignInRequired:
+            try:
+                songs = fetch_songs(url)
+            except (IngestError, OSError, ValueError) as e:
+                if isinstance(e, YouTubeSignInRequired):
+                    raise
+                log(f"playlist {url}: FAILED: {type(e).__name__}: {e}")
+                results[url] = None
+                continue
+            results[url] = run(songs, deps, existing, covers, work, dry)
+        except YouTubeSignInRequired as e:
+            e.playlists_not_attempted = len(urls) - n - 1
+            log_interrupted(url, results, e)
             raise
-        except (IngestError, OSError, ValueError) as e:
-            log(f"playlist {url}: FAILED: {type(e).__name__}: {e}")
-            results[url] = None
-            continue
-        results[url] = run(songs, deps, existing, covers, work, dry)
         log(f"playlist {url}: {summary(results[url])}")
     return results
+
+
+def log_interrupted(url: str, results: dict, e: YouTubeSignInRequired) -> None:
+    """Counts only, never values: what was done before the sign-in challenge and what was not attempted."""
+    done = [c for c in results.values() if c is not None]
+    current = e.counts or {k: 0 for k in COUNT_KEYS}
+    log(f"playlist {url}: interrupted by youtube-sign-in: {summary(current)}")
+    total = {k: sum(c[k] for c in [*done, current]) for k in COUNT_KEYS}
+    log(f"so far: {summary(total)}; not attempted: {e.tracks_not_attempted} more track(s) of the current "
+        f"playlist (plus the track that was challenged), {e.playlists_not_attempted} playlist(s) not started")
 
 
 def main() -> int:
@@ -551,7 +582,8 @@ def main() -> int:
             results = run_playlists(urls, fetch_songs, real_deps(YTMusic()), existing, covers, work, args.dry_run)
         except YouTubeSignInRequired:
             log(f"ERROR {FAILURE_YOUTUBE_SIGN_IN}: YouTube asks to sign in (bot check); skipping the rest of the "
-                f"run (remaining tracks and playlists), not retrying; exit code {EXIT_YOUTUBE_SIGN_IN}")
+                f"run (remaining tracks and playlists), not retrying; manual action needed: wait and re-run later, "
+                f"do not add cookies; exit code {EXIT_YOUTUBE_SIGN_IN}")
             return EXIT_YOUTUBE_SIGN_IN
     ok = [c for c in results.values() if c is not None]
     total = {k: sum(c[k] for c in ok) for k in ("new", "exists", "no_match", "too_big", "failed")}
