@@ -9,12 +9,16 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin"
 
-# Shims: log argv (never stdin) to calls.log, store stdin as "<tool> <args>: <value>" in stdin.log.
+# Shims: log argv (never stdin) to calls.log, cwd to pwd.log, stdin to stdin.log. FAIL_AT=N makes the
+# Nth call exit 1 (after recording). The shims set +x themselves: they stand in for non-bash tools.
 for tool in gh npx; do
   cat > "$TMP/bin/$tool" <<SHIM
 #!/usr/bin/env bash
+set +x
 printf '%s\n' "$tool \$*" >> "$TMP/calls.log"
+printf '%s\n' "$tool \$PWD" >> "$TMP/pwd.log"
 printf '%s: %s\n' "$tool \$*" "\$(cat)" >> "$TMP/stdin.log"
+if [ -n "\${FAIL_AT:-}" ] && [ "\$(wc -l < "$TMP/calls.log")" -eq "\$FAIL_AT" ]; then echo "shim: simulated failure" >&2; exit 1; fi
 SHIM
   chmod +x "$TMP/bin/$tool"
 done
@@ -42,8 +46,10 @@ run() { # run <outfile> args... ; env ENV_FILE=$TMP/env; returns script exit cod
 }
 no_leak() { # no_leak <label> files...
   local label="$1"; shift
+  local f
+  for f in "$@"; do [ -f "$f" ] || fail "$label: file to check does not exist: $f"; done
   for c in "${CANARIES[@]}" CANARY_BROAD_9999; do
-    if grep -q "$c" "$@" 2>/dev/null; then fail "$label: value $c leaked"; fi
+    if grep -q "$c" "$@"; then fail "$label: value $c leaked"; fi
   done
 }
 
@@ -54,16 +60,20 @@ grep -q 'INGEST_CLOUDFLARE_API_TOKEN.*gh-secret.*CLOUDFLARE_API_TOKEN.*present' 
 no_leak dry-run "$TMP/t1.out" "$TMP/t1.err"
 
 # 2. real sync (shims): correct calls, values only on stdin, no leak even under xtrace
-env PATH="$TMP/bin:$PATH" ENV_FILE="$TMP/env" SHELLOPTS=xtrace "$SCRIPT" > "$TMP/t2.out" 2> "$TMP/t2.err" || fail "sync exit"
+(cd "$TMP" && env PATH="$TMP/bin:$PATH" ENV_FILE="$TMP/env" SHELLOPTS=xtrace "$SCRIPT") > "$TMP/t2.out" 2> "$TMP/t2.err" || fail "sync exit"
 no_leak sync "$TMP/t2.out" "$TMP/t2.err" "$TMP/calls.log"
 [ "$(wc -l < "$TMP/calls.log")" -eq 10 ] || fail "expected 10 tool calls"
 grep -qx 'gh secret set CLOUDFLARE_API_TOKEN: CANARY_INGEST_3333' "$TMP/stdin.log" || fail "renamed secret"
 grep -qx 'gh variable set D1_DATABASE_ID: CANARY_D1_6666' "$TMP/stdin.log" || fail "variable"
-grep -qx 'npx wrangler secret put SUBSONIC_USER -c wrangler.local.toml: CANARY_USER_7b21' "$TMP/stdin.log" || fail "worker secret, quote stripping"
+grep -qx 'npx --no-install wrangler secret put SUBSONIC_USER -c wrangler.local.toml: CANARY_USER_7b21' "$TMP/stdin.log" || fail "worker secret, quote stripping"
 grep -qx 'gh secret set TG_BOT_TOKEN: CANARY_TG_9f3a' "$TMP/stdin.log" || fail "export prefix"
 grep -q CANARY_BROAD "$TMP/stdin.log" && fail "unmanifested key synced"
+grep -qx "gh $ROOT" "$TMP/pwd.log" || fail "gh not run from repo root"
+[ "$(grep -c '^npx ' "$TMP/pwd.log")" -eq 3 ] || fail "expected 3 npx calls"
+[ "$(grep -cx "npx $ROOT/worker" "$TMP/pwd.log")" -eq 3 ] || fail "npx not run from worker/"
+grep -q 'npx --no-install wrangler secret put' "$TMP/calls.log" || fail "npx --no-install not used"
 PATH="$TMP/bin:$PATH" ENV_FILE="$TMP/env" bash -x "$SCRIPT" --only SUBSONIC_USER > /dev/null 2> "$TMP/t2x.err" || fail "bash -x exit"
-no_leak xtrace "$TMP/t2x.err"
+no_leak "script resists xtrace via its own set +x" "$TMP/t2x.err"
 
 # 3. --only syncs exactly one entry
 rm -f "$TMP/calls.log" "$TMP/stdin.log"
@@ -91,6 +101,39 @@ PATH="$TMP/bin:$PATH" ENV_FILE="$TMP/env" MANIFEST="$TMP/bad.manifest" "$SCRIPT"
 grep -q "unknown target" "$TMP/t6.err" || fail "unknown target message"
 [ ! -e "$TMP/calls.log" ] || fail "call made with bad manifest"
 no_leak badmanifest "$TMP/t6.out" "$TMP/t6.err"
+
+# 6b. partial failure: 3rd of 10 calls fails
+rm -f "$TMP/calls.log" "$TMP/stdin.log" "$TMP/pwd.log"
+rc=0; FAIL_AT=3 run "$TMP/t7" || rc=$?
+[ "$rc" -eq 1 ] || fail "partial failure exit code is $rc, expected 1"
+[ "$(wc -l < "$TMP/calls.log")" -eq 3 ] || fail "script continued after a failed call"
+grep -q 'failed at SUBSONIC_USER' "$TMP/t7.err" || fail "failing entry not named"
+grep -q '2 of 10 entries synced' "$TMP/t7.err" || fail "synced count missing"
+grep -q 'TG_BOT_TOKEN->gh-secret' "$TMP/t7.err" || fail "already-synced list missing"
+grep -q 'Rerun is safe' "$TMP/t7.err" || fail "rerun hint missing"
+no_leak partial-failure "$TMP/t7.out" "$TMP/t7.err" "$TMP/calls.log"
+
+# 6c. .env syntax rejection: line number reported, value never printed
+for bad in 'SUBSONIC_USER= CANARY_LEAD_1' 'SUBSONIC_USER=CANARY_INL_2 # note' 'SUBSONIC_USER="CANARY_Q_3" # note' 'SUBSONIC_USER="CANARY_UNB_4'; do
+  grep -v '^SUBSONIC_USER' "$TMP/env.full" > "$TMP/env"; printf '%s\n' "$bad" >> "$TMP/env"
+  rm -f "$TMP/calls.log"
+  run "$TMP/t8" && fail "bad .env line accepted: ${bad%%CANARY*}"
+  grep -q "line $(wc -l < "$TMP/env"): .*(key SUBSONIC_USER)" "$TMP/t8.err" || fail "line number/key not reported"
+  [ ! -e "$TMP/calls.log" ] || fail "synced despite bad .env"
+  no_leak badenv "$TMP/t8.out" "$TMP/t8.err"; if grep -q CANARY_ "$TMP/t8.out" "$TMP/t8.err"; then fail "bad-line value printed"; fi
+done
+cp "$TMP/env.full" "$TMP/env"
+
+# 6d. preflight: missing wrangler.local.toml / gh not on PATH abort before any call
+mkdir -p "$TMP/fake/scripts" "$TMP/fake/worker"; cp "$SCRIPT" "$TMP/fake/scripts/"
+rm -f "$TMP/calls.log"
+PATH="$TMP/bin:$PATH" ENV_FILE="$TMP/env" MANIFEST="$ROOT/scripts/secrets.manifest" "$TMP/fake/scripts/sync-secrets.sh" > "$TMP/t9.out" 2> "$TMP/t9.err" && fail "missing wrangler.local.toml should fail"
+grep -q 'wrangler.local.toml is missing' "$TMP/t9.err" || fail "toml preflight message"
+[ ! -e "$TMP/calls.log" ] || fail "call made before preflight failed"
+no_leak preflight "$TMP/t9.out" "$TMP/t9.err"
+mkdir -p "$TMP/emptybin"; ln -s "$(command -v bash)" "$TMP/emptybin/bash"; ln -s "$(command -v dirname)" "$TMP/emptybin/dirname"
+PATH="$TMP/emptybin" ENV_FILE="$TMP/env" "$TMP/emptybin/bash" "$SCRIPT" > "$TMP/t10.out" 2> "$TMP/t10.err" && fail "missing gh should fail"
+grep -q 'gh not found' "$TMP/t10.err" || fail "gh preflight message"
 
 # 7. real manifest has the required entries
 for e in 'TG_BOT_TOKEN gh-secret' 'TG_BOT_TOKEN worker-secret' 'INGEST_CLOUDFLARE_API_TOKEN gh-secret:CLOUDFLARE_API_TOKEN' 'D1_DATABASE_ID gh-variable'; do

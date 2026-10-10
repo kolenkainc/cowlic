@@ -111,7 +111,9 @@ Single-source rule: every secret and config value is edited only in the local gi
 | `SUBSONIC_USER`, `SUBSONIC_PASSWORD` | Worker secrets | Client login |
 | `CLOUDFLARE_API_TOKEN` (optional) | `.env` only, never synced | Broad personal token for local wrangler/ad-hoc work |
 
-Usage: `scripts/sync-secrets.sh --dry-run` (lists key, target, present/missing; never shows values), `scripts/sync-secrets.sh` (all), `scripts/sync-secrets.sh --only KEY`. Values travel only through stdin of `gh secret set`, `gh variable set` and `wrangler secret put`. Missing keys or unknown manifest targets abort before anything is synced. Test: `scripts/test-sync-secrets.sh` (fixture `.env` plus gh/npx shims, no network).
+Usage: `scripts/sync-secrets.sh --dry-run` (lists key, target, present/missing; never shows values), `scripts/sync-secrets.sh` (all), `scripts/sync-secrets.sh --only KEY`. Values travel only through stdin of `gh secret set`, `gh variable set` and `wrangler secret put`. Missing keys, unsupported `.env` syntax, unknown manifest targets, missing `gh`/`npx` or a missing `worker/wrangler.local.toml` abort before anything is synced. If a call fails midway, the script reports which entries were already synced; rerunning is safe (idempotent upserts), `--only KEY` retries one entry. Prerequisites: `gh` authenticated, and `npm ci` done in `worker/` (the script uses `npx --no-install`).
+
+Supported `.env` subset: `KEY=value`, optional `export `, optional matching quotes around the whole value. The value is taken verbatim (no escape processing, no expansion, no multiline), trailing whitespace is trimmed, the last duplicate key wins. A value starting with a space or an unquoted inline comment (` #`) is rejected with the line number (never the value). Test: `scripts/test-sync-secrets.sh` (fixture `.env` plus gh/npx shims, no network).
 
 Rotation: edit the one line in `.env`, run `scripts/sync-secrets.sh --only KEY`, then check `gh secret list`, `gh variable list`, `npx wrangler secret list -c wrangler.local.toml` (from `worker/`). Rotate the secret at its provider first (BotFather, Spotify dashboard, Cloudflare).
 
