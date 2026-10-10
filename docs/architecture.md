@@ -107,6 +107,7 @@ Single-source rule: every secret and config value is edited only in the local gi
 | `TG_BOT_TOKEN` | local `.env`, Worker secret | Bot API |
 | `TG_CHANNEL_ID` | local `.env` | Storage channel |
 | `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET` | local `.env` | Metadata for spotdl |
+| `SPOTIFY_USER_REFRESH_TOKEN` (optional) | local `.env` only | Spotify user login (scope `user-follow-read`, PKCE, no client secret) for the followed-artists list. Written by `python ingest/spotify_user.py login` (atomic write, mode kept, never printed), refreshed by `get_access_token()` in `ingest/spotify_user.py`. Not required by the normal ingest run and hidden from the spotdl subprocess. Valid about 6 months from login; on `invalid_grant` run `login` again. Redirect URI registered in the Spotify dashboard: `http://127.0.0.1:8888/callback`. |
 | `INGEST_CLOUDFLARE_API_TOKEN` | local `.env` | Narrow token (D1:Edit only) for ingest writing to D1 over the REST API. The only Cloudflare token ingest reads: no fallback to `CLOUDFLARE_API_TOKEN`; if it is missing the run stops with an error naming this key. |
 | `CLOUDFLARE_ACCOUNT_ID`, `D1_DATABASE_ID` | local `.env` | D1 REST API addressing |
 | `SUBSONIC_USER`, `SUBSONIC_PASSWORD` | local `.env`, Worker secrets | Client login |
