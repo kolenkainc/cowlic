@@ -13,6 +13,8 @@
 #   bash     >= 4: already true on Debian/Ubuntu         | brew install bash (macOS ships 3.2)
 #   .env     copy the template from the repo docs and fill it in (see the runbook); this script
 #            only checks the key names, never the values.
+# Option --deno-optional: deno missing, too old or unparsable prints a WARN line and keeps the exit code (the
+# local wrapper uses it; ingest.py runs without deno and only logs a warning). Everything else stays fatal.
 # Test: scripts/test-check-local-prereqs.sh
 set +x   # never trace: xtrace would expose values of .env that grep reads
 set -u
@@ -25,6 +27,13 @@ MIN_DENO="2.3.0"
 REQUIRED_ENV=(TG_BOT_TOKEN TG_CHANNEL_ID SPOTIFY_CLIENT_ID SPOTIFY_CLIENT_SECRET
               INGEST_CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID D1_DATABASE_ID)
 TIMEOUT_S=30  # as in ingest.py for deno; skipped when `timeout` is not installed (stock macOS)
+
+DENO_OPTIONAL=0
+case "${1:-}" in
+  "") ;;
+  --deno-optional) DENO_OPTIONAL=1 ;;
+  *) echo "usage: $0 [--deno-optional]" >&2; exit 2 ;;
+esac
 
 fail=0
 with_timeout() { if command -v timeout >/dev/null 2>&1; then timeout "$TIMEOUT_S" "$@"; else "$@"; fi; }
@@ -46,15 +55,20 @@ version_ge() {
 if command -v ffmpeg >/dev/null 2>&1; then ok "ffmpeg"
 else missing "ffmpeg" "not on PATH. Debian/Ubuntu: sudo apt install ffmpeg; macOS: brew install ffmpeg"; fi
 
+# With --deno-optional a deno problem is a "WARN" line and does not change the exit code
+# (ingest.py itself only warns about a missing JS runtime).
+deno_problem() {
+  if ((DENO_OPTIONAL)); then printf 'WARN     %s: %s\n' "$1" "$2"; else missing "$1" "$2"; fi
+}
 if ! command -v deno >/dev/null 2>&1; then
-  missing "deno" "not on PATH, need >= $MIN_DENO. macOS: brew install deno; Linux: release from https://github.com/denoland/deno/releases"
+  deno_problem "deno" "not on PATH, need >= $MIN_DENO. macOS: brew install deno; Linux: release from https://github.com/denoland/deno/releases"
 else
   dv="$(with_timeout deno --version 2>/dev/null | head -n 1)"
   if [[ "$dv" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]]; then
     if version_ge "${BASH_REMATCH[1]}" "$MIN_DENO"; then ok "deno ${BASH_REMATCH[1]} (>= $MIN_DENO)"
-    else missing "deno" "version ${BASH_REMATCH[1]} is older than $MIN_DENO. Upgrade: deno upgrade, or brew upgrade deno"; fi
+    else deno_problem "deno" "version ${BASH_REMATCH[1]} is older than $MIN_DENO. Upgrade: deno upgrade, or brew upgrade deno"; fi
   else
-    missing "deno" "cannot parse 'deno --version' output; need >= $MIN_DENO"
+    deno_problem "deno" "cannot parse 'deno --version' output; need >= $MIN_DENO"
   fi
 fi
 
