@@ -9,6 +9,8 @@
 # - Log: ${XDG_STATE_HOME:-$HOME/.local/state}/cowlic/ingest.log, rotated by size (ingest.log.1 .. .N).
 # - Exit code: the ingest exit code is passed through; any non-zero means the run failed (see
 #   describe_ingest_exit). The wrapper's own failures use the codes in the block below.
+# - After last-run.json: best-effort push of this run's redacted log to Grafana Cloud Loki (ship_grafana(); never
+#   changes the exit code, see docs/local-ingest.md).
 # Test: scripts/test-run-ingest-local.sh
 set +x
 set -uo pipefail
@@ -81,8 +83,33 @@ write_last_run() { # exit_code
     || { rm -f "$tmp"; log "WARN could not write last-run.json"; }
 }
 
-# Ends the run after the lock was taken: writes last-run.json, then exits with the code.
-finish() { write_last_run "$1"; rm -f "$RESULT"; exit "$1"; }
+# Best-effort shipping of THIS run's redacted log lines (from byte LOG_OFFSET on) and a run_summary line to Grafana
+# Cloud Loki (ingest/ship_grafana.py, which reads its credentials from .env itself). It can never change the run:
+# runs after last-run.json is written, under timeout (killed after 30 s), stdin closed, lock fd not inherited, stderr
+# dropped, result ignored. Only the first line of its stdout is logged, reduced to a harmless character set.
+SHIP="$ROOT/ingest/ship_grafana.py"
+SHIP_TIMEOUT_S="${COWLIC_SHIP_TIMEOUT:-30}"  # hard limit for the shipper (the test lowers it)
+case "$SHIP_TIMEOUT_S" in '' | *[!0-9]* | 0* ) SHIP_TIMEOUT_S=30 ;; esac  # positive integer only: timeout 0 means no limit
+[ "${#SHIP_TIMEOUT_S}" -le 3 ] && [ "$SHIP_TIMEOUT_S" -le 120 ] || SHIP_TIMEOUT_S=30  # sane maximum: 120 s
+ship_grafana() {
+  [ -x "$VENV_PY" ] && [ -f "$SHIP" ] || return 0
+  local out ship_rc=0 line
+  out="$(timeout -k 2 "$SHIP_TIMEOUT_S" "$VENV_PY" "$SHIP" --log "$LOG" --offset "$LOG_OFFSET" --last-run "$LAST_RUN" \
+    --started-at "$STARTED_AT" < /dev/null 9>&- 2> /dev/null)" || ship_rc=$?
+  if [ "$ship_rc" = 124 ] || [ "$ship_rc" = 137 ]; then
+    log "WARN grafana shipping timed out"
+  elif [ "$ship_rc" != 0 ]; then
+    log "WARN grafana shipping failed"
+  else
+    line="$(printf '%s\n' "$out" | head -n 1 | LC_ALL=C tr -cd 'A-Za-z0-9 .:,()_=*/-' | cut -c1-160)"
+    case "$line" in grafana:*) log "$line" ;; esac
+  fi
+  return 0
+}
+
+# Ends the run after the lock was taken: writes last-run.json, ships to Grafana (best effort), then exits with the
+# code. The exit code is the argument, whatever shipping does.
+finish() { local rc="$1"; write_last_run "$rc"; rm -f "$RESULT"; ship_grafana || true; exit "$rc"; }
 
 rotate_log() {
   [ -f "$LOG" ] || return 0
@@ -117,6 +144,9 @@ fi
 STARTED_AT="$(now_utc)"
 rm -f "$RESULT"  # no stale result of an earlier run can be mistaken for this one
 rotate_log
+# Where this run's lines begin in the log (after the rotation above; rotation happens only here, under the lock).
+LOG_OFFSET="$({ wc -c < "$LOG"; } 2> /dev/null)" || LOG_OFFSET=0
+case "$LOG_OFFSET" in '' | *[!0-9]*) LOG_OFFSET=0 ;; esac
 log "start"
 
 if [ ! -x "$VENV_PY" ]; then

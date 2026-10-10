@@ -15,8 +15,10 @@ enabling the timer) is untested by the author and is done by the owner in #73 an
   uploads to the Telegram channel and writes metadata to D1. Tracks already in D1 are skipped, so re-runs add
   no duplicates.
 - A systemd user timer starts the wrapper daily at 21:10 machine LOCAL time (`deploy/systemd/`).
-- Observability is logs only. Nothing is sent anywhere on success or failure (decision #72): you read the log
-  and `last-run.json`.
+- Observability is logs only, no notifications (decision #72): you read the log and `last-run.json`. Optionally
+  the redacted log of each run is also pushed to your Grafana Cloud Loki (see
+  [Shipping the run log to Grafana Cloud](#shipping-the-run-log-to-grafana-cloud)); without the three keys
+  listed there nothing is sent anywhere.
 
 ## Prerequisites
 
@@ -205,6 +207,63 @@ The journal holds the same output as the log for systemd runs (stdout/stderr go 
 The wrapper takes `flock -n` on `ingest.lock`. If a run is active, a second invocation prints one line to stderr,
 exits 75 and does not touch the log or `last-run.json`. This is normal if you start a manual run while the timer
 run is still going: wait for it to finish.
+
+## Shipping the run log to Grafana Cloud
+
+After every run (after `last-run.json` is written) the wrapper calls `ingest/ship_grafana.py` (Python standard
+library only). It is best effort and cannot change the run: it runs under `timeout` (30 s hard limit), its result
+is ignored, the wrapper exit code and `last-run.json` are unchanged, and a failure leaves one short line in
+`ingest.log` (`grafana: loki push failed (HTTP 401)`, `... (URLError)`, `grafana shipping timed out`). There is
+no retry: the next run is the retry, a failed night is a gap in Grafana.
+
+Enable it with three keys in the machine's `.env` (names only; values come from your Grafana Cloud portal, see
+#107, and are never committed or pasted anywhere):
+
+- `INGEST_GRAFANA_LOKI_URL`: the Loki URL of your stack (`https://logs-....grafana.net`; the path
+  `/loki/api/v1/push` is added if missing). Must be https and a host ending in `.grafana.net`, otherwise nothing
+  is sent.
+- `INGEST_GRAFANA_LOKI_USER`: the Loki user (instance id).
+- `INGEST_GRAFANA_TOKEN`: an access policy token with the `logs:write` scope only.
+
+With any of them missing the step logs `grafana: not configured` and does nothing.
+
+What is sent, and only that:
+
+- The lines of THIS run: the part of `ingest.log` from the byte offset the wrapper recorded just before its
+  `start` line (log rotation happens only there, under the lock, so the offset holds for the whole run). If the
+  file is shorter than the offset or the offset is not at a line start, no log lines are sent (this also happens
+  on the run after one that was killed mid-line, because the log then has no trailing newline: that run ships
+  only the summary). Lines are the ones ingest already redacted; the shipper cleans the whole text before
+  splitting it into lines: redact (token and its Basic credential as extra secrets), drop control, format and
+  line-separator characters, redact again (so a secret cannot be rebuilt by removing characters between its
+  letters). The same cleaning applies to the summary line, and a last check refuses to send a body that still
+  contains the token. Lines are cut at 4096 characters, at most 2000 lines are kept (first 1000 and the tail) and
+  the body is capped at about 1 MiB (the first quarter and the tail of the run, with one "omitted" line). If
+  Loki answers 400 or 413 to the push, ONE small follow-up push with just the `run_summary` line is made; any
+  other failure is not retried.
+- The 30 s limit can be lowered for tests with `COWLIC_SHIP_TIMEOUT`; only a positive integer up to 120 is
+  accepted, anything else (including 0, which would mean no limit) falls back to 30.
+- One `run_summary` line built from allowlisted, validated fields of `last-run.json` (parsed strictly: NaN and
+  Infinity are rejected; if the file is unusable or is not from this run, no summary line and the run is
+  unaffected): `run_summary exit_code=0 failure_class=none added=2 skipped=1 no_match=0 too_big=0 failed=0
+  not_attempted=0 duration_s=159`. No playlist URLs, no log file path.
+- Never sent: `.env` values, the token, URLs with queries, Telegram, D1 or Cloudflare ids. The URL, user and token
+  are never printed or logged; redirects are not followed; environment proxies are ignored.
+
+Labels (low cardinality, nothing per track or playlist): `job="cowlic-ingest"`, `host` (the machine host name),
+`level` (`info`, `warn`, `error`; from a leading `ERROR` or `WARN` token of the line, default `info`). The
+`run_summary` line is `info` for exit code 0 and `error` otherwise.
+
+Find the logs in Grafana (Explore, Loki data source of your stack):
+
+```logql
+{job="cowlic-ingest"}                                  # all lines
+{job="cowlic-ingest", level=~"warn|error"}             # problems only
+{job="cowlic-ingest"} |= "run_summary" | logfmt        # one line per run; then filter, e.g. | exit_code != "0"
+```
+
+Set the time range to the last 24 hours or more (one run a day). Free tier retention is about 14 days. Whether
+the first live push works is verified by the owner in #108.
 
 ## Per-run limits and the local state file
 
