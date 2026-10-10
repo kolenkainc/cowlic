@@ -82,15 +82,43 @@ def log(msg: str) -> None:
     print(neutralize(msg))
 
 
-def tail_of(text: str, secrets: list[str]) -> str:
-    """Last TAIL_LINES meaningful lines of tool output: redacted first, then whitespace-collapsed (rich pads
-    lines to the console width), debug-noise lines dropped and each line capped at LINE_MAX characters."""
+# rich draws spotdl's tracebacks as boxes whose lines start with these characters; they carry no error text.
+BOX_START = "│╭╰├┃┏┗─"
+# `[01:32:59 PM] DEBUG MainThread - <message> base.py:408`: spotdl's DEBUG record (whitespace already collapsed).
+# spotdl 4.5.2 get_download_metadata() logs the yt-dlp exception this way (logger.debug(exception)).
+DEBUG_RECORD = re.compile(r"^\[[^\]]+\]\s+DEBUG\s+\S+ - (?P<msg>.*?)(?:\s+\S+\.py:\d+)?$")
+EXC_SUMMARY = re.compile(r"^(?:[\w.]+\.)?\w*(?:Error|Exception): \S")  # last line of a printed Python traceback
+MAX_CAUSES = 3
+GENERIC_FAILURE = "YT-DLP download error"  # spotdl's own wrapper message; it names no cause
+
+
+def clean_lines(text: str, secrets: list[str]) -> list[str]:
+    """Output lines, redacted first, then whitespace-collapsed (rich pads lines to the console width), with
+    empty lines, debug noise and rich traceback-box lines dropped and each line capped at LINE_MAX."""
     lines = []
     for ln in redact(text, secrets).splitlines():
         ln = " ".join(ln.split())
-        if ln and not any(n in ln for n in SPOTDL_DEBUG_NOISE):
+        if ln and ln[0] not in BOX_START and not any(n in ln for n in SPOTDL_DEBUG_NOISE):
             lines.append(ln[:LINE_MAX])
-    return "\n".join(lines[-TAIL_LINES:])
+    return lines
+
+
+def cause_lines(lines: list[str]) -> list[str]:
+    """Lines that carry the real download error, searched in the WHOLE output (they can be far from its end):
+    spotdl's DEBUG record of the yt-dlp exception (`ERROR: [youtube] ...`) and printed exception summaries,
+    without repeats; the last MAX_CAUSES are kept."""
+    found = []
+    for ln in lines:
+        m = DEBUG_RECORD.match(ln)
+        if (m and (m["msg"].startswith("ERROR:") or EXC_SUMMARY.match(m["msg"]))) or EXC_SUMMARY.match(ln):
+            if ln not in found and GENERIC_FAILURE not in ln:
+                found.append(ln)
+    return found[-MAX_CAUSES:]
+
+
+def tail_of(text: str, secrets: list[str]) -> str:
+    """Last TAIL_LINES meaningful lines of tool output (see clean_lines)."""
+    return "\n".join(clean_lines(text, secrets)[-TAIL_LINES:])
 
 
 def stable_id(*parts: str) -> str:
@@ -198,9 +226,9 @@ MIN_DENO = (2, 3, 0)  # yt-dlp 2026.8.19: DenoJsRuntime.MIN_SUPPORTED_VERSION
 SPOTDL_CMD = [sys.executable, "-m", "spotdl"]  # tests replace this with a fake
 
 
-def spotdl_run(args: list[str], cwd: Path) -> str:
-    """Runs spotdl; returns the redacted tail of its output (<= TAIL_LINES). spotdl 4.5.2 exits 0 even when a
-    song's download failed (e.g. a YouTube block), so callers include the tail when no file appeared."""
+def spotdl_run(args: list[str], cwd: Path) -> tuple[list[str], str]:
+    """Runs spotdl; returns (cause lines, redacted tail of its output <= TAIL_LINES). spotdl 4.5.2 exits 0 even
+    when a song's download failed (e.g. a YouTube block), so callers include both when no file appeared."""
     # spotdl 4.x has no env-var support for credentials, so they go through argv. Output is captured and only
     # ever surfaced redacted.
     cid, secret = os.environ["SPOTIFY_CLIENT_ID"], os.environ["SPOTIFY_CLIENT_SECRET"]
@@ -209,10 +237,11 @@ def spotdl_run(args: list[str], cwd: Path) -> str:
     env = {k: v for k, v in os.environ.items() if k not in SPOTDL_HIDDEN_ENV}
     env["COLUMNS"] = SPOTDL_CONSOLE_COLUMNS
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env)
-    tail = tail_of(r.stdout + "\n" + r.stderr, [cid, secret])
+    lines = clean_lines(r.stdout + "\n" + r.stderr, [cid, secret])
+    tail = "\n".join(lines[-TAIL_LINES:])
     if r.returncode != 0:
         raise IngestError(f"spotdl {args[0]} failed with exit code {r.returncode}: {tail}")
-    return tail
+    return cause_lines(lines), tail
 
 
 def js_runtime_problem() -> str | None:
@@ -302,13 +331,15 @@ def real_deps(ytm) -> Deps:
         return find_match(ytm, song["name"], primary_artist(song), song.get("album_name"), int(song["duration"]))
 
     def download(song, m, tdir):
-        tail = spotdl_run(["download", f"https://music.youtube.com/watch?v={m.video_id}|{song['url']}",
+        causes, tail = spotdl_run(["download", f"https://music.youtube.com/watch?v={m.video_id}|{song['url']}",
                            "--output", str(tdir / "{track-id}.{output-ext}"), "--format", "mp3", "--bitrate", BITRATE,
                             *SPOTDL_DOWNLOAD_ARGS],
                           tdir.parent)
         files = list(tdir.glob("*.mp3"))
         if len(files) != 1:
+            # causes first and on the first line: the CI summary lists only the first line of each ERROR
             raise IngestError("expected exactly one mp3 after download"
+                              + (f"; yt-dlp error: {' | '.join(causes)}" if causes else "")
                               + (f"; spotdl output (last lines):\n{tail}" if tail else ""))
         return files[0]
 
