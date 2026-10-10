@@ -1,0 +1,16 @@
+# User timer: daily local ingest at 21:10 machine LOCAL time.
+# OnCalendar has no time zone suffix on purpose, so systemd uses the machine's
+# local time and DST changes follow automatically.
+[Unit]
+Description=Run the cowlic local ingest daily at 21:10 local time
+
+[Timer]
+OnCalendar=*-*-* 21:10:00
+# Catch up one run if the machine was off or asleep at 21:10 (may start later,
+# e.g. right after login or wake).
+Persistent=true
+RandomizedDelaySec=60
+Unit=cowlic-ingest.service
+
+[Install]
+WantedBy=timers.target
