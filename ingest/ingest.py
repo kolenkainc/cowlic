@@ -151,15 +151,21 @@ def tg_delete(message_id: int) -> None:
                                  headers={"content-type": "application/json"})
     tg_check._send(req)
 
+SPOTDL_HIDDEN_ENV = {"TG_BOT_TOKEN", "TG_CHANNEL_ID", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID",
+                     "D1_DATABASE_ID"}
+TAIL_LINES = 15  # lines of failing spotdl output kept in the error, so a YouTube block stays diagnosable
+
 
 def spotdl_run(args: list[str], cwd: Path) -> None:
     # spotdl 4.x has no env-var support for credentials, so they go through argv. Output is captured and
     # printed (redacted) only on failure.
     cid, secret = os.environ["SPOTIFY_CLIENT_ID"], os.environ["SPOTIFY_CLIENT_SECRET"]
     cmd = [sys.executable, "-m", "spotdl", args[0], *args[1:], "--client-id", cid, "--client-secret", secret]
-    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    # spotdl needs none of the Telegram / Cloudflare values, so keep them out of its environment.
+    env = {k: v for k, v in os.environ.items() if k not in SPOTDL_HIDDEN_ENV}
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env)
     if r.returncode != 0:
-        tail = "\n".join(redact(r.stdout + r.stderr, [cid, secret]).strip().splitlines()[-5:])
+        tail = "\n".join(redact(r.stdout + r.stderr, [cid, secret]).strip().splitlines()[-TAIL_LINES:])
         raise IngestError(f"spotdl {args[0]} failed with exit code {r.returncode}: {tail}")
 
 
@@ -263,7 +269,9 @@ def run(songs: list[dict], deps: Deps, existing: set, covers: dict, work: Path, 
             counts["failed"] += 1
             continue
         counts[status] += 1
-        if status in ("no_match", "too_big"):
+        if status == "exists":
+            print(f"skipped (already present): {label}")
+        elif status in ("no_match", "too_big"):
             print(f"WARN {status.replace('_', ' ')}: {label}")
         elif status in ("new", "dry_run"):
             print(f"{'ingested' if status == 'new' else 'dry-run would ingest'}: {label}")
@@ -278,7 +286,8 @@ def main() -> int:
     tg_check.load_env()
     missing = [k for k in REQUIRED_ENV if not os.environ.get(k)]
     if missing:
-        sys.exit(f"Missing env vars: {', '.join(missing)}")
+        print(f"ERROR missing env vars: {', '.join(missing)}")
+        return 1
 
     from ytmusicapi import YTMusic
     existing = {r["spotify_id"] for r in d1_query("SELECT spotify_id FROM tracks")}
@@ -286,7 +295,11 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         save = work / "list.spotdl"
-        spotdl_run(["save", args.playlist_url, "--save-file", str(save)], work)
+        try:
+            spotdl_run(["save", args.playlist_url, "--save-file", str(save)], work)
+        except IngestError as e:
+            print(f"ERROR spotdl save failed: {e}")
+            return 1
         counts = run(json.loads(save.read_text(encoding="utf-8")), real_deps(YTMusic()), existing, covers, work,
                      args.dry_run)
     print(f"done: {counts['new']} new, {counts['exists']} already present, {counts['no_match']} no match, "
