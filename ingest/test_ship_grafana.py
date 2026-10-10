@@ -299,6 +299,26 @@ class MetricsTests(Base):
         self.assertTrue(all(fields[k] == "0i" for k in fields if k.startswith("failure_")))
         self.assertEqual(out.strip(), "grafana: loki push ok (HTTP 204); metrics push ok (HTTP 204)")
 
+    def test_host_label_is_allowlisted_in_influx_body_and_loki_label(self):
+        hostile = ["a b,c=d", "h\nx=1i", "h\\", "", "a" * 64, "h=1", "h\r", "h\n", "h,job=x", "höst"]
+        for name in hostile:
+            f = self.fake()
+            with mock.patch.object(sg.socket, "gethostname", return_value=name):
+                self.run_ship(f)
+            _, tags, _ = parse_influx(self.metrics_requests(f)[0]["body"])
+            self.assertEqual(tags["host"], "unknown", repr(name))
+            loki = [r for r in f.requests if r["path"] == sg.PUSH_PATH][0]
+            hosts = {s["stream"]["host"] for s in json.loads(loki["body"])["streams"]}
+            self.assertEqual(hosts, {"unknown"}, repr(name))
+        for name in ("my-host.local", "a" * 63):
+            f = self.fake()
+            with mock.patch.object(sg.socket, "gethostname", return_value=name):
+                self.run_ship(f)
+            _, tags, _ = parse_influx(self.metrics_requests(f)[0]["body"])
+            self.assertEqual(tags["host"], name)
+            loki = [r for r in f.requests if r["path"] == sg.PUSH_PATH][0]
+            self.assertEqual({s["stream"]["host"] for s in json.loads(loki["body"])["streams"]}, {name})
+
     def test_failed_run_values(self):
         self.lr.write_text(json.dumps({**LAST_RUN, "exit_code": 3, "failure_class": "youtube-sign-in"}))
         f = self.fake()
