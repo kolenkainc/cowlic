@@ -161,6 +161,23 @@ elif mode == "debug_cause":
     print(f"[13:10:01] WARNING  MainThread - Some YouTube downloads require Deno. Run spotdl --download-deno{pad} deno.py:143")
     print(f"[13:10:01] DEBUG    MainThread - ERROR: [youtube] x: Video unavailable. This video is private{pad} base.py:408")
     print("AudioProviderError: YT-DLP download error - https://music.youtube.com/watch?v=x")
+elif mode.startswith("buried:"):
+    # the yt-dlp exception is logged early; a rich traceback box (with a chained cause) follows it
+    pad = " " * 300
+    msg = mode.split(":", 1)[1]
+    print(f"[13:10:01] DEBUG    MainThread - {msg}{pad} base.py:408")
+    box = ["╭─ Traceback (most recent call last) ─╮", "│ 721 │ │ │ │ ), │", "│ ❱ 409 │ raise AudioProviderError(x) │",
+           "╰─────────────────────────────────────╯"]
+    for _ in range(40):
+        for ln in box:
+            print(ln + pad)
+    print(f"AudioProviderError: {msg}")
+    print("The above exception was the direct cause of the following exception:")
+    for _ in range(10):
+        for ln in box:
+            print(ln + pad)
+    print("AudioProviderError: YT-DLP download error - https://music.youtube.com/watch?v=x")
+    print("[13:10:02] DEBUG    MainThread - Took 8 seconds" + pad + " entry_point.py:182")
 elif mode == "command":
     print("harmless\n::add-mask::topsecret\n  ::warning::x\n##[add-mask]y")
 sys.exit(0)
@@ -227,6 +244,25 @@ class SpotdlOutputTest(FakeSpotdlCase):
         self.assertNotIn(SECRET, out)
         self.assertNotIn("   ", out)  # padding collapsed
 
+    def test_exception_line_far_from_the_end_is_surfaced_on_the_error_line(self):
+        msg = "ERROR: [youtube] x: Sign in to confirm you're not a bot"
+        out = download_log(self.work, "buried:" + msg)
+        first = next(ln for ln in out.splitlines() if ln.startswith("ERROR "))
+        self.assertIn(f"yt-dlp error: [13:10:01] DEBUG MainThread - {msg} base.py:408", first)
+        self.assertIn(f"AudioProviderError: {msg}", first)
+        self.assertNotIn("│", out)  # traceback box lines are dropped from the tail
+        self.assertNotIn("╭", out)
+        self.assertEqual(out.count("YT-DLP download error"), 1)  # only in the tail, not as a "cause"
+
+    def test_exception_line_is_redacted(self):
+        out = download_log(self.work, f"buried:ERROR: [youtube] x: bad {SECRET[:9]} {SECRET[9:]}")
+        self.assertIn("***", out)
+        self.assertNotIn(SECRET[:9], out)
+
+    def test_cause_lines_ignore_unrelated_debug_records(self):
+        lines = ["[13:10:00] DEBUG MainThread - Searching for x base.py:178", "plain text"]
+        self.assertEqual(ingest.cause_lines(lines), [])
+
     def test_long_lines_are_capped(self):
         self.assertEqual(len(ingest.tail_of("x" * 5000, [])), ingest.LINE_MAX)
 
@@ -292,6 +328,25 @@ class SummaryStepTest(unittest.TestCase):
         finally:
             case.doCleanups()
         self.assertIn("YouTube appears to block", self.summary(log_text))
+
+    def buried_summary(self, msg: str) -> str:
+        case = SpotdlOutputTest("test_exit_zero_without_file_surfaces_block_message")
+        case.setUp()
+        try:
+            return self.summary(download_log(case.work, "buried:" + msg))
+        finally:
+            case.doCleanups()
+
+    def test_buried_exception_is_classified_by_the_summary(self):
+        block = self.buried_summary("ERROR: [youtube] x: Sign in to confirm you're not a bot")
+        self.assertIn("YouTube appears to block", block)
+        self.assertNotIn("another reason", block)
+        runtime = self.buried_summary("ERROR: [youtube] x: n challenge solving failed: Some formats may be missing")
+        self.assertIn("No usable JavaScript runtime", runtime)
+        self.assertNotIn("YouTube appears to block", runtime)
+        other = self.buried_summary("ERROR: [youtube] x: Video unavailable. This video is private")
+        self.assertIn("another reason", other)
+        self.assertIn("Video unavailable. This video is private", other)  # visible on the ERROR line in the summary
 
     def test_telegram_429_is_not_a_youtube_block(self):
         text = self.summary("ERROR A - T: IngestError: 429: Too Many Requests: retry after 5\n")
