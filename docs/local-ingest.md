@@ -502,7 +502,7 @@ decision and the top failing patterns in #112. Do not commit the CSV.
 |---|---|---|---|
 | 0 | ingest | Everything done; new tracks added, others already present | `none` |
 | 1 | ingest | Some track or playlist failed, or sources/`.env` invalid | `partial` or `config` |
-| 2 | ingest | Bad command-line usage (only when calling ingest directly), or `followed_artists` is enabled but the Spotify user login is missing or rejected (nothing ran; the result file, if requested, says `config`) | none written, or `config` |
+| 2 | ingest | Bad command-line usage (only when calling ingest directly), or `followed_artists` is enabled but the Spotify user login is missing or rejected, or `lastfm_artists` is enabled but `LASTFM_API_KEY` is missing or Last.fm refuses the ranking (nothing ran; the result file, if requested, says `config`) | none written, or `config` |
 | 3 | ingest | YouTube asked to sign in; rest of the run skipped | `youtube-sign-in` |
 | 75 | wrapper | Another run holds the lock; nothing ran | not written |
 | 78 | wrapper | A required prerequisite or the venv is missing, or (before the lock) `flock` is missing, the state dir is unusable, neither `HOME` nor `XDG_STATE_HOME` is set, or `cd` to the repo fails; nothing ran. `last-run.json` is written (class `config`) only for failures after the lock is taken (venv, prerequisite check); for the pre-lock failures none is written (flock missing: one ERROR line in the log if the state dir exists, otherwise stderr only) | `config` or not written |
@@ -648,6 +648,51 @@ Rules (a violation ends the run with exit 78 before ingest starts, with one log 
 - `max_artists` is a `sources.yml` key (see above), not an ingest option, so it is not accepted here.
 
 With a cap of 200 a night, about 2,500 tracks take about 13 nights and 40,000 about 200.
+
+## Last.fm artists (your most listened artists, no playlist)
+
+Added in #152 (short version; the full runbook is #153). `sources.yml` can have a `lastfm_artists:` section. A run
+then also takes your top artists by listening over the last years from Last.fm and ingests their tracks through the
+same pipeline as a playlist (cap, state file, pacing and the YouTube sign-in stop apply unchanged). It is opt-in:
+a file without the section, or with `enabled: false`, behaves exactly as before. It may be combined with playlists
+and with `followed_artists`; the playlists run first, then the followed artists, then the Last.fm artists.
+
+```yaml
+# lastfm_artists:
+#   enabled: true         # default true
+#   user: <last.fm user>  # required when enabled: 2-15 letters, digits, _ or -, not a URL
+#   years: 5              # listening window, 1..10; default 5 (about 53 weekly-chart requests per year)
+#   max_artists: 100      # size of the ranking, 1..10000 (Last.fm client limit: 1000); default 100
+#   rescan_days: 7        # a fully scanned artist is looked at again after this many days, 0..3650; default 7
+#   exclude:              # artist names, compared case-insensitively without punctuation; one per line, as is
+#     - Various Artists
+```
+
+Same strictness as `followed_artists`: two-space keys, four-space list items, unknown or repeated keys, inline
+comments and quotes are errors. The API key is NOT a `sources.yml` key: set `LASTFM_API_KEY` in `.env` (never
+logged, and hidden from the spotdl child process). A missing or malformed key ends the run with exit 2 before any work
+(`config`). The ranking is read AFTER the playlists and followed artists, so a Last.fm problem never stops them; it is
+not cached (Last.fm caching follows response headers, which the client does not read) and `--max-minutes` bounds it
+too. If Last.fm refuses it for a reason only you can fix (unknown user, invalid or suspended key, private or empty
+profile: error codes 6, 10, 17, 26) the playlists are still ingested and reported, then the run exits 2 (`config`);
+an outage, 5xx or rate limit, or a D1 error while reading the stored rows, is a failed Last.fm phase (exit 1, result
+status `failed`). A per-artist failure is counted (exit 1) and the others go on. The result
+JSON gets an additive `lastfm_artists` object (counts only, including `dropped_stored`); title-only matches are
+counted in `matched_title_only` and logged as `(matched by title only)`.
+
+The 21:10 nightly timer must not use the `lastfm_artists` section (the first run is slow and unbounded by default);
+a separate bootstrap process comes in Release 3 (#163, #168).
+
+Known limitations:
+
+- Compilation tracks do not match the stored rows (Last.fm side compares on `artists[0]`, the stored row on the album
+  artist), so such a track can be stored twice: once from a playlist, once from Last.fm.
+- Last.fm gives few track durations, so most tracks are matched by title and artist only (no duration check): these
+  matches are weaker than the playlist matches and are counted separately.
+- The first run can be slow: the ranking alone is about 261 weekly-chart calls at 1 call per second for 5 years,
+  then one or more calls per album of every artist, again at 1 call per second, before any download. Bound the
+  nights with `COWLIC_INGEST_ARGS` (`--max-new`, `--max-minutes`, `--pace-seconds`, see above) and a small
+  `max_artists`; progress is kept in the state file (`artists` map, keys `lfm:<16 hex>`) and the next run continues.
 
 ## Troubleshooting
 
