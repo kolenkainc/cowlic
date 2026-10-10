@@ -16,6 +16,7 @@ for tool in gh npx; do
 #!/usr/bin/env bash
 set +x
 printf '%s\n' "$tool \$*" >> "$TMP/calls.log"
+if [ "$tool" = gh ] && [ "\${1:-}" = api ] && [ -n "\${FAIL_API:-}" ]; then echo "shim: environment missing" >&2; exit 1; fi
 printf '%s\n' "$tool \$PWD" >> "$TMP/pwd.log"
 printf '%s: %s\n' "$tool \$*" "\$(cat)" >> "$TMP/stdin.log"
 if [ -n "\${FAIL_AT:-}" ] && [ "\$(wc -l < "$TMP/calls.log")" -eq "\$FAIL_AT" ]; then echo "shim: simulated failure" >&2; exit 1; fi
@@ -56,17 +57,21 @@ no_leak() { # no_leak <label> files...
 # 1. dry run: all present, nothing executed, no values shown
 run "$TMP/t1" --dry-run || fail "dry-run exit"
 [ ! -e "$TMP/calls.log" ] || fail "dry-run called tools"
-grep -q 'INGEST_CLOUDFLARE_API_TOKEN.*gh-secret.*CLOUDFLARE_API_TOKEN.*present' "$TMP/t1.out" || fail "dry-run output"
+grep -q 'INGEST_CLOUDFLARE_API_TOKEN.*gh-env-secret@ingest.*CLOUDFLARE_API_TOKEN.*present' "$TMP/t1.out" || fail "dry-run output"
 no_leak dry-run "$TMP/t1.out" "$TMP/t1.err"
 
 # 2. real sync (shims): correct calls, values only on stdin, no leak even under xtrace
 (cd "$TMP" && env PATH="$TMP/bin:$PATH" ENV_FILE="$TMP/env" SHELLOPTS=xtrace "$SCRIPT") > "$TMP/t2.out" 2> "$TMP/t2.err" || fail "sync exit"
 no_leak sync "$TMP/t2.out" "$TMP/t2.err" "$TMP/calls.log"
-[ "$(wc -l < "$TMP/calls.log")" -eq 10 ] || fail "expected 10 tool calls"
-grep -qx 'gh secret set CLOUDFLARE_API_TOKEN: CANARY_INGEST_3333' "$TMP/stdin.log" || fail "renamed secret"
-grep -qx 'gh variable set D1_DATABASE_ID: CANARY_D1_6666' "$TMP/stdin.log" || fail "variable"
+[ "$(wc -l < "$TMP/calls.log")" -eq 11 ] || fail "expected 11 tool calls (1 preflight + 10 writes)"
+[ "$(head -n1 "$TMP/calls.log")" = 'gh api repos/{owner}/{repo}/environments/ingest' ] || fail "environment preflight must be the first call"
+[ "$(grep -c '^gh api' "$TMP/calls.log")" -eq 1 ] || fail "environment checked more than once"
+grep -q 'gh secret set' "$TMP/calls.log" && ! grep '^gh secret set' "$TMP/calls.log" | grep -qv -- '--env ingest$' || fail "every gh secret set must use --env ingest"
+grep -q '^gh variable' "$TMP/calls.log" && fail "no repo-level variables expected"
+grep -qx 'gh secret set CLOUDFLARE_API_TOKEN --env ingest: CANARY_INGEST_3333' "$TMP/stdin.log" || fail "renamed secret"
+grep -qx 'gh secret set D1_DATABASE_ID --env ingest: CANARY_D1_6666' "$TMP/stdin.log" || fail "id value must be an environment secret"
 grep -qx 'npx --no-install wrangler secret put SUBSONIC_USER -c wrangler.local.toml: CANARY_USER_7b21' "$TMP/stdin.log" || fail "worker secret, quote stripping"
-grep -qx 'gh secret set TG_BOT_TOKEN: CANARY_TG_9f3a' "$TMP/stdin.log" || fail "export prefix"
+grep -qx 'gh secret set TG_BOT_TOKEN --env ingest: CANARY_TG_9f3a' "$TMP/stdin.log" || fail "export prefix"
 grep -q CANARY_BROAD "$TMP/stdin.log" && fail "unmanifested key synced"
 grep -qx "gh $ROOT" "$TMP/pwd.log" || fail "gh not run from repo root"
 [ "$(grep -c '^npx ' "$TMP/pwd.log")" -eq 3 ] || fail "expected 3 npx calls"
@@ -78,8 +83,21 @@ no_leak "script resists xtrace via its own set +x" "$TMP/t2x.err"
 # 3. --only syncs exactly one entry
 rm -f "$TMP/calls.log" "$TMP/stdin.log"
 run "$TMP/t3" --only SPOTIFY_CLIENT_ID || fail "--only exit"
-[ "$(wc -l < "$TMP/calls.log")" -eq 1 ] || fail "--only call count"
+[ "$(wc -l < "$TMP/calls.log")" -eq 2 ] || fail "--only call count (preflight + 1 write)"
 no_leak only "$TMP/t3.out" "$TMP/t3.err"
+
+# 3b. missing environment: fails before any write, clear message
+rm -f "$TMP/calls.log" "$TMP/stdin.log"
+rc=0; FAIL_API=1 run "$TMP/t3b" || rc=$?
+[ "$rc" -ne 0 ] || fail "missing environment should fail"
+grep -q "environment 'ingest' not found" "$TMP/t3b.err" || fail "missing environment message"
+[ "$(wc -l < "$TMP/calls.log")" -eq 1 ] || fail "write attempted after failed preflight"
+[ ! -e "$TMP/stdin.log" ] || [ "$(grep -c 'secret set' "$TMP/stdin.log")" -eq 0 ] || fail "secret written before preflight"
+no_leak missing-env "$TMP/t3b.out" "$TMP/t3b.err"
+# worker-only selection does not need the environment
+rm -f "$TMP/calls.log" "$TMP/stdin.log"
+FAIL_API=1 run "$TMP/t3c" --only SUBSONIC_USER || fail "worker-only sync must not check the environment"
+! grep -q '^gh api' "$TMP/calls.log" || fail "preflight ran for worker-only entry"
 
 # 4. unknown --only key fails
 run "$TMP/t4" --only NOPE && fail "unknown --only should fail"
@@ -102,14 +120,22 @@ grep -q "unknown target" "$TMP/t6.err" || fail "unknown target message"
 [ ! -e "$TMP/calls.log" ] || fail "call made with bad manifest"
 no_leak badmanifest "$TMP/t6.out" "$TMP/t6.err"
 
-# 6b. partial failure: 3rd of 10 calls fails
+# 6a. gh-env-secret without an environment, and @env on other targets, are rejected
+for badm in 'TG_BOT_TOKEN gh-env-secret' 'TG_BOT_TOKEN gh-secret@ingest' 'TG_BOT_TOKEN gh-env-secret@bad-name'; do
+  printf '%s\n' "$badm" > "$TMP/bad.manifest"; rm -f "$TMP/calls.log"
+  PATH="$TMP/bin:$PATH" ENV_FILE="$TMP/env" MANIFEST="$TMP/bad.manifest" "$SCRIPT" > "$TMP/t6a.out" 2> "$TMP/t6a.err" && fail "bad manifest accepted: $badm"
+  grep -q 'manifest line 1' "$TMP/t6a.err" || fail "manifest line not reported: $badm"
+  [ ! -e "$TMP/calls.log" ] || fail "call made with bad manifest: $badm"
+done
+
+# 6b. partial failure: 4th of 11 calls fails (1 preflight, TG env, TG worker, SUBSONIC_USER)
 rm -f "$TMP/calls.log" "$TMP/stdin.log" "$TMP/pwd.log"
-rc=0; FAIL_AT=3 run "$TMP/t7" || rc=$?
+rc=0; FAIL_AT=4 run "$TMP/t7" || rc=$?
 [ "$rc" -eq 1 ] || fail "partial failure exit code is $rc, expected 1"
-[ "$(wc -l < "$TMP/calls.log")" -eq 3 ] || fail "script continued after a failed call"
+[ "$(wc -l < "$TMP/calls.log")" -eq 4 ] || fail "script continued after a failed call"
 grep -q 'failed at SUBSONIC_USER' "$TMP/t7.err" || fail "failing entry not named"
 grep -q '2 of 10 entries synced' "$TMP/t7.err" || fail "synced count missing"
-grep -q 'TG_BOT_TOKEN->gh-secret' "$TMP/t7.err" || fail "already-synced list missing"
+grep -q 'TG_BOT_TOKEN->gh-env-secret' "$TMP/t7.err" || fail "already-synced list missing"
 grep -q 'Rerun is safe' "$TMP/t7.err" || fail "rerun hint missing"
 no_leak partial-failure "$TMP/t7.out" "$TMP/t7.err" "$TMP/calls.log"
 
@@ -136,8 +162,9 @@ PATH="$TMP/emptybin" ENV_FILE="$TMP/env" "$TMP/emptybin/bash" "$SCRIPT" > "$TMP/
 grep -q 'gh not found' "$TMP/t10.err" || fail "gh preflight message"
 
 # 7. real manifest has the required entries
-for e in 'TG_BOT_TOKEN gh-secret' 'TG_BOT_TOKEN worker-secret' 'INGEST_CLOUDFLARE_API_TOKEN gh-secret:CLOUDFLARE_API_TOKEN' 'D1_DATABASE_ID gh-variable'; do
+for e in 'TG_BOT_TOKEN gh-env-secret@ingest' 'TG_BOT_TOKEN worker-secret' 'SUBSONIC_USER worker-secret' 'SUBSONIC_PASSWORD worker-secret' 'SPOTIFY_CLIENT_ID gh-env-secret@ingest' 'SPOTIFY_CLIENT_SECRET gh-env-secret@ingest' 'INGEST_CLOUDFLARE_API_TOKEN gh-env-secret@ingest:CLOUDFLARE_API_TOKEN' 'TG_CHANNEL_ID gh-env-secret@ingest' 'CLOUDFLARE_ACCOUNT_ID gh-env-secret@ingest' 'D1_DATABASE_ID gh-env-secret@ingest'; do
   grep -qx "$e" "$ROOT/scripts/secrets.manifest" || fail "manifest lacks: $e"
 done
+if grep -qE '^[A-Z0-9_]+ gh-(secret|variable)' "$ROOT/scripts/secrets.manifest"; then fail "repo-level gh-secret/gh-variable entries must not be in the manifest"; fi
 
 echo "all sync-secrets tests passed"

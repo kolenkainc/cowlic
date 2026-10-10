@@ -103,19 +103,25 @@ Single-source rule: every secret and config value is edited only in the local gi
 
 | `.env` key | Where it lives | Purpose |
 |---|---|---|
-| `TG_BOT_TOKEN` | GH secret, Worker secret | Bot API |
-| `TG_CHANNEL_ID` | GH variable | Storage channel |
-| `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET` | GH secrets | Metadata for spotdl |
-| `INGEST_CLOUDFLARE_API_TOKEN` | GH secret `CLOUDFLARE_API_TOKEN` | Narrow token (D1:Edit only) for ingest writing to D1 over the REST API |
-| `CLOUDFLARE_ACCOUNT_ID`, `D1_DATABASE_ID` | GH variables | D1 REST API addressing |
+| `TG_BOT_TOKEN` | GH environment `ingest` secret, Worker secret | Bot API |
+| `TG_CHANNEL_ID` | GH environment `ingest` secret | Storage channel |
+| `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET` | GH environment `ingest` secrets | Metadata for spotdl |
+| `INGEST_CLOUDFLARE_API_TOKEN` | GH environment `ingest` secret `CLOUDFLARE_API_TOKEN` | Narrow token (D1:Edit only) for ingest writing to D1 over the REST API |
+| `CLOUDFLARE_ACCOUNT_ID`, `D1_DATABASE_ID` | GH environment `ingest` secrets | D1 REST API addressing |
 | `SUBSONIC_USER`, `SUBSONIC_PASSWORD` | Worker secrets | Client login |
 | `CLOUDFLARE_API_TOKEN` (optional) | `.env` only, never synced | Broad personal token for local wrangler/ad-hoc work |
 
-Usage: `scripts/sync-secrets.sh --dry-run` (lists key, target, present/missing; never shows values), `scripts/sync-secrets.sh` (all), `scripts/sync-secrets.sh --only KEY`. Values travel only through stdin of `gh secret set`, `gh variable set` and `wrangler secret put`. Missing keys, unsupported `.env` syntax, unknown manifest targets, missing `gh`/`npx` or a missing `worker/wrangler.local.toml` abort before anything is synced. If a call fails midway, the script reports which entries were already synced; rerunning is safe (idempotent upserts), `--only KEY` retries one entry. Prerequisites: `gh` authenticated, and `npm ci` done in `worker/` (the script uses `npx --no-install`).
+GitHub environment `ingest`: all ingest values, including the ids (`TG_CHANNEL_ID`, `CLOUDFLARE_ACCOUNT_ID`, `D1_DATABASE_ID`), are secrets of the environment `ingest`, not repo-level secrets or variables. Reasons: repo Variables are printed unmasked in the public run logs, and repo-level secrets can be read by any write-access user who dispatches a modified workflow from any branch. The environment is created by the owner and its deployment branches are restricted to `master` (Settings -> Environments -> ingest -> Deployment branches and tags -> Selected branches -> `master`), so only workflow runs from master get the values. The ingest workflow declares `environment: ingest` and reads `secrets.*` only. In `scripts/secrets.manifest` this is the target `gh-env-secret@ingest[:REMOTE_NAME]`; the script runs `gh secret set NAME --env ingest`.
+
+Preflight: before the first write the script runs `gh api repos/{owner}/{repo}/environments/ingest` (owner/repo resolved by `gh` from the clone) and aborts with a clear message if the environment does not exist or is not accessible. Worker-only selections (`--only SUBSONIC_USER`) skip this check.
+
+Removing old repo-level entries: after the first sync into the environment, delete the leftovers once (they are no longer in the manifest and nothing refreshes them): `gh secret delete NAME` for `TG_BOT_TOKEN`, `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `CLOUDFLARE_API_TOKEN`, and `gh variable delete NAME` for `TG_CHANNEL_ID`, `CLOUDFLARE_ACCOUNT_ID`, `D1_DATABASE_ID` (ignore "not found"). Check with `gh secret list` and `gh variable list` that no ingest value remains at repo level.
+
+Usage: `scripts/sync-secrets.sh --dry-run` (lists key, target, present/missing; never shows values), `scripts/sync-secrets.sh` (all), `scripts/sync-secrets.sh --only KEY`. Values travel only through stdin of `gh secret set` (with `--env ingest`) and `wrangler secret put`. Missing keys, unsupported `.env` syntax, unknown manifest targets, missing `gh`/`npx` or a missing `worker/wrangler.local.toml` abort before anything is synced. If a call fails midway, the script reports which entries were already synced; rerunning is safe (idempotent upserts), `--only KEY` retries one entry. Prerequisites: `gh` authenticated, and `npm ci` done in `worker/` (the script uses `npx --no-install`).
 
 Supported `.env` subset: `KEY=value`, optional `export `, optional matching quotes around the whole value. The value is taken verbatim (no escape processing, no expansion, no multiline), trailing whitespace is trimmed, the last duplicate key wins. A value starting with a space or an unquoted inline comment (` #`) is rejected with the line number (never the value). Test: `scripts/test-sync-secrets.sh` (fixture `.env` plus gh/npx shims, no network).
 
-Rotation: edit the one line in `.env`, run `scripts/sync-secrets.sh --only KEY`, then check `gh secret list`, `gh variable list`, `npx wrangler secret list -c wrangler.local.toml` (from `worker/`). Rotate the secret at its provider first (BotFather, Spotify dashboard, Cloudflare).
+Rotation: edit the one line in `.env`, run `scripts/sync-secrets.sh --only KEY`, then check `gh secret list --env ingest`, `npx wrangler secret list -c wrangler.local.toml` (from `worker/`). Rotate the secret at its provider first (BotFather, Spotify dashboard, Cloudflare).
 
 Narrow Cloudflare token (`INGEST_CLOUDFLARE_API_TOKEN`): Cloudflare dashboard -> My Profile -> API Tokens -> Create Token -> Create Custom Token. Permission: Account -> D1 -> Edit. Account resources: Include -> the single account that owns the database. No zone permissions, no other account permissions. Put it in `.env` as `INGEST_CLOUDFLARE_API_TOKEN`; it must not be the broad personal token.
 

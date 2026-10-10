@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Distribute secrets from the local .env to GitHub (secrets/variables) and Worker secrets.
+# Ingest values go to the GitHub environment "ingest" (gh secret set --env), see scripts/secrets.manifest.
 # Usage: scripts/sync-secrets.sh [--dry-run] [--only KEY]
 # Values are never printed: they travel only through stdin of gh / wrangler.
 # Env overrides (used by tests): ENV_FILE, MANIFEST.
@@ -66,7 +67,7 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < "$ENV_FILE"
 
 # Parse and validate the whole manifest before touching anything.
-keys=(); targets=(); remotes=()
+keys=(); targets=(); remotes=(); ghenvs=()
 lineno=0
 while IFS= read -r line || [ -n "$line" ]; do
   lineno=$((lineno + 1))
@@ -74,17 +75,22 @@ while IFS= read -r line || [ -n "$line" ]; do
   [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
   read -r key spec extra <<< "$line"
   [ -z "${extra:-}" ] || die "manifest line $lineno: too many fields"
-  [ -n "${spec:-}" ] || die "manifest line $lineno: expected '<ENV_KEY> <target>[:<REMOTE_NAME>]'"
+  [ -n "${spec:-}" ] || die "manifest line $lineno: expected '<ENV_KEY> <target>[@<GH_ENVIRONMENT>][:<REMOTE_NAME>]'"
   [[ "$key" =~ $NAME_RE ]] || die "manifest line $lineno: invalid key name"
   target="${spec%%:*}"
+  ghenv=""
+  if [[ "$target" == *@* ]]; then ghenv="${target#*@}"; target="${target%%@*}"; fi
   remote="$key"
   if [[ "$spec" == *:* ]]; then remote="${spec#*:}"; fi
   [[ "$remote" =~ $NAME_RE ]] || die "manifest line $lineno: invalid remote name"
   case "$target" in
-    gh-secret|gh-variable|worker-secret) ;;
+    gh-env-secret)
+      [[ "$ghenv" =~ $NAME_RE ]] || die "manifest line $lineno: gh-env-secret needs an environment name, e.g. gh-env-secret@ingest" ;;
+    gh-secret|gh-variable|worker-secret)
+      [ -z "$ghenv" ] || die "manifest line $lineno: '@environment' is only valid for gh-env-secret" ;;
     *) die "manifest line $lineno: unknown target '$target'" ;;
   esac
-  keys+=("$key"); targets+=("$target"); remotes+=("$remote")
+  keys+=("$key"); targets+=("$target"); remotes+=("$remote"); ghenvs+=("$ghenv")
 done < "$MANIFEST"
 
 selected=()
@@ -106,7 +112,7 @@ done
 missing=0
 for i in "${selected[@]}"; do
   if [ -n "${ENVV[${keys[$i]}]:-}" ]; then state=present; else state=missing; missing=$((missing + 1)); fi
-  if [ "$dry_run" -eq 1 ]; then printf '%-30s %-14s -> %-30s %s\n' "${keys[$i]}" "${targets[$i]}" "${remotes[$i]}" "$state"; fi
+  if [ "$dry_run" -eq 1 ]; then printf '%-30s %-26s -> %-30s %s\n' "${keys[$i]}" "${targets[$i]}${ghenvs[$i]:+@${ghenvs[$i]}}" "${remotes[$i]}" "$state"; fi
   if [ "$dry_run" -eq 0 ] && [ "$state" = missing ]; then printf 'error: %s is missing or empty in %s\n' "${keys[$i]}" "$ENV_FILE" >&2; fi
 done
 [ "$missing" -eq 0 ] || die "$missing key(s) missing or empty in the env file; nothing was synced"
@@ -122,14 +128,26 @@ if [ "$need_worker" -eq 1 ]; then
   command -v npx > /dev/null || die "npx not found on PATH; nothing was synced"
   [ -r "$ROOT/worker/wrangler.local.toml" ] || die "worker/wrangler.local.toml is missing (gitignored, holds the real D1 id); nothing was synced"
 fi
+# Every GitHub environment the selected entries write to must exist (owner creates it). Checked
+# last among the preflights but before the first write, so a missing environment never leaves a
+# half-synced state. {owner}/{repo} are resolved by gh from the clone (we cd to the repo root).
+declare -A seen_env=()
+for i in "${selected[@]}"; do
+  e="${ghenvs[$i]}"
+  [ -n "$e" ] && [ -z "${seen_env[$e]:-}" ] || continue
+  seen_env["$e"]=1
+  gh api "repos/{owner}/{repo}/environments/$e" > /dev/null 2>&1 < /dev/null \
+    || die "GitHub environment '$e' not found or not accessible (gh api repos/{owner}/{repo}/environments/$e failed). Create it in the repo settings (restricted to master) or check gh auth; nothing was synced"
+done
 
 synced=()
 total="${#selected[@]}"
 for i in "${selected[@]}"; do
-  key="${keys[$i]}"; remote="${remotes[$i]}"; target="${targets[$i]}"
-  printf 'sync %s -> %s %s\n' "$key" "$target" "$remote"
+  key="${keys[$i]}"; remote="${remotes[$i]}"; target="${targets[$i]}"; ghenv="${ghenvs[$i]}"
+  printf 'sync %s -> %s %s\n' "$key" "$target${ghenv:+@$ghenv}" "$remote"
   rc=0
   case "$target" in
+    gh-env-secret) printf '%s' "${ENVV[$key]}" | gh secret set "$remote" --env "$ghenv" || rc=$? ;;
     gh-secret)     printf '%s' "${ENVV[$key]}" | gh secret set "$remote" || rc=$? ;;
     gh-variable)   printf '%s' "${ENVV[$key]}" | gh variable set "$remote" || rc=$? ;;
     worker-secret) printf '%s' "${ENVV[$key]}" | (cd "$ROOT/worker" && npx --no-install wrangler secret put "$remote" -c wrangler.local.toml) || rc=$? ;;
