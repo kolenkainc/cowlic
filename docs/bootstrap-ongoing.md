@@ -22,9 +22,9 @@ Every factual claim carries a tag:
 State of the code at the time of writing: master has the Last.fm client and ranking (#148, `ingest/lastfm.py`),
 the track enumeration (#149, `ingest/lastfm_tracks.py`), the `lfm:` id and cross-source dedupe (#150), and the
 title-and-artist-only matcher mode (#151, `ingest/match.py`) [V]. The `lastfm_artists:` source and `run_lastfm`
-(#152) are only in the open PR #162, not on master [V, `gh pr diff 162`]. Everything bootstrap- or
-new-release-specific (#166-#174) does not exist yet. Where this page names a function of PR #162 it says so; check
-it again after the merge.
+(#152, PR #162, merged) are on master too [V, `ingest/ingest.py` on master: `run_lastfm`, `prepare_lastfm`,
+`run_lastfm_phase`, `lastfm_artist_key`]. Everything bootstrap- or new-release-specific (#166-#174) does not exist
+yet. Function names below are those of master when this page was last updated; #166 may rename them.
 
 ## 1. Definitions and the rule that keeps the timer lean
 
@@ -33,7 +33,7 @@ it again after the merge.
 | Ranking | The owner's top artists over a window (default 5 years), summed from weekly Last.fm charts: 1 call `user.getWeeklyChartList` plus one `user.getWeeklyArtistChart` per week, about 261 calls at 1 call/s, about 5 minutes [V, `ingest/lastfm.py` docstring and `MIN_INTERVAL = 1.0`] |
 | Bootstrap | A ONE-TIME, manual, resumable job that works through the stored ranking artist by artist and fills the library. Started by the owner, capped per session, ends with `done: N artists, M tracks` |
 | Ongoing | The daily 21:10 run: the playlists exactly as today, then a bounded check for missing releases of artists already in the library |
-| Engine | The shared code path ranking -> tracks -> dedupe -> match -> download -> upload -> D1 (`run_lastfm` of #152 / PR #162 and the per-track pipeline `run` / `process_track` in `ingest/ingest.py` [V]) |
+| Engine | The shared code path ranking -> tracks -> dedupe -> match -> download -> upload -> D1 (`run_lastfm` of #152 and the per-track pipeline `run` / `process_track` in `ingest/ingest.py` [V]) |
 | Session | One invocation of `bootstrap.py run` |
 
 ### The rule
@@ -61,8 +61,8 @@ Bootstrap and ongoing never run at the same time: they share one lock (section 5
 
 ## 2. Bootstrap contract
 
-Proposal of the planner as in #163, adopted here unchanged ([P] unless a line says otherwise); any change a
-ticket makes must be written back to this page.
+Proposal of the planner as in #163, with the changes this page makes marked ([P] unless a line says otherwise);
+any change a ticket makes must be written back to this page.
 
 ### 2.1 Files and entry points
 
@@ -77,9 +77,18 @@ The engine changes needed first are #166 (see 2.6). The wrapper adds the log and
 NOT only the wrapper's job: `bootstrap.py run` (and `rank --refresh`, which writes the ranking) takes the same
 `flock` on `ingest.lock` itself, so that starting the Python entry point directly cannot overlap the timer or
 another session. Otherwise two processes each load the D1 `existing` set once and can upload the same track
-twice. [P, requirement for #168; the wrapper then only has to pass the lock state through, and must not
-deadlock on a lock it already holds: the wrapper keeps its descriptor 9 out of the child (`9>&-`, [V]) and the
-child takes its own lock, or the wrapper sets a marker the child checks. #168 and #169 pick one and test it]
+twice. [P, requirement for #168 and #169]
+
+Chosen mechanism, one only [P]: the wrapper takes the lock exactly as the nightly wrapper does (`exec 9>"$LOCK"`,
+`flock -n 9`, exit 75 before anything else [V, `scripts/run-ingest-local.sh` on master]), starts the child with
+`9>&-` (the descriptor is not inherited [V]) and sets the environment variable `COWLIC_LOCK_HELD=1` for the child.
+`bootstrap.py` takes the flock itself, with `flock.LOCK_EX | LOCK_NB` on `ingest.lock`, only when that variable is
+absent (a direct call), exit 75 if it is held. The variable is a convenience against accidental direct calls,
+not a security boundary. Why not "the wrapper locks and the child locks again": `flock` locks belong to the open
+file description, so a second `open()` of the same file conflicts with the first even in a child process; a child
+that opens the lock file while the wrapper holds it would always get 75 (standard `flock(2)` semantics, not run
+here). #168 and #169 test both paths: via the wrapper (no double lock) and direct (takes the lock, exit 75 when
+held).
 
 ### 2.2 Subcommands
 
@@ -99,7 +108,7 @@ All options below are `--long` options of `bootstrap.py`; the wrapper passes the
   tracks attempted (new, too big, failed, and dry-run matches); tracks already stored, in cooldown or without a
   match are not counted. `--max-minutes` is wall clock: no new track is started after it, a download in progress
   finishes. Last.fm enumeration time counts as wall clock; the limits are checked before each artist is enumerated
-  [V, `run_lastfm` in PR #162].
+  [V, `run_lastfm` on master].
 - Ranges: the wrapper validates like `parse_ingest_args` of the nightly wrapper [V]: integers, `--max-new`
   1..1000000, `--max-minutes` 1..1440. `bootstrap.py` applies the same ranges. `--pace-seconds` and the jitter
   keep the engine defaults (5 s plus 0..5 s) [V, local-ingest.md "Pacing and backoff"]; they are not new
@@ -116,16 +125,16 @@ All options below are `--long` options of `bootstrap.py`; the wrapper passes the
   `${XDG_CONFIG_HOME:-$HOME/.config}/cowlic/bootstrap.yml`; owner question #165-6). Reason: the Last.fm user name
   must not be committed to this public repo. [P]
 - Format: the `lastfm_artists:` section parser of #152 (strict two-space keys, no inline comments, unknown or
-  repeated keys fail) reused as is [V, parser described in PR #162; check the final code after merge]. Keys used
+  repeated keys fail) reused as is [V, `ingest/ingest.py` on master]. Keys used
   by bootstrap: `user` (2-15 of `[A-Za-z0-9_-]`), `years` (1..10, default 5), `max_artists` (1..10000 in the
   parser; the client refuses above 1000, default 100), `exclude` (artist names, compared with `match.normalize`).
-  `rescan_days` is accepted by the shared parser, but bootstrap does NOT ignore it in the engine: PR #162's
-  `run_lastfm` applies `state.artist_due(key, cfg.rescan_days)` to every artist handed in [V, PR #162 diff],
+  `rescan_days` is accepted by the shared parser, but bootstrap does NOT ignore it in the engine: `run_lastfm`
+  applies `state.artist_due(key, cfg.rescan_days)` to every artist handed in [V, master],
   so bootstrap must pass `rescan_days=0` (on master `artist_due` is then always true: `days >= 0` [V,
   `RunState.artist_due`]). The value in the file has no meaning for bootstrap; `enabled` has none either. [P]
-  The parser facts are [V] from PR #162.
-- `rank` sizes its Last.fm client for the ranking like PR #162 does (`1 + years * 53 + 4` plus the per-artist
-  budget when needed [V, `open_lastfm` in PR #162]); the default `MAX_CALLS = 400` [V] is below that for `years`
+  The parser facts are [V] on master.
+- `rank` sizes its Last.fm client for the ranking like `prepare_lastfm` does (`1 + years * 53 + 4` plus the
+  per-artist budget [V, `prepare_lastfm` on master]); the default `MAX_CALLS = 400` [V] is below that for `years`
   above about 7. Either size it or cap `years`. [P]
 - Which subcommand needs what: `rank` needs `user`, `years`, `max_artists`. `run` and `plan` need only `exclude`
   from the file (the artists come from the stored ranking, enumeration is by artist name); `status` needs no
@@ -167,8 +176,8 @@ through), `bootstrap-state.json` (the engine's own state: cooldowns, side-effect
 - Written once by `rank`. `rank --refresh` replaces it; the old file stays when the new compute fails. [V, #167]
 - The file is personal listening data (artist names and counts) in the owner's own state directory. Storing the
   DERIVED ordered list is the reading of the Last.fm terms this page relies on; the wording of the terms
-  (cl. 4.3, caching follows the response headers) is [R, not confirmed, see #147, #165-3]. PR #162 does not
-  cache at all because of this reading [V, PR #162]. If the owner does not accept (#165-3), `run` has to recompute
+  (cl. 4.3, caching follows the response headers) is [R, not confirmed, see #147, #165-3]. `run_lastfm_phase`
+  does not cache at all because of this reading [V, master: it reads the ranking at every run]. If the owner does not accept (#165-3), `run` has to recompute
   the ranking at the start of every session (about 5 minutes, 261 calls); that changes #167 and #168. It also
   removes the artist set of the nightly phase (section 4.2 default): questions 3 and 4 of #165 are COUPLED. With
   no stored ranking the nightly phase uses the other artist set, the artists in D1 (a read it already needs),
@@ -184,12 +193,11 @@ through), `bootstrap-state.json` (the engine's own state: cooldowns, side-effect
 
 - This file is the engine's own state format, nothing else [V, `RunState` in `ingest/ingest.py`: `version`,
   `tracks` cooldowns `{status, retry_after}`, `artists` map of key -> last completed scan date; the key of a
-  Last.fm artist is `lfm:` + 16 hex of the normalised name, `lastfm_artist_key` in PR #162]. #166 hands the
+  Last.fm artist is `lfm:` + 16 hex of the normalised name, `lastfm_artist_key` on master]. #166 hands the
   engine this file as ITS state file, so cooldowns (30 days no_match, 3 days failed [V]) behave exactly as in a
   nightly run, in a separate file. Bootstrap never writes into it. The `artists` map here is a SIDE EFFECT of the
-  engine (`record_artist`); bootstrap never reads it to decide anything. Note: on master `RunState.load` drops
-  `lfm:` artist keys because `ARTIST_ID` is the 22-char Spotify id only; PR #162 widens it [V, master and the
-  PR #162 diff], so this example is valid only after #162 merges.
+  engine (`record_artist`); bootstrap never reads it to decide anything. `RunState.load` on master accepts `lfm:`
+  artist keys next to Spotify ids (`LASTFM_ARTIST_KEY` [V, `ingest/ingest.py` on master]).
 
 #### `bootstrap-progress.json` (#168): the single truth about artists
 
@@ -218,9 +226,12 @@ engine saves after every track, so a shared file would have two writers.
   `pending`. `status` shows the rank position from the ranking file.
 - **Unknown and zero-track artists are NOT silently `done`.** On master `artist_tracks` does not raise for an
   unknown artist (Last.fm error 6) or one without albums: it returns an empty `ArtistTracks` with status
-  `UNKNOWN_ARTIST`, `NO_ALBUMS` or `UNUSABLE_ARTIST` [V, `ingest/lastfm_tracks.py` `_enumerate`], and in PR #162
+  `UNKNOWN_ARTIST`, `NO_ALBUMS` or `UNUSABLE_ARTIST` [V, `ingest/lastfm_tracks.py` `_enumerate`], and in
   `run_lastfm` such an artist goes through `run([])`, is counted `scanned` and recorded by `record_artist` [V,
-  PR #162 diff]. Without the hook a top-ranked artist spelled differently on Last.fm would be reported as a
+  `ingest/ingest.py` on master]. The status never leaves the engine today: `real_lastfm_enumerator` returns only
+  `.records`, so #166 must pass the status (and `truncated`) through to the hook. An artist whose name is empty
+  after `match.normalize` is skipped and counted (`lr.unusable`) by master's `run_lastfm` before enumeration [V];
+  bootstrap records it as `unusable_artist` itself. Without the hook a top-ranked artist spelled differently on Last.fm would be reported as a
   clean `done` with no tracks. The hook must receive and store `enum` and `truncated` (a requirement for
   #166, whose "enumeration fails" test does not cover this case), and `status` counts them separately (2.8).
   Only `ArtistBudgetExceeded` and other `LastfmError`s raise and are enumeration FAILURES (2.7).
@@ -252,13 +263,15 @@ engine saves after every track, so a shared file would have two writers.
 
 ### 2.6 What the engine must offer (ticket #166, and a gap)
 
-[V] `run_lastfm` in PR #162 takes `artists` (ranking order), an `enumerate_artist` callable, `stored_rows`, and
-the state object; it records an artist only when its last track was handled (`state.record_artist`, never in a
-dry run); it stops on cap or time before enumerating the next artist; it counts a failed enumeration and goes on;
-it re-raises the YouTube sign-in stop after updating its counters; one `LastfmClient` per run with a budget of
-ranking calls plus 150 per artist. #166 changes it to take an injected ranking and its own state file.
+[V, `ingest/ingest.py` on master] `run_lastfm` takes `artists` (ranking order), an `enumerate_artist` callable,
+`stored_rows`, and the state object; it records an artist only when its last track was handled
+(`state.record_artist`, never in a dry run); it stops on cap or time before enumerating the next artist; it counts
+a failed enumeration and goes on; it re-raises the YouTube sign-in stop after updating its counters. The ranking
+is read inside `run_lastfm_phase` (after the playlists, through a `DeadlineClient` so `--max-minutes` also bounds
+the ranking) with one `LastfmClient` per run created by `prepare_lastfm` with a budget of ranking calls plus 150
+per artist. #166 changes this to take an injected ranking and its own state file.
 
-What bootstrap needs on top, for #166/#168 to settle. Items 1, 2 and 4 are NOT in the text of #166 today; the
+What bootstrap needs on top, for #166/#168 to settle. Items 1, 2 and 3 are NOT in the text of #166 today; the
 planner should add them:
 
 1. **A per-artist progress hook**, called after each artist with the outcome (`done`, `cut` by cap/time/sign-in,
@@ -266,15 +279,15 @@ planner should add them:
    `truncated`) and the track counts of that artist, so `bootstrap.py` can write `partial` / `done` /
    `parked` into `bootstrap-progress.json` immediately. Without it the only record is the engine's scan date,
    which cannot express `partial`, per-artist counts or an empty enumeration. [P]
-4. **`rescan_days=0` and the progress file as the single truth** (2.4): #166 must not let the engine's scan
+2. **`rescan_days=0` and the progress file as the single truth** (2.4): #166 must not let the engine's scan
    date decide which artists are worked. [P]
-2. **A client budget sized for the session**, not for `max_artists`: a session works at most as many artists as
+3. **A client budget sized for the session**, not for `max_artists`: a session works at most as many artists as
    it reaches, `LastfmClient` has a hard `max_calls` (default `MAX_CALLS = 400`) [V]. Size it as
    150 x (artists in the planned list) or refuse to start; do not silently use 400. [P]
-3. Resume cost: a `partial` artist is re-enumerated (up to about 150 requests, about 2.5 minutes at 1 call/s
+4. Resume cost: a `partial` artist is re-enumerated (up to about 150 requests, about 2.5 minutes at 1 call/s
    [V arithmetic from `CALL_BUDGET` and `MIN_INTERVAL`]), then the tracks already stored are skipped by the D1
    `existing` set and the cross-source dedupe, tracks in cooldown are skipped. It adds only what is missing; the
-   cost is the enumeration, not repeated downloads. [V mechanism in PR #162; the real time is [R]]
+   cost is the enumeration, not repeated downloads. [V mechanism on master; the real time is [R]]
 
 ### 2.7 Failure and resume behaviour
 
@@ -286,7 +299,7 @@ planner should add them:
 | One track fails (download, upload, D1) | Counted `failed`; cooldown 3 days [V]; the artist goes on. Exit 1 at the end like a failed track today [V] | in the engine state `tracks` map |
 | No match for a track | Counted `no_match`, cooldown 30 days [V]. The track is NOT retried by bootstrap, and the nightly run never retries it (it does not enumerate Last.fm discographies) | `tracks` map |
 | Artist enumeration FAILS (`ArtistBudgetExceeded` or another `LastfmError` such as a refused key or a malformed answer; NOT an unknown artist, see the next row) | Logged redacted, counted in `failed`, the other artists go on, retried next session [V, #168; the exceptions are [V, `ingest/lastfm_tracks.py`]] | `failures` +1, status unchanged. After `N` consecutive failures (default 3 [P]) the artist becomes `parked`: skipped by `run` and `plan`, counted and reported by `status`, never retried automatically, so a permanent cause cannot eat each session (a retry costs up to 150 calls, about 2.5 minutes, before any track). Un-park: an explicit `run --unpark` for all parked artists (they become `pending`, `failures` reset), or add the artist to `exclude`. This is a requirement for #168's tests (an end state needs it) [P] |
-| Unknown artist, no albums, unusable name | NOT an exception: `artist_tracks` returns an empty result with a status [V]. The artist has nothing to download | stored in `enum` (`unknown_artist`, `no_albums`, `unusable_artist`), the artist ends `done` with 0 tracks, and `status` counts these separately (2.8). The owner fixes the spelling in `exclude` or accepts the gap [P] |
+| Unknown artist, no albums, unusable name | NOT an exception: `artist_tracks` returns an empty result with a status [V]. The artist has nothing to download | stored in `enum` (`unknown_artist`, `no_albums`, `unusable_artist`), the artist ends `done` with 0 tracks, and `status` counts these separately (2.8). `exclude` only REMOVES an artist from the work list, it cannot fix a spelling, so the owner accepts the gap or the name is handled by a later change (for example storing `mbid`, 2.4). The status must reach the hook: `real_lastfm_enumerator` returns only `.records` on master [V], so #166 passes the status through [P] |
 | Process killed (SIGKILL, power loss) | Loses at most the current track. State is written after every change, atomically [V, `RunState` and `atomic_write_json`]. A kill between the Telegram upload and the D1 write leaves one orphan message in the channel and the track is uploaded again next session; the exception path deletes the orphan only when the process survives to run it [V, `process_track`; the kill case is [R], not tested] | the track is simply not stored |
 | Another process holds the lock | The wrapper (or `bootstrap.py` itself) exits 75, touches nothing (section 5) | none |
 
@@ -305,14 +318,13 @@ something bootstrap does silently.
   - no ranking stored, or an unusable state file: one line saying so (still exit 0 for `status`, as it only
     reports; the refusal exit 2 belongs to `run`). [P]
   - a second line, always, when any apply: `empty: E artists with no tracks found (unknown or no albums),
-    truncated: T artists` so a clean `done` is never mistaken for a complete library [P, finding of the review of
-    PR #179].
+    truncated: T artists` so a clean `done` is never mistaken for a complete library [P].
   `M` is the number of tracks bootstrap added (sum of `tracks_added`) [P]; tracks the library already held from
   playlists are not counted.
 - `run --result-json FILE` writes counts only: added, skipped, no_match, too_big, failed, matched_title_only,
   `stop reason` (`done | cap | time | sign-in`, the engine's vocabulary [V, local-ingest.md "Why a run stopped"]).
 - Log: no secret, no Last.fm user name, counts per artist, never track titles [V, #168]. The engine already logs
-  artist names (`artist <name>: ...`) in the nightly style [V, PR #162]; names of artists are accepted in the log,
+  artist names (`artist <name>: ...`) in the nightly style [V, `run_lastfm` on master]; names of artists are accepted in the log,
   titles are not. [R] whether the owner wants artist names out of the bootstrap log too: not asked yet.
 - Exit codes: `bootstrap.py` 0 ok (a cap or time stop is NOT a failure), 1 some track or artist failed, 2 bad usage,
   missing caps, no ranking, bad config, 3 sign-in stop [V for 0/1/2/3 as ingest's codes, local-ingest.md "Exit
@@ -365,7 +377,7 @@ The per-artist filtering is done in Python, never by string-building SQL. [P]
 ### 4.3 What "missing" means
 
 Decided by #164 (see 4.4), replacing the "newer than a watermark date" model of the first version of this page and
-of the bodies of #165-5, #171 and #172, which are now stale (listed in the PR comment). The source gives the
+of the bodies of #165-5, #171 and #172, which are now stale (list at the end of section 7). The source gives the
 YEAR only, never a day, so a date watermark cannot work.
 
 1. Per artist, list the newest releases (4.4). A release is MISSING when no album of that artist in D1 has the
@@ -440,7 +452,7 @@ the phase attempts still go to `ingest-state.json` through the shared engine, as
                                        "failures": 0, "evaluated": ["0a1b2c3d4e5f6071:2025", "99aa88bb77cc66dd:"]}}}
 ```
 
-- Key: `lfm:` + 16 hex of the normalised name, as the engine's `artists` map [V for the key shape in PR #162];
+- Key: `lfm:` + 16 hex of the normalised name, as the engine's `artists` map [V for the key shape, `lastfm_artist_key` on master];
   no plain names. `browse_id`: the cached YouTube Music artist id, a public id, no secret; absent until
   resolved, left unset when the artist was ambiguous (then `failures` is not raised: it is "unresolvable", and
   the artist is skipped without calls). `checked_at`: last SUCCESSFUL check; an artist is due again after
@@ -464,7 +476,7 @@ Proposed defaults, not yet decided by the owner (#165-5):
 | re-check interval | 7 days | `recheck_days` |
 | tracks added by the phase | 20 | `max_new` of the section; also bound by the shared `--max-new 30` of the unit |
 | wall clock | 20 minutes for the phase [P: proposed by #165]; the whole run is capped by `--max-minutes 30` of the unit | owner question |
-| requests per artist per night | hard budget of 6 (one `get_artist` if the section params are not cached, 2 `get_artist_albums` calls for albums and singles at up to 2 requests each, [V per #164 reading of the source]), plus 1 `search` the first time, plus 1 `get_album` per missing release | #171 |
+| requests per artist per night | check: 1 `get_artist` (the state caches only `browse_id`, not the section params, so it is needed every night) + 2 `get_artist_albums` (albums, singles) at up to 2 requests each (page, sort continuation, [V per the #164 reading of the ytmusicapi source]) = at most 5 requests. Extra: 1 `search` the first night only, 1 `get_album` per missing release. Hard budget in #171: 5 + 1 per `get_album` allowed by `max_new`, + 1 on the first night | #171 |
 | pacing | at least 1 s between source calls | #171 |
 
 No `lookback_days` row: the first check of an artist has no date to look back to; the first page of Recency and
@@ -474,21 +486,21 @@ most `max_new` tracks that night; the rest is picked up by later nights as their
 On a refusal or rate limit of the source the phase stops without retry loops [P, #171]; a sign-in challenge
 during a download ends the whole run (exit 3) as today.
 
-Worst case by the proposed numbers, checking only: 10 artists x 6 requests x 1 s = 60 s, plus 10 first-time
-searches, plus 1 `get_album` per missing release, all inside the 20-minute phase cap; downloads: 20 tracks x
+Worst case by the proposed numbers, checking only: 10 artists x 5 requests x 1 s = 50 s a night, plus 10
+searches (10 s) on the first night, plus 1 `get_album` per missing release (at most 20 by `max_new`), all inside
+the 20-minute phase cap; downloads: 20 tracks x
 about a minute [R, the figure local-ingest.md and the unit comment use]. The real request counts are unmeasured
 [R]; the caps, not the estimate, are what guarantee it stays under the 30-minute run cap.
 
 ### 4.7 Logging: no names in the shipped log
 
 The nightly wrapper ships `ingest.log` lines to Grafana Cloud Loki [V, local-ingest.md "Shipping the run log"].
-The engine of PR #162 logs `artist <name>: ...` lines for the Last.fm source [V, PR #162 diff], which is fine for
+The engine's `run_lastfm` logs `artist <name>: ...` lines for the Last.fm source [V, master], which is fine for
 the never-shipped `bootstrap.log` but would send the owner's taste to a third party from the nightly. Requirement
 for #171/#172 [P]: the new-release phase writes counts and hashed keys only to `ingest.log` (due, checked,
 with_new, added, failed; the 16-hex key), no artist and no release names; it must not reuse the artist-name log
-lines of the Last.fm engine. Whether even playlist-track labels in the shipped log are acceptable is the
-owner's existing decision and out of scope here; if the owner wants the phase to log names, it is a question
-for #165, not a default.
+lines of the Last.fm engine. If the owner wants the phase to log names, that is a question for #165, not a
+default.
 
 ### 4.8 Result JSON and metrics
 
@@ -539,7 +551,7 @@ for #165, not a default.
 | Ticket | Role after the split |
 |---|---|
 | #148-#151 (Last.fm client and ranking, track enumeration, `lfm:` id and cross-source dedupe, title-only matcher) | Merged; the parts of the engine [V, on master] |
-| #152 / PR #162 | THE ENGINE for both processes: bootstrap calls it with the stored ranking and its own state (after #166); the nightly never enables the `lastfm_artists:` section. The PR docs and text that describe enabling the section for the timer are superseded; the PR itself is kept as is (planner comment on #152). One sentence in its docs section is wanted: the nightly timer must not use the section, see this page |
+| #152 / PR #162 (merged) | THE ENGINE for both processes: bootstrap calls it with the stored ranking and its own state (after #166); the nightly never enables the `lastfm_artists:` section. The merged docs section in `docs/local-ingest.md` that describes enabling the section for the timer is superseded by this page (#170 and #174 add the note and the guard) |
 | #153 report | Stays the match-rate gate before the first bootstrap session. Its runbook part about a first capped run through the nightly `sources.yml` is NOT written; #170 carries the dry run and first session steps through `bootstrap.py` (planner comment on #153) |
 | #154 go/no-go | Stays the gate; #176 is blocked by it |
 | #155 first capped run via the `sources.yml` section | Superseded by #176 (first bootstrap evening) if the owner agrees (#165-8); until then the section must not be enabled where the timer reads it |
@@ -642,10 +654,10 @@ edits them, this PR does not.
   comments, not repeated here): singles year presence for every artist, first-page size, same-name artists and the
   YouTube Music terms are open. The real request counts per artist per night (4.6) are unmeasured.
 - The behaviour of `ArtistTracks` statuses, `RunState.artist_due` and `record_artist` is read from code on master
-  and from the PR #162 diff, not run.
+  and `run_lastfm` on master, not run.
 - Real call counts, run times and track counts per artist (everything marked "unmeasured"); the owner's profile
   privacy and the duration quality of Last.fm records are measured by #153/#154 and the first sessions.
 - The wording of the Last.fm terms.
-- PR #162 is read from its diff, not from master. If it changes before the merge, the places that cite it
-  (`run_lastfm`, `lastfm_artist_key`, the section parser, the client budget) need a recheck.
+- Function names and behaviour of the engine are read from master after the merge of #162; #166 and #172 will
+  change them, and this page must be updated with them.
 - Whether systemd re-runs a catch-up after a run that exited 75.
