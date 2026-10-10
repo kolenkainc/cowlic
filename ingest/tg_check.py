@@ -10,6 +10,7 @@ The token is never printed.
 import hashlib
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -23,14 +24,69 @@ class TelegramError(Exception):
     """Telegram API failure. The message never contains the request URL (it holds the bot token)."""
 
 
+class EnvSyntaxError(Exception):
+    """Unsupported .env syntax. The message holds line numbers and reasons, never a value."""
+
+
+_ENV_LINE = re.compile(r"[ \t]*([A-Za-z_][A-Za-z0-9_]*)=(.*)")
+_ENV_SKIP = re.compile(rb"[ \t]*(#.*)?")
+
+
+def parse_env(data: bytes) -> dict[str, str]:
+    """Parse ./.env from its bytes. Supported: blank lines, comment lines (first non-blank char is #, any bytes
+    after it), and KEY=value (KEY is [A-Za-z_][A-Za-z0-9_]*, no space around =). The value is taken verbatim, trailing
+    spaces/tabs are trimmed and matching quotes around the whole value are removed; an empty value counts as missing
+    for the caller. Rejected, naming only the line (never the value): `export`, a value starting with a space, an
+    unbalanced quote or text after the closing quote, an unquoted ' #' inline comment, a repeated key, a NUL byte, a
+    CR that is not directly before a line feed, a non-ASCII byte outside a comment, any other line."""
+    if b"\x00" in data:
+        raise EnvSyntaxError("unsupported .env syntax: the file contains a NUL byte")
+    out: dict[str, str] = {}
+    problems = []
+    parts = data.split(b"\n")
+    for n, raw in enumerate(parts, 1):
+        if raw.endswith(b"\r") and n < len(parts):  # CRLF; a CR at the very end of the file is a lone CR
+            raw = raw[:-1]
+        if b"\r" in raw:
+            problems.append(f"line {n}: carriage return not directly before a line feed")
+            continue
+        if _ENV_SKIP.fullmatch(raw):
+            continue
+        if not raw.isascii():
+            problems.append(f"line {n}: non-ASCII byte outside a comment")
+            continue
+        line = raw.decode("ascii")
+        m = _ENV_LINE.fullmatch(line)
+        if not m:
+            reason = ("'export' is not supported, write KEY=value" if re.match(r"[ \t]*export[ \t]", line)
+                      else "not a KEY=value line (no spaces around '=')")
+            problems.append(f"line {n}: {reason}")
+            continue
+        key, val = m.group(1), m.group(2).rstrip(" \t")
+        if val[:1] in (" ", "\t"):
+            problems.append(f"line {n}: value starts with whitespace (key {key})")
+        elif len(val) >= 2 and val[0] in "\"'" and val[-1] == val[0]:
+            val = val[1:-1]
+        elif val[:1] in ("\"", "'"):
+            problems.append(f"line {n}: unbalanced quote or text after the closing quote (key {key})")
+        elif re.search(r"[ \t]#", val):
+            problems.append(f"line {n}: unquoted inline comment (' #') (key {key})")
+        if key in out:
+            problems.append(f"line {n}: key {key} is defined twice")
+        out[key] = val
+    if problems:
+        raise EnvSyntaxError("unsupported .env syntax: " + "; ".join(problems))
+    return out
+
+
 def load_env() -> None:
+    """Load ./.env into os.environ without overriding variables that are already set (an explicit environment
+    wins). Raises EnvSyntaxError on unsupported syntax."""
     env = Path(__file__).resolve().parent.parent / ".env"
     if not env.exists():
         return
-    for line in env.read_text().splitlines():
-        if "=" in line and not line.lstrip().startswith("#"):
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+    for k, v in parse_env(env.read_bytes()).items():
+        os.environ.setdefault(k, v)
 
 
 def call(token: str, method: str, **params) -> dict:
@@ -103,5 +159,5 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except TelegramError as e:
+    except (TelegramError, EnvSyntaxError) as e:
         sys.exit(str(e))
