@@ -40,7 +40,7 @@ import urllib.request
 from typing import Callable
 
 import tg_check
-from ingest import redact
+from ingest import error_reason, read_error_body, redact
 
 API = "https://api.spotify.com/v1"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
@@ -66,7 +66,8 @@ Fetch = Callable[[str, dict, float], tuple[int, dict, dict]]
 
 
 class ArtistTracksError(Exception):
-    """Enumeration failure. The message is redacted and never holds a token, secret or response body."""
+    """Enumeration failure. The message is redacted and never holds a token or secret; for an HTTP error it holds
+    the status, the path (no query) and Spotify's error message, cleaned and cut to about 200 characters."""
 
 
 # ---- validation (allowlist; rejects, never rewrites) ----
@@ -109,8 +110,8 @@ def default_fetch(url: str, headers: dict, timeout: float) -> tuple[int, dict, d
     try:
         with _OPEN(req, timeout=timeout) as r:
             status, hdrs, raw = r.status, r.headers, r.read()
-    except urllib.error.HTTPError as e:
-        status, hdrs, raw = e.code, e.headers, e.read()
+    except urllib.error.HTTPError as e:  # the body is read bounded; it carries Spotify's reason (error.message)
+        return e.code, {k.lower(): v for k, v in e.headers.items()}, read_error_body(e)
     except (urllib.error.URLError, OSError, http.client.HTTPException) as e:  # includes timeouts; the class name only
         raise ArtistTracksError(f"network error talking to Spotify ({type(e).__name__})") from None
     try:
@@ -197,7 +198,9 @@ class Catalog:
                 self._out(f"HTTP {status}, waiting {secs} s before retry {attempt + 1}/{MAX_RETRIES}")
                 self._sleep(secs)
                 continue
-            raise self._err(f"Spotify request failed: HTTP {status}")
+            reason = error_reason(body, self.secrets + [self._token])
+            where = urllib.parse.urlsplit(url).path  # the path only: never the query
+            raise self._err(f"Spotify request failed: HTTP {status} on {where}" + (f": {reason}" if reason else ""))
         raise self._err("Spotify request failed after retries")  # unreachable, keeps the contract explicit
 
 

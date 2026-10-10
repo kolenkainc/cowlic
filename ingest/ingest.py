@@ -112,6 +112,36 @@ def redact(text: str, secrets: list[str]) -> str:
     return text
 
 
+ERROR_BODY_MAX = 4096  # bytes read from an HTTP error response; the rest is never read
+REASON_MAX = 200  # characters of an upstream error message that may reach an error text
+
+
+def read_error_body(fp) -> dict:
+    """Parsed JSON object of an HTTP error response (read bounded to ERROR_BODY_MAX bytes). A body that is not a
+    JSON object becomes {"error": {"message": <its text>}} so error_reason() can show a short, bounded reason."""
+    raw = fp.read(ERROR_BODY_MAX)
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        body = None
+    if isinstance(body, dict):
+        return body
+    text = raw.decode("utf-8", "replace").strip()
+    return {"error": {"message": text}} if text else {}
+
+
+def error_reason(body: dict, secrets: list[str]) -> str:
+    """The reason an API gave for an error (Spotify: error.message; OAuth style: a string `error`), safe to show:
+    redacted first (so a secret is removed whole before any cutting), control characters replaced by '?', cut to
+    REASON_MAX characters. Empty when the body carries no string reason."""
+    err = body.get("error") if isinstance(body, dict) else None
+    msg = err.get("message") if isinstance(err, dict) else err
+    if not isinstance(msg, str):
+        return ""
+    text = "".join(c if c.isprintable() else "?" for c in redact(msg, secrets)).strip()
+    return text if len(text) <= REASON_MAX else text[:REASON_MAX] + "..."
+
+
 def neutralize(text: str) -> str:
     """Stop any line from being read as a GitHub Actions workflow command (`::cmd::` or legacy `##[cmd]`)."""
     return "\n".join(f"[neutralised] {ln}" if ln.lstrip().startswith(("::", "##[")) else ln

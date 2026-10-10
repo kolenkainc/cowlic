@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Callable
 
 import tg_check
-from ingest import redact
+from ingest import error_reason, read_error_body, redact
 
 AUTHORIZE_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
@@ -72,7 +72,8 @@ HttpGet = Callable[[str, dict, float], tuple[int, dict, dict]]
 
 
 class UserAuthError(Exception):
-    """Login or refresh failure. The message is redacted and never holds a token, code or response body."""
+    """Login or refresh failure. The message is redacted and never holds a token or code; for a Spotify API error it may hold
+    Spotify's error message, cleaned and cut to about 200 characters."""
 
 
 def _fail(msg: str, secret_values: list[str]) -> UserAuthError:
@@ -337,8 +338,8 @@ def default_get(url: str, headers: dict, timeout: float) -> tuple[int, dict, dic
     try:
         with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as r:
             status, raw, hdrs = r.status, r.read(), r.headers
-    except urllib.error.HTTPError as e:
-        status, raw, hdrs = e.code, e.read(), e.headers
+    except urllib.error.HTTPError as e:  # the body is read bounded; it carries Spotify's reason (error.message)
+        return e.code, read_error_body(e), {"retry-after": e.headers.get("Retry-After", "")}
     except (urllib.error.URLError, OSError, http.client.HTTPException) as e:  # includes timeouts; the class name only, no request details
         raise UserAuthError(f"network error talking to Spotify ({type(e).__name__})") from None
     try:
@@ -374,12 +375,14 @@ def _get_page(get: HttpGet, sleep: Callable[[float], None], url: str, token: str
             continue
         if status == 401:
             raise _fail(f"Spotify rejected the access token (HTTP 401); {RELOGIN}", secret_values)
+        reason = error_reason(body, secret_values)
+        said = f" Spotify said: {reason}" if reason else ""
         if status == 403:
             raise _fail("Spotify refused the request (HTTP 403). Likely causes: the app is in Development Mode and "
                         "this Spotify account is not added under User Management in the developer dashboard, the app "
                         "owner has no active Premium subscription, or the login did not grant user-follow-read "
-                        f"({RELOGIN} if the scope changed)", secret_values)
-        raise _fail(f"Spotify API error: HTTP {status}", secret_values)
+                        f"({RELOGIN} if the scope changed).{said}", secret_values)
+        raise _fail(f"Spotify API error: HTTP {status} on {urllib.parse.urlsplit(url).path}.{said}", secret_values)
     raise AssertionError("unreachable")
 
 
