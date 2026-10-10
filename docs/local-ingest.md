@@ -268,7 +268,8 @@ the first live push works is verified by the owner in #108.
 ## Per-run limits and the local state file
 
 Added in #119 (the base for the artist source in #121). Without the options below a run behaves as before:
-no cap and no time limit. The wrapper does not forward options yet; use them when calling ingest directly:
+no cap and no time limit. The wrapper forwards `--max-new`, `--max-minutes` and `--pace-seconds` only through
+`COWLIC_INGEST_ARGS` (see "The cap and the 21:10 timer"); use the options directly when calling ingest by hand:
 
 ```sh
 ingest/.venv/bin/python ingest/ingest.py --sources sources.yml --max-new 200 --max-minutes 90
@@ -547,16 +548,31 @@ the fix and exits with code 2 (class `config`; before any playlist is run, so fi
 
 ### The cap and the 21:10 timer
 
-The wrapper `scripts/run-ingest-local.sh` does not forward ingest options yet, so the timer run has NO cap and no
-time limit: with the section enabled and a big followed list, the first night would try to ingest everything
-(about 5-10 s pause plus the download per track; the unit stops at `TimeoutStartSec=2h`, and a run killed by that
-timeout writes no `last-run.json`). Until the wrapper forwards options, either run the backlog by hand with the
-options above, or set `max_artists` small in `sources.yml` so a night stays short. Progress is kept either way: a
-killed run keeps what the state file and D1 already hold, and the next run continues. Follow-up for the wrapper
-(not done here): let `run-ingest-local.sh` append extra ingest arguments from one environment variable, for
-example `COWLIC_INGEST_ARGS="--max-new 200 --max-minutes 90"` set in the unit with `Environment=`, expanded
-unquoted into the command line, with a test in `scripts/test-run-ingest-local.sh`. With a cap of 200 a night,
-about 2,500 tracks take about 13 nights and 40,000 about 200.
+Without `COWLIC_INGEST_ARGS` the timer run has NO cap and no time limit: with the section enabled and a big
+followed list, the first night would try to ingest everything (about 5-10 s pause plus the download per track; the
+unit stops at `TimeoutStartSec=2h`, and a run killed by that timeout writes no `last-run.json`). Set the caps in
+the unit, or set `max_artists` small in `sources.yml`. Progress is kept either way: a killed run keeps what the
+state file and D1 already hold, and the next run continues.
+
+`scripts/run-ingest-local.sh` appends the optional environment variable `COWLIC_INGEST_ARGS` to the ingest command
+line, for example in the unit (`systemctl --user edit cowlic-ingest.service`, or the commented line in
+`deploy/systemd/cowlic-ingest.service`):
+
+```ini
+Environment="COWLIC_INGEST_ARGS=--max-new 200 --max-minutes 90"
+```
+
+Rules (a violation ends the run with exit 78 before ingest starts, with one log line that does not repeat the value):
+
+- Unset, empty or blank: nothing is appended, the command line is exactly as before.
+- Only these options, each followed by a separate positive integer (no leading zero, no `=` form, each at most
+  once): `--max-new` (1..1000000), `--max-minutes` (1..1440), `--pace-seconds` (1..3600). Words are separated by
+  spaces. Every other ingest option (`--state-file`, `--dry-run`, ...) is rejected on purpose.
+- Only letters, digits, spaces and `-` may appear at all, at most 200 characters. The value is split with
+  `read -a`: no `eval`, no shell expansion, no globbing. No secret belongs in it.
+- `max_artists` is a `sources.yml` key (see above), not an ingest option, so it is not accepted here.
+
+With a cap of 200 a night, about 2,500 tracks take about 13 nights and 40,000 about 200.
 
 ## Troubleshooting
 
