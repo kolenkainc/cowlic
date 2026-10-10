@@ -283,7 +283,11 @@ def song_record(track: dict, album: dict) -> dict | None:
         "year": _year(album.get("release_date")),
         "track_number": track.get("track_number") if isinstance(track.get("track_number"), int) else None,
         "disc_number": track.get("disc_number") if isinstance(track.get("disc_number"), int) else None,
-        "duration": ms / 1000.0, "url": f"https://open.spotify.com/track/{tid}", "cover_url": _cover(album)}
+        "duration": ms / 1000.0, "url": f"https://open.spotify.com/track/{tid}", "cover_url": _cover(album),
+        # extra fields for cross-release dedupe (ingest/dedupe.py); the pipeline ignores them
+        "album_type": album.get("album_type") if isinstance(album.get("album_type"), str) else None,
+        "release_date": album.get("release_date") if isinstance(album.get("release_date"), str) else None,
+        "explicit": track.get("explicit") if isinstance(track.get("explicit"), bool) else None}
     return rec
 
 
