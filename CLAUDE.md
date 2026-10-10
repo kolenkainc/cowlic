@@ -16,4 +16,4 @@ Serverless self-hosted Spotify alternative: GitHub Actions ingest (spotdl) -> Te
 - Open question: whether YouTube blocks GitHub Actions runner IPs (ticket "POC 4").
 
 ## Conventions
-Conventional commits, English, imperative. Work on branches, PRs, squash merge. Board: https://github.com/orgs/kolenkainc/projects/5; move tickets Todo -> In progress -> Done.
+Conventional commits, English, imperative. Work on branches, PRs, squash merge. Board: https://github.com/orgs/kolenkainc/projects/5; move tickets Todo -> In progress -> Done. Status `Blocked` (option id a2a9edaa) means waiting on the owner or on another open ticket: the ticket must have a comment naming the blocker, and it returns to Todo / In progress when that is closed or answered. Label `blocked-on-owner` marks tickets that wait specifically for the owner.
