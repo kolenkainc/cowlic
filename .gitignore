@@ -5,3 +5,4 @@ node_modules/
 __pycache__/
 .venv/
 wrangler.local.toml
+.claude/worktrees/
