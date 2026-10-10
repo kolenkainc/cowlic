@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -778,7 +779,7 @@ class LogsOnlyTests(Base):
         out = io.StringIO()
         with contextlib.redirect_stdout(out), mock.patch.object(sg, "ship_logs_only") as m, \
                 mock.patch.object(sg, "ship") as nightly:
-            sg.main(["--logs-only", "--log", "x", "--offset", "0", "--offset-file", "o"])
+            sg.main(["--logs-only", "--job", "cowlic-report", "--log", "x", "--offset", "0", "--offset-file", "o"])
         m.assert_called_once()
         nightly.assert_not_called()
 
@@ -835,9 +836,80 @@ class LogsOnlyTests(Base):
         self.off.write_text("3\n")  # not at a line start
         self.logs_only(f)
         self.assertEqual(f.requests, [])
+
+    def test_corrupt_offset_file_is_reset_with_a_status_line(self):
+        self.log.write_text("a\nb\n")
         self.off.write_text("-1")
-        with self.assertRaises(sg.ShipError):
+        f = self.fake()
+        out = self.logs_only(f)
+        self.assertIn("reset", out)
+        self.assertEqual(self.lines_of(f.requests[0]), ["a", "b"])
+        self.assertEqual(self.off.read_text().strip(), "4")
+
+    def test_overlong_line_is_cut_once_and_never_split(self):
+        with mock.patch.object(sg, "MAX_BATCH_BYTES", 20):
+            self.log.write_text("short\n" + "x" * 50 + "\nafter\n")
+            f = self.fake()
+            self.logs_only(f)  # "short\n" (6 bytes): the long line does not fit the batch, so only "short"
+            self.assertEqual(self.lines_of(f.requests[0]), ["short"])
+            self.logs_only(f)  # the long line alone: first 20 bytes shipped, the rest skipped to its newline
+            self.assertEqual(self.lines_of(f.requests[1]), ["x" * 20])
+            self.assertEqual(self.off.read_text().strip(), str(len("short\n" + "x" * 50 + "\n")))
+            self.logs_only(f)  # the following line is not wedged
+            self.assertEqual(self.lines_of(f.requests[2]), ["after"])
+
+    def test_overlong_unfinished_line_waits_then_final_takes_it(self):
+        with mock.patch.object(sg, "MAX_BATCH_BYTES", 20):
+            self.log.write_text("y" * 50)
+            f = self.fake()
             self.logs_only(f)
+            self.assertEqual(f.requests, [])
+            self.logs_only(f, final=True)
+            self.assertEqual(self.lines_of(f.requests[0]), ["y" * 20])
+            self.assertEqual(self.off.read_text().strip(), "50")
+
+    def test_log_without_trailing_newline_does_not_wedge_a_fresh_offset(self):
+        # an offset saved at the end of a finished log is a line start; a final push of an unfinished line
+        # moves the offset to EOF (the wrapper never appends to such a log: a fresh log per run)
+        self.log.write_text("a\nunfinished")
+        f = self.fake()
+        self.logs_only(f)
+        self.assertEqual(self.lines_of(f.requests[0]), ["a"])
+        self.logs_only(f, final=True)
+        self.assertEqual(self.lines_of(f.requests[1]), ["unfinished"])
+
+    def test_logs_only_refuses_the_nightly_job_label(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(sg, "ship_logs_only") as m:
+            sg.main(["--logs-only", "--job", "cowlic-ingest", "--log", "x", "--offset", "0"])
+        m.assert_not_called()
+        self.assertIn("--job", out.getvalue())
+
+    def test_main_redacts_the_env_secret_in_the_shipped_body(self):
+        self.log.write_text(f"hello {self.USER} and {self.USER.upper()}\n")
+        f = self.fake()
+        env = dict(self.env(), **{sg.EXTRA_SECRET_ENV: self.USER})
+        point = lambda raw, path=sg.PUSH_PATH: f.base + path  # noqa: E731
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch.dict(sys.modules, {"tg_check": mock.Mock()}), \
+                contextlib.redirect_stdout(out), mock.patch.object(sg, "validate_url", side_effect=point):
+            sg.main(["--logs-only", "--job", "cowlic-report", "--log", str(self.log), "--offset", "0",
+                     "--offset-file", str(self.off)])
+        self.assertEqual(len(f.requests), 1)
+        body = f.requests[0]["body"].decode()
+        self.assertNotIn(self.USER.lower(), body.lower())
+        self.assertIn("***", body)
+
+    def test_guard_refusal_prints_a_status_line(self):
+        self.log.write_text("some co text\n")  # a user name "co" makes redaction and the guard bite everywhere
+        f = self.fake()
+        env = dict(self.env(), **{sg.EXTRA_SECRET_ENV: "ZZ"})
+        with mock.patch.dict(os.environ, env), mock.patch.dict(sys.modules, {"tg_check": mock.Mock()}):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), mock.patch.object(sg, "ship_logs_only",
+                                                                    side_effect=sg.ShipError("secret found in payload, not sent")):
+                sg.main(["--logs-only", "--job", "cowlic-report", "--log", str(self.log), "--offset", "0"])
+        self.assertIn("grafana: secret found in payload", out.getvalue())
 
     def test_redaction_of_extra_secret_token_and_final_guard(self):
         self.log.write_text(f"user {self.USER} token {CANARY_TOKEN} line\n")

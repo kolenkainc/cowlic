@@ -416,7 +416,8 @@ def write_offset(path: str, offset: int) -> None:
 def read_chunk(log_path: str, offset: int, final: bool) -> tuple[str, int]:
     """Follow mode: at most MAX_BATCH_BYTES of the log from `offset`, cut after the last complete line (the
     unfinished last line waits for the next push unless `final`). Returns (text, new offset). A single line longer
-    than the batch is taken as is. ShipError when the file is shorter than the offset or the offset is not at a
+    than the batch is shipped cut at the batch size and the rest of that line is skipped (never split over two
+    pushes; if its end is not written yet it waits, unless `final`). ShipError when the file is shorter than the offset or the offset is not at a
     line start (rotated or truncated: nothing is guessed)."""
     fd = os.open(log_path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, "rb") as f:
@@ -429,13 +430,34 @@ def read_chunk(log_path: str, offset: int, final: bool) -> tuple[str, int]:
                 raise ShipError("saved offset is not at a line start")
         f.seek(offset)
         data = f.read(MAX_BATCH_BYTES)
-    reached_end = len(data) == size - offset
-    if not (final and reached_end):
+        reached_end = len(data) == size - offset
+        if final and reached_end:
+            return data.decode("utf-8", errors="replace"), offset + len(data)
         cut = data.rfind(b"\n") + 1
         if cut:
             data = data[:cut]
         elif reached_end:
             data = b""  # one unfinished line: wait for its end
+        else:
+            # A single line longer than the batch: ship its first MAX_BATCH_BYTES (sanitize_lines cuts it further
+            # and marks it) and skip to the byte after its newline, so a line is never split over two pushes and
+            # the offset stays at a line start. Without a newline yet (still being written): wait, unless final.
+            pos = offset + len(data)
+            nl = -1
+            while nl < 0:
+                f.seek(pos)
+                more = f.read(65536)
+                if not more:
+                    break
+                i = more.find(b"\n")
+                if i >= 0:
+                    nl = pos + i
+                pos += len(more)
+            if nl >= 0:
+                return data.decode("utf-8", errors="replace"), nl + 1
+            if final:
+                return data.decode("utf-8", errors="replace"), pos
+            data = b""
     return data.decode("utf-8", errors="replace"), offset + len(data)
 
 
@@ -449,7 +471,11 @@ def ship_logs_only(log_path: str, offset: int, offset_file: str | None, job: str
         from ingest import redact  # fail closed: without ingest's redaction nothing is sent
     auth = "Basic " + base64.b64encode(f"{user}:{token}".encode()).decode()
     secrets = [token, auth.split(" ", 1)[1], *[s for s in extra_secrets if s]]
-    start = read_offset(offset_file, offset) if offset_file else offset
+    try:
+        start = read_offset(offset_file, offset) if offset_file else offset
+    except ShipError as e:  # a corrupt offset file must not block shipping for the rest of the run
+        say(f"{e}, reset to the start offset")
+        start = offset
     try:
         text, new_offset = read_chunk(log_path, start, final)
     except (OSError, ShipError) as e:
@@ -510,6 +536,8 @@ def main(argv: list[str]) -> int:
         except Exception as e:  # noqa: BLE001 - e.g. EnvSyntaxError; class only, the message could name a key
             say(f"env not loaded ({type(e).__name__})")
         if args.logs_only:
+            if args.job == "cowlic-ingest":  # that label belongs to the nightly run's panels
+                raise ShipError("--logs-only needs a --job other than cowlic-ingest")
             ship_logs_only(args.log, args.offset, args.offset_file, args.job, args.final,
                            extra_secrets=[os.environ.get(EXTRA_SECRET_ENV, "")])
         else:

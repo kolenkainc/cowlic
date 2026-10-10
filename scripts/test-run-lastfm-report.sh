@@ -57,6 +57,7 @@ assert "exit code of the report is passed through" "$([ "$rc" = 3 ] && echo 0 ||
 assert "arguments are forwarded to the report" "$(has "--lastfm-user $USERNAME_SECRET --years 2" "$STUB_REPORT_ARGS")"
 assert "log has the report output (stdout and stderr)" "$(has 'report error on stderr' "$(LOGF)")"
 assert "user name is redacted in the log" "$(hasnt "$USERNAME_SECRET" "$(LOGF)")"
+assert "the redacted line is there with the marker (not just missing)" "$(has 'report line for user \*\*\* and more' "$(LOGF)")"
 assert "user name is not on the terminal output" "$(hasnt "$USERNAME_SECRET" "$C/out")"
 assert "log is mode 0600" "$([ "$(stat -c %a "$(LOGF)")" = 600 ] && echo 0 || echo 1)"
 assert "state dir is private" "$([ "$(stat -c %a "$S/cowlic")" = 700 ] && echo 0 || echo 1)"
@@ -129,7 +130,40 @@ assert "SIGTERM: no stray process" "$([ -z "$stray" ] && echo 0 || echo 1)"
 assert "SIGTERM: final push still happened" "$(has '--final' "$C/ship_calls")"
 unset COWLIC_REPORT_SHIP_INTERVAL
 
-# 7. missing venv: 78
+# 7. kill -9 of the wrapper: no trap runs, the live loop must end by itself within a few seconds
+new_case kill9; MARKARG="31337.$$"
+cat > "$R/ingest/.venv/bin/python" <<PY
+#!/bin/sh
+case "\$*" in
+  *ship_grafana.py*--filter*) exec cat ;;
+  *ship_grafana.py*) echo "\$@" >> "$C/ship_calls"; exit 0 ;;
+  *lastfm_report.py*) echo started; exec sleep $MARKARG ;;
+esac
+PY
+export COWLIC_REPORT_SHIP_INTERVAL=1
+XDG_STATE_HOME="$S" bash "$R/scripts/run-lastfm-report.sh" --lastfm-user x > "$C/out" 2>&1 &
+wp=$!
+sleep 3.5
+kill -9 "$wp"
+wait "$wp" 2> /dev/null || true
+pkill -f -- "sleep $MARKARG" || true  # the orphaned report of a kill -9 (no trap can stop it); its subshell then ends too
+before="$(wc -l < "$C/ship_calls" 2> /dev/null || echo 0)"
+sleep 4
+loops="$(pgrep -f -- "bash $R/scripts/run-lastfm-report.sh" || true)"
+assert "kill -9: the live loop is gone within 4 s" "$([ -z "$loops" ] && echo 0 || echo 1)"
+sleep 2.5
+after="$(wc -l < "$C/ship_calls" 2> /dev/null || echo 0)"
+assert "kill -9: no push after the wrapper died (beyond the one in flight)" "$([ "$after" -le $((before + 1)) ] && echo 0 || echo 1)"
+unset COWLIC_REPORT_SHIP_INTERVAL
+
+# 8. a log left by a run killed mid-line: the new run starts a fresh log at offset 0 (the old one moves to .1)
+new_case partial; mkdir -p "$S/cowlic"; printf 'old line\nunfinished without newline' > "$S/cowlic/lastfm-report.log"
+run --lastfm-user "$USERNAME_SECRET"
+assert "fresh log per run: old log kept as .1" "$(has 'unfinished without newline' "$S/cowlic/lastfm-report.log.1")"
+assert "fresh log per run: new log does not hold the old content" "$(hasnt 'unfinished without newline' "$(LOGF)")"
+assert "shipper starts at offset 0" "$(has '--offset 0 ' "$STUB_SHIP_CALLS")"
+
+# 9. missing venv: 78
 new_case novenv; rm -f "$R/ingest/.venv/bin/python"; run --lastfm-user x
 assert "no venv: exit 78" "$([ "$rc" = 78 ] && echo 0 || echo 1)"
 

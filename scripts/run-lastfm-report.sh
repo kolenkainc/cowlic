@@ -9,14 +9,14 @@
 #   and to the shipper through the environment (COWLIC_EXTRA_SECRET, never argv) and is removed from the local log
 #   and from every shipped line.
 # - Output (stdout and stderr of the report) -> ingest/ship_grafana.py --filter (redaction) -> tee -> the log
-#   ${XDG_STATE_HOME:-$HOME/.local/state}/cowlic/lastfm-report.log (mode 0600, rotated by size like the ingest log).
+#   ${XDG_STATE_HOME:-$HOME/.local/state}/cowlic/lastfm-report.log (mode 0600, a fresh file per run; earlier ones kept as .1 ..).
 # - While the report runs, a background loop ships the NEW complete lines every COWLIC_REPORT_SHIP_INTERVAL seconds
 #   (default 20; bounded batch, offset kept in a file) and once more at the end. Shipping is best effort and never
 #   changes the report's exit code. Logs only: no metrics, no last-run.json, nothing of the nightly status is touched.
 # - Own flock lock (lastfm-report.lock): a second report logs one line to stderr and exits 75.
 # - Exit code: the report's own; 128+N when interrupted by signal N. Wrapper failures: 78 (prerequisites), 75 (locked).
 # - The background loop and the report run in their own process groups (job control) and are always stopped when
-#   the wrapper ends or is interrupted (trap).
+#   the wrapper ends or is interrupted (trap); after a kill -9 of the wrapper the loop ends itself within ~1 s.
 # Test: scripts/test-run-lastfm-report.sh
 set +x
 set -uo pipefail
@@ -35,7 +35,6 @@ VENV_PY="$ROOT/ingest/.venv/bin/python"
 REPORT="$ROOT/ingest/lastfm_report.py"
 SHIP="$ROOT/ingest/ship_grafana.py"
 JOB="cowlic-report"
-LOG_MAX_BYTES="${COWLIC_LOG_MAX_BYTES:-5242880}"
 LOG_KEEP="${COWLIC_LOG_KEEP:-5}"
 EXIT_PREREQ=78
 EXIT_LOCKED=75
@@ -61,11 +60,11 @@ for a in "$@"; do
 done
 unset prev a
 
+# A fresh log per run: a non-empty log of an earlier run always moves to .1 (older ones shift, LOG_KEEP kept), so
+# this run's log starts empty and its first byte is a line start (an earlier run killed mid-line cannot matter).
 rotate_log() {
-  [ -f "$LOG" ] || return 0
-  local size i
-  size="$(wc -c < "$LOG")"
-  ((size >= LOG_MAX_BYTES)) || return 0
+  [ -s "$LOG" ] || return 0
+  local i
   rm -f "$LOG.$LOG_KEEP"
   for ((i = LOG_KEEP - 1; i >= 1; i--)); do
     [ -f "$LOG.$i" ] && mv -f "$LOG.$i" "$LOG.$((i + 1))"
@@ -80,6 +79,7 @@ ship_call() { # extra shipper flags
     --log "$LOG" --offset "$LOG_OFFSET" --offset-file "$OFFSET_FILE" "$@" < /dev/null 9>&- 2> /dev/null
 }
 
+WRAPPER_PID=$$
 PIPE_PID=""
 TICK_PID=""
 INTERRUPTED=0
@@ -113,8 +113,7 @@ fi
 
 rotate_log
 rm -f "$OFFSET_FILE"
-LOG_OFFSET="$({ wc -c < "$LOG"; } 2> /dev/null)" || LOG_OFFSET=0
-case "$LOG_OFFSET" in '' | *[!0-9]*) LOG_OFFSET=0 ;; esac
+LOG_OFFSET=0  # the log is fresh (see rotate_log)
 trap cleanup EXIT
 trap 'on_signal 2' INT
 trap 'on_signal 15' TERM
@@ -133,12 +132,26 @@ log "start (arguments are not logged)"
 PIPE_PID=$!
 
 # The live shipper: its own process group (stopped as a whole), output dropped.
+# It exits by itself as soon as the wrapper is gone (kill -0 on its pid before every one-second sleep step and
+# before every push), so even a kill -9 of the wrapper, which no trap survives, ends it within about a second.
 (
+  warned=0
   while :; do
-    sleep "$INTERVAL"
-    ship_call > /dev/null
+    n=0
+    while [ "$n" -lt "$INTERVAL" ]; do
+      kill -0 "$WRAPPER_PID" 2> /dev/null || exit 0
+      sleep 1
+      n=$((n + 1))
+    done
+    kill -0 "$WRAPPER_PID" 2> /dev/null || exit 0
+    out="$(ship_call)"
+    case "$out" in
+      *"secret found"*) # the final guard refused the body (e.g. a very short user name): say it once, on the terminal
+        [ "$warned" = 1 ] || echo "run-lastfm-report: WARN grafana shipping refused by the secret guard; nothing is shipped" >&2
+        warned=1 ;;
+    esac
   done
-) < /dev/null > /dev/null 2>&1 9>&- &
+) < /dev/null > /dev/null 9>&- &
 TICK_PID=$!
 
 wait "$PIPE_PID"
