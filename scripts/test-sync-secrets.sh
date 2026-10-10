@@ -36,7 +36,7 @@ chmod +x "$TMP/bin/npx" "$TMP/bin/gh"
 CANARIES=(CANARY_TG_9f3a CANARY_USER_7b21 CANARY_PASS_c0de CANARY_SPID_1111 CANARY_SPSEC_2222 CANARY_INGEST_3333 CANARY_CHAN_4444 CANARY_ACCT_5555 CANARY_D1_6666)
 cat > "$TMP/env" <<ENVF
 # comment
-export TG_BOT_TOKEN=${CANARIES[0]}
+TG_BOT_TOKEN=${CANARIES[0]}
 SUBSONIC_USER="${CANARIES[1]}"
 SUBSONIC_PASSWORD='${CANARIES[2]}'
 SPOTIFY_CLIENT_ID=${CANARIES[3]}
@@ -75,7 +75,7 @@ no_leak sync "$TMP/t2.out" "$TMP/t2.err" "$TMP/calls.log"
 [ "$(wc -l < "$TMP/calls.log")" -eq 3 ] || fail "expected 3 tool calls (one per worker secret)"
 [ ! -e "$TMP/gh-called.log" ] || fail "gh must not be called: nothing is synced to GitHub"
 grep -qx 'npx --no-install wrangler secret put SUBSONIC_USER -c wrangler.local.toml: CANARY_USER_7b21' "$TMP/stdin.log" || fail "worker secret, quote stripping"
-grep -qx 'npx --no-install wrangler secret put TG_BOT_TOKEN -c wrangler.local.toml: CANARY_TG_9f3a' "$TMP/stdin.log" || fail "export prefix"
+grep -qx 'npx --no-install wrangler secret put TG_BOT_TOKEN -c wrangler.local.toml: CANARY_TG_9f3a' "$TMP/stdin.log" || fail "plain unquoted value"
 grep -q 'CANARY_BROAD\|CANARY_SPID\|CANARY_D1' "$TMP/stdin.log" && fail "unmanifested key synced"
 [ "$(grep -c '^npx ' "$TMP/pwd.log")" -eq 3 ] || fail "expected 3 npx calls"
 [ "$(grep -cx "npx $FROOT/worker" "$TMP/pwd.log")" -eq 3 ] || fail "npx not run from worker/"
@@ -127,7 +127,7 @@ grep -q 'Rerun is safe' "$TMP/t7.err" || fail "rerun hint missing"
 no_leak partial-failure "$TMP/t7.out" "$TMP/t7.err" "$TMP/calls.log"
 
 # 6c. .env syntax rejection: line number reported, value never printed
-for bad in 'SUBSONIC_USER= CANARY_LEAD_1' 'SUBSONIC_USER=CANARY_INL_2 # note' 'SUBSONIC_USER="CANARY_Q_3" # note' 'SUBSONIC_USER="CANARY_UNB_4'; do
+for bad in 'SUBSONIC_USER=CANARY_LEAD_1''SUBSONIC_USER=CANARY_INL_2 # note' 'SUBSONIC_USER="CANARY_Q_3" # note' 'SUBSONIC_USER="CANARY_UNB_4'; do
   grep -v '^SUBSONIC_USER' "$TMP/env.full" > "$TMP/env"; printf '%s\n' "$bad" >> "$TMP/env"
   rm -f "$TMP/calls.log"
   run "$TMP/t8" && fail "bad .env line accepted: ${bad%%CANARY*}"
@@ -136,6 +136,37 @@ for bad in 'SUBSONIC_USER= CANARY_LEAD_1' 'SUBSONIC_USER=CANARY_INL_2 # note' 'S
   no_leak badenv "$TMP/t8.out" "$TMP/t8.err"; if grep -q CANARY_ "$TMP/t8.out" "$TMP/t8.err"; then fail "bad-line value printed"; fi
 done
 cp "$TMP/env.full" "$TMP/env"
+
+# 6c2. cross-check with the shared fixtures (scripts/testdata/env-syntax), also used by ingest/test_env_syntax.py and
+# scripts/test-check-local-prereqs.sh, so the three parsers cannot drift. Here the value is observed exactly: it must
+# arrive on the shim's stdin as the fixture expects; an invalid fixture must sync nothing.
+printf 'TG_BOT_TOKEN worker-secret\n' > "$TMP/one.manifest"
+fx_count=0
+for f in "$ROOT"/scripts/testdata/env-syntax/*.env; do
+  name="$(basename "$f")"; first="$(head -n 1 "$f")"; fx_count=$((fx_count + 1))
+  rm -f "$TMP/calls.log" "$TMP/stdin.log"
+  rc=0; PATH="$TMP/bin:$PATH" ENV_FILE="$f" MANIFEST="$TMP/one.manifest" "$SCRIPT" > "$TMP/fx.out" 2> "$TMP/fx.err" || rc=$?
+  case "$first" in
+    "# expect-invalid")
+      [ "$rc" -ne 0 ] || fail "fixture $name: accepted but expected invalid"
+      [ ! -e "$TMP/calls.log" ] || fail "fixture $name: synced despite invalid syntax" ;;
+    "# expect-value:"*)
+      expected="${first#"# expect-value:"}"; expected="${expected# }"
+      if [ -z "$expected" ]; then
+        [ "$rc" -ne 0 ] || fail "fixture $name: empty value must count as missing"
+        [ ! -e "$TMP/calls.log" ] || fail "fixture $name: synced an empty value"
+      else
+        [ "$rc" -eq 0 ] || fail "fixture $name: rejected but expected valid"
+        grep -qxF "npx --no-install wrangler secret put TG_BOT_TOKEN -c wrangler.local.toml: $expected" "$TMP/stdin.log" || fail "fixture $name: value differs from the expectation"
+      fi ;;
+    *) fail "fixture $name: no expectation line" ;;
+  esac
+  if grep -qF "fake" "$TMP/fx.out" "$TMP/fx.err"; then fail "fixture $name: a value was printed"; fi
+done
+[ "$fx_count" -ge 10 ] || fail "fixtures not found"
+printf 'TG_BOT_TOKEN=fake-abc\r\n' > "$TMP/crlf.env"; rm -f "$TMP/stdin.log"
+PATH="$TMP/bin:$PATH" ENV_FILE="$TMP/crlf.env" MANIFEST="$TMP/one.manifest" "$SCRIPT" > /dev/null 2>&1 || fail "CRLF .env rejected"
+grep -qxF 'npx --no-install wrangler secret put TG_BOT_TOKEN -c wrangler.local.toml: fake-abc' "$TMP/stdin.log" || fail "CRLF value differs"
 
 # 6d. preflight: missing wrangler.local.toml / npx not on PATH abort before any call
 mkdir -p "$TMP/nowrangler/scripts" "$TMP/nowrangler/worker"; cp "$ROOT/scripts/sync-secrets.sh" "$ROOT/scripts/secrets.manifest" "$TMP/nowrangler/scripts/"

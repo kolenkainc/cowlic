@@ -10,6 +10,7 @@ The token is never printed.
 import hashlib
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -23,14 +24,63 @@ class TelegramError(Exception):
     """Telegram API failure. The message never contains the request URL (it holds the bot token)."""
 
 
+class EnvSyntaxError(Exception):
+    """Unsupported .env syntax. The message holds the line number and a reason, never the value."""
+
+
+_ENV_LINE = re.compile(r"[ \t]*([A-Za-z_][A-Za-z0-9_]*)=(.*)")
+_ENV_SKIP = re.compile(r"[ \t]*(#.*)?")
+
+
+def parse_env(text: str) -> dict[str, str]:
+    """Parse the supported .env subset (docs/architecture.md section 4); identical rules in
+    scripts/sync-secrets.sh and scripts/check-local-prereqs.sh, kept in step by a cross-check test over
+    scripts/testdata/env-syntax. Lines: blank, a comment (first non-blank char is #), or KEY=value with KEY
+    matching [A-Za-z_][A-Za-z0-9_]* and no space around =. The value is taken verbatim (no escapes, no expansion),
+    trailing spaces/tabs trimmed, optional matching quotes around the whole value removed. Rejected, with the
+    line number only: `export`, a value starting with a space, an unquoted ' #' inline comment, an unbalanced
+    quote or text after the closing quote, a repeated key, any other line."""
+    out: dict[str, str] = {}
+    problems = []
+    for n, line in enumerate(text.split("\n"), 1):
+        line = line.removesuffix("\r")
+        if _ENV_SKIP.fullmatch(line):
+            continue
+        m = _ENV_LINE.fullmatch(line)
+        if not m:
+            reason = ("'export' is not supported, write KEY=value" if re.match(r"[ \t]*export[ \t]", line)
+                      else "not a KEY=value line (no spaces around '=')")
+            problems.append(f"line {n}: {reason}")
+            continue
+        key, val = m.group(1), m.group(2).rstrip(" \t")
+        if val[:1] in (" ", "\t"):
+            problems.append(f"line {n}: value starts with whitespace (key {key})")
+        elif len(val) >= 2 and val[0] in "\"'" and val[-1] == val[0]:
+            val = val[1:-1]
+        elif val[:1] in ("\"", "'"):
+            problems.append(f"line {n}: unbalanced quote or text after the closing quote (key {key})")
+        elif re.search(r"[ \t]#", val):
+            problems.append(f"line {n}: unquoted inline comment (' #') (key {key})")
+        if key in out:
+            problems.append(f"line {n}: key {key} is defined twice")
+        out[key] = val
+    if problems:
+        raise EnvSyntaxError("unsupported .env syntax: " + "; ".join(problems))
+    return out
+
+
 def load_env() -> None:
+    """Load ./.env into os.environ without overriding variables that are already set (an explicit
+    environment wins). Raises EnvSyntaxError on unsupported syntax."""
     env = Path(__file__).resolve().parent.parent / ".env"
     if not env.exists():
         return
-    for line in env.read_text().splitlines():
-        if "=" in line and not line.lstrip().startswith("#"):
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+    try:
+        values = parse_env(env.read_text(encoding="utf-8"))
+    except UnicodeDecodeError:
+        raise EnvSyntaxError("unsupported .env syntax: the file is not valid UTF-8") from None
+    for k, v in values.items():
+        os.environ.setdefault(k, v)
 
 
 def call(token: str, method: str, **params) -> dict:
@@ -103,5 +153,5 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except TelegramError as e:
+    except (TelegramError, EnvSyntaxError) as e:
         sys.exit(str(e))

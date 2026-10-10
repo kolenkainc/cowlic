@@ -5,12 +5,15 @@
 # Values are never printed: they travel only through stdin of wrangler.
 # Env overrides (used by tests): ENV_FILE, MANIFEST.
 #
-# Supported .env subset (anything else is rejected with the line number, never the value):
-#   KEY=value, optional leading "export ", optional matching single or double quotes around the
-#   whole value. The value is taken verbatim: no escape processing (a backslash is a backslash),
-#   no variable expansion, no multiline values. Trailing whitespace is trimmed. A value that starts
-#   with a space, or an unquoted value containing " #" (inline comment), is rejected. Comment lines
-#   (starting with #) and blank lines are ignored. If a key is repeated, the last assignment wins.
+# Supported .env subset (anything else is rejected with the line number, never the value). The same
+# rules are implemented in ingest/tg_check.py parse_env and scripts/check-local-prereqs.sh; the shared
+# fixtures in scripts/testdata/env-syntax keep the three in step:
+#   KEY=value with no space around "=", optional matching single or double quotes around the whole
+#   value. No "export". The value is taken verbatim: no escape processing (a backslash is a backslash),
+#   no variable expansion, no multiline values. Trailing spaces/tabs are trimmed. A value that starts
+#   with a space, an unbalanced quote, or an unquoted value containing " #" (inline comment) is
+#   rejected, and so is a repeated key. Comment lines (first non-blank char #) and blank lines are
+#   ignored; any other line is rejected.
 set +x            # never trace: xtrace would expose values
 set -euo pipefail
 set +x
@@ -43,28 +46,43 @@ if [ -n "$only" ] && ! [[ "$only" =~ $NAME_RE ]]; then die "invalid key name for
 
 # Parse .env as data (no source/eval). See the supported subset in the header.
 declare -A ENVV=()
-declare -A BADLINE=()
+declare -A ENVSEEN=()
 envline=0
+envbad=0
+ws=$' \t'
+re_skip='^[ '$'\t'']*(#.*)?$'
+re_line='^[ '$'\t'']*([A-Za-z_][A-Za-z0-9_]*)=(.*)$'
+re_dq='^"(.*)"$'
+re_sq="^'(.*)'\$"
+re_comment='[ '$'\t'']#'
+envbadmsg() { printf 'error: %s line %s: %s\n' "$ENV_FILE" "$envline" "$1" >&2; envbad=$((envbad + 1)); }
 while IFS= read -r line || [ -n "$line" ]; do
   envline=$((envline + 1))
   line="${line%$'\r'}"
-  [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
-  key="${BASH_REMATCH[2]}"
-  val="${BASH_REMATCH[3]}"
-  val="${val%"${val##*[![:space:]]}"}"
-  unset 'BADLINE[$key]'
-  if [[ "$val" =~ ^[[:space:]] ]]; then
-    BADLINE["$key"]="$envline:value starts with whitespace"; ENVV["$key"]=""; continue
+  [[ "$line" =~ $re_skip ]] && continue
+  if ! [[ "$line" =~ $re_line ]]; then
+    if [[ "$line" =~ ^[$ws]*export[$ws] ]]; then envbadmsg "'export' is not supported, write KEY=value"
+    else envbadmsg "not a KEY=value line (no spaces around '=')"; fi
+    continue
   fi
-  if [[ "$val" =~ ^\"(.*)\"$ ]] || [[ "$val" =~ ^\'(.*)\'$ ]]; then
+  key="${BASH_REMATCH[1]}"
+  val="${BASH_REMATCH[2]}"
+  while [[ "$val" == *[$ws] ]]; do val="${val%?}"; done
+  if [ -n "${ENVSEEN[$key]:-}" ]; then envbadmsg "key $key is defined twice"; fi
+  ENVSEEN["$key"]=1
+  if [[ "$val" == [$ws]* ]]; then
+    envbadmsg "value starts with whitespace (key $key)"; continue
+  fi
+  if [[ "$val" =~ $re_dq ]] || [[ "$val" =~ $re_sq ]]; then
     val="${BASH_REMATCH[1]}"
   elif [[ "$val" == \"* || "$val" == \'* ]]; then
-    BADLINE["$key"]="$envline:unbalanced quote or text after the closing quote"; ENVV["$key"]=""; continue
-  elif [[ "$val" =~ [[:space:]]# ]]; then
-    BADLINE["$key"]="$envline:unquoted inline comment (' #')"; ENVV["$key"]=""; continue
+    envbadmsg "unbalanced quote or text after the closing quote (key $key)"; continue
+  elif [[ "$val" =~ $re_comment ]]; then
+    envbadmsg "unquoted inline comment (' #') (key $key)"; continue
   fi
   ENVV["$key"]="$val"
 done < "$ENV_FILE"
+[ "$envbad" -eq 0 ] || die "unsupported .env syntax; nothing was synced"
 
 # Parse and validate the whole manifest before touching anything.
 declare -A DESTS=()   # needs bash >= 4 (also used for ENVV below)
@@ -97,16 +115,6 @@ for i in "${!keys[@]}"; do
   if [ -z "$only" ] || [ "${keys[$i]}" = "$only" ]; then selected+=("$i"); fi
 done
 [ "${#selected[@]}" -gt 0 ] || die "no manifest entries selected${only:+ (key '$only' is not in the manifest)}"
-
-badcount=0
-for i in "${selected[@]}"; do
-  b="${BADLINE[${keys[$i]}]:-}"
-  if [ -n "$b" ]; then
-    printf 'error: %s line %s: %s (key %s)\n' "$ENV_FILE" "${b%%:*}" "${b#*:}" "${keys[$i]}" >&2
-    badcount=$((badcount + 1))
-  fi
-done
-[ "$badcount" -eq 0 ] || die "unsupported .env syntax; nothing was synced"
 
 missing=0
 for i in "${selected[@]}"; do

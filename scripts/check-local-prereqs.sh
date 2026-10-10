@@ -22,7 +22,7 @@ VENV_PY="$ROOT/ingest/.venv/bin/python"
 MIN_DENO="2.3.0"
 # Copies of REQUIRED_ENV and MIN_DENO in ingest/ingest.py; scripts/test-check-local-prereqs.sh fails on drift.
 REQUIRED_ENV=(TG_BOT_TOKEN TG_CHANNEL_ID SPOTIFY_CLIENT_ID SPOTIFY_CLIENT_SECRET
-              CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID D1_DATABASE_ID)
+              INGEST_CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID D1_DATABASE_ID)
 TIMEOUT_S=30  # as in ingest.py for deno; skipped when `timeout` is not installed (stock macOS)
 
 fail=0
@@ -82,22 +82,46 @@ if ((BASH_VERSINFO[0] >= 4)); then ok "bash ${BASH_VERSINFO[0]}.${BASH_VERSINFO[
 else missing "bash" "version ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]} is older than 4. macOS: brew install bash and use it for the wrapper"; fi
 
 if [ -f "$ENV_FILE" ] && [ -r "$ENV_FILE" ]; then
-  # Same rules as tg_check.load_env + ingest.py: a line counts when it has "=" and its stripped text does not
-  # start with "#"; the key is the stripped text before the first "=" (so "export KEY=v" defines "export KEY");
-  # the first definition of a key wins; an empty value counts as missing. Values never reach output.
-  absent=() ; exported=()
-  for k in "${REQUIRED_ENV[@]}"; do
-    if ! grep -E "^[[:space:]]*$k[[:space:]]*=" "$ENV_FILE" 2>/dev/null | head -n 1 \
-         | grep -Eq "=[[:space:]]*[^[:space:]]" >/dev/null 2>&1; then
-      absent+=("$k")
-      grep -Eq "^[[:space:]]*export[[:space:]]+$k[[:space:]]*=" "$ENV_FILE" >/dev/null 2>&1 && exported+=("$k")
+  # Same rules as ingest/tg_check.py parse_env and scripts/sync-secrets.sh (see the header of sync-secrets.sh and
+  # scripts/testdata/env-syntax): KEY=value, no "export", no space around "=", matching quotes stripped, no inline
+  # comment, no repeated key; an empty value counts as missing. Only line numbers and key names reach output, never
+  # values. Written without associative arrays: this script must also run (and report) under macOS bash 3.2.
+  ws=$' \t'
+  re_skip='^[ '$'\t'']*(#.*)?$'
+  re_line='^[ '$'\t'']*([A-Za-z_][A-Za-z0-9_]*)=(.*)$'
+  re_dq='^"(.*)"$'
+  re_sq="^'(.*)'\$"
+  re_comment='[ '$'\t'']#'
+  problems="" ; filled=" " ; seen=" " ; n=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line="${line%$'\r'}"
+    [[ "$line" =~ $re_skip ]] && continue
+    if ! [[ "$line" =~ $re_line ]]; then
+      if [[ "$line" =~ ^[$ws]*export[$ws] ]]; then problems="$problems line $n ('export' is not supported, write KEY=value);"
+      else problems="$problems line $n (not a KEY=value line, no spaces around '=');"; fi
+      continue
     fi
+    key="${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]}"
+    while [[ "$val" == *[$ws] ]]; do val="${val%?}"; done
+    case "$seen" in *" $key "*) problems="$problems line $n (key $key is defined twice);" ;; esac
+    seen="$seen$key "
+    if [[ "$val" == [$ws]* ]]; then problems="$problems line $n (value starts with whitespace, key $key);"; continue; fi
+    if [[ "$val" =~ $re_dq ]] || [[ "$val" =~ $re_sq ]]; then val="${BASH_REMATCH[1]}"
+    elif [[ "$val" == \"* || "$val" == \'* ]]; then problems="$problems line $n (unbalanced quote or text after the closing quote, key $key);"; continue
+    elif [[ "$val" =~ $re_comment ]]; then problems="$problems line $n (unquoted inline comment ' #', key $key);"; continue
+    fi
+    [ -n "$val" ] && filled="$filled$key "
+  done < "$ENV_FILE"
+  absent=()
+  for k in "${REQUIRED_ENV[@]}"; do
+    case "$filled" in *" $k "*) ;; *) absent+=("$k") ;; esac
   done
-  if ((${#absent[@]} == 0)); then ok ".env has all required keys"
+  if [ -n "$problems" ]; then
+    missing ".env" "unsupported syntax:${problems%;}. Supported: KEY=value, optional matching quotes, comments on their own lines; no export, no inline comments (docs/architecture.md section 4)"
+  elif ((${#absent[@]} == 0)); then ok ".env has all required keys"
   else
-    hint=""
-    ((${#exported[@]})) && hint=" ('export' is not supported, write KEY=value: ${exported[*]})"
-    missing ".env" "missing or empty: ${absent[*]}$hint. Fill them in, see the runbook"
+    missing ".env" "missing or empty: ${absent[*]}. Fill them in, see the runbook"
   fi
 else
   missing ".env" "not found or unreadable at the repo root. Create it with the required keys: ${REQUIRED_ENV[*]}"

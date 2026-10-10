@@ -413,5 +413,48 @@ class JsRuntimeTest(unittest.TestCase):
             self.assertIsNone(self.problem(f"deno {v} (stable, release, x86_64-unknown-linux-gnu)"), v)
 
 
+class CloudflareTokenTest(unittest.TestCase):
+    ENV = {"CLOUDFLARE_ACCOUNT_ID": "acct", "D1_DATABASE_ID": "db"}
+
+    def test_d1_uses_only_the_narrow_token(self):
+        seen = {}
+
+        def fake_urlopen(req, timeout=None):
+            seen["auth"] = req.get_header("Authorization")
+            return io.BytesIO(b'{"success": true, "result": []}')
+
+        env = {**self.ENV, "INGEST_CLOUDFLARE_API_TOKEN": "narrow-fake", "CLOUDFLARE_API_TOKEN": "broad-fake"}
+        with mock.patch.dict(os.environ, env), mock.patch("urllib.request.urlopen", fake_urlopen):
+            ingest.d1_batch([("SELECT 1", [])])
+        self.assertEqual(seen["auth"], "Bearer narrow-fake")
+
+    def test_no_silent_fallback_to_the_broad_token(self):
+        env = {**self.ENV, "CLOUDFLARE_API_TOKEN": "broad-fake"}
+        with mock.patch.dict(os.environ, env), mock.patch("urllib.request.urlopen") as opened:
+            os.environ.pop("INGEST_CLOUDFLARE_API_TOKEN", None)
+            with self.assertRaises(KeyError):
+                ingest.d1_batch([("SELECT 1", [])])
+        opened.assert_not_called()
+
+    def test_required_env_names_the_narrow_token_not_the_broad_one(self):
+        self.assertIn("INGEST_CLOUDFLARE_API_TOKEN", ingest.REQUIRED_ENV)
+        self.assertNotIn("CLOUDFLARE_API_TOKEN", ingest.REQUIRED_ENV)
+
+    def test_missing_narrow_token_is_reported_by_name_even_with_the_broad_one(self):
+        env = {k: "x" for k in ingest.REQUIRED_ENV if k != "INGEST_CLOUDFLARE_API_TOKEN"}
+        env["CLOUDFLARE_API_TOKEN"] = "broad-fake"
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch("tg_check.load_env"), \
+                mock.patch.object(sys, "argv", ["ingest.py", "https://example.invalid/playlist"]), \
+                contextlib.redirect_stdout(out):
+            os.environ.pop("INGEST_CLOUDFLARE_API_TOKEN", None)
+            self.assertEqual(ingest.main(), 1)
+        self.assertIn("INGEST_CLOUDFLARE_API_TOKEN", out.getvalue())
+        self.assertNotIn("broad-fake", out.getvalue())
+
+    def test_spotdl_never_inherits_either_cloudflare_token(self):
+        self.assertLessEqual({"INGEST_CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_TOKEN"}, ingest.SPOTDL_HIDDEN_ENV)
+
+
 if __name__ == "__main__":
     unittest.main()

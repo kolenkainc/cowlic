@@ -1,0 +1,8 @@
+Shared .env syntax fixtures (fake values only). Each file defines TG_BOT_TOKEN (a Worker secret in
+secrets.manifest and a REQUIRED_ENV key) and its FIRST line says what every parser must do:
+  # expect-value: X   valid, and TG_BOT_TOKEN has the value X (empty X = counts as missing)
+  # expect-invalid    must be rejected
+Consumers: ingest/test_env_syntax.py (tg_check.parse_env), scripts/test-sync-secrets.sh and
+scripts/test-check-local-prereqs.sh (the latter only sees present / missing / invalid).
+The expectation line is a comment, so it does not affect parsing. A CRLF case is generated in the tests,
+because the file tooling does not keep carriage returns.

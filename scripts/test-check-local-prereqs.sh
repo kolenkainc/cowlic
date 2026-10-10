@@ -32,7 +32,7 @@ TG_BOT_TOKEN=x
 TG_CHANNEL_ID=x
 SPOTIFY_CLIENT_ID=x
 SPOTIFY_CLIENT_SECRET=x
-CLOUDFLARE_API_TOKEN=x
+INGEST_CLOUDFLARE_API_TOKEN=x
 CLOUDFLARE_ACCOUNT_ID=x
 D1_DATABASE_ID=x
 ENV
@@ -78,7 +78,12 @@ assert ".env key missing: names the key" "$(grep -q 'TG_CHANNEL_ID' <<<"$OUT"; e
 new_case noenv; rm "$TMP/noenv/root/.env"; run noenv
 assert ".env missing: exit 1" "$([ "$RC" = 1 ]; echo $?)"
 
-# .env edge cases, mirroring tg_check.load_env + ingest.py (empty value = missing, export not accepted).
+# The broad token must not satisfy the narrow one.
+new_case broad; sed -i 's/^INGEST_CLOUDFLARE_API_TOKEN=x/CLOUDFLARE_API_TOKEN=x/' "$TMP/broad/root/.env"; run broad
+assert "only the broad CLOUDFLARE_API_TOKEN: exit 1" "$([ "$RC" = 1 ]; echo $?)"
+assert "only the broad CLOUDFLARE_API_TOKEN: names the narrow key" "$(grep -q 'INGEST_CLOUDFLARE_API_TOKEN' <<<"$OUT"; echo $?)"
+
+# .env edge cases, mirroring tg_check.parse_env (empty value = missing, export not accepted).
 env_case() { # name, sed expression applied to .env
   new_case "$1"; sed -i "$2" "$TMP/$1/root/.env"; run "$1"
 }
@@ -91,7 +96,10 @@ env_case export 's/^TG_BOT_TOKEN=x/export TG_BOT_TOKEN=x/'
 assert ".env export form: exit 1" "$([ "$RC" = 1 ]; echo $?)"
 assert ".env export form: hint" "$(grep -q "export' is not supported" <<<"$OUT"; echo $?)"
 env_case spaced 's/^TG_BOT_TOKEN=x/  TG_BOT_TOKEN = x/'
-assert ".env leading space and spaced = accepted" "$([ "$RC" = 0 ]; echo $?)"
+assert ".env spaced = rejected: exit 1" "$([ "$RC" = 1 ]; echo $?)"
+assert ".env spaced = rejected: names the line" "$(grep -q 'line 1' <<<"$OUT"; echo $?)"
+env_case indented 's/^TG_BOT_TOKEN=x/  TG_BOT_TOKEN=x/'
+assert ".env indented key accepted" "$([ "$RC" = 0 ]; echo $?)"
 env_case commented 's/^TG_BOT_TOKEN=x/#TG_BOT_TOKEN=x/'
 assert ".env commented key: exit 1" "$([ "$RC" = 1 ]; echo $?)"
 env_case indcomm 's/^TG_BOT_TOKEN=x/  # TG_BOT_TOKEN=x/'
@@ -99,7 +107,27 @@ assert ".env indented comment: exit 1" "$([ "$RC" = 1 ]; echo $?)"
 env_case prefix 's/^TG_BOT_TOKEN=x/XTG_BOT_TOKEN=x/'
 assert ".env prefix match not counted: exit 1" "$([ "$RC" = 1 ]; echo $?)"
 env_case firstwins 's/^TG_BOT_TOKEN=x/TG_BOT_TOKEN=\nTG_BOT_TOKEN=x/'
-assert ".env first definition wins (empty then set): exit 1" "$([ "$RC" = 1 ]; echo $?)"
+assert ".env repeated key rejected: exit 1" "$([ "$RC" = 1 ]; echo $?)"
+assert ".env repeated key rejected: says so" "$(grep -q 'defined twice' <<<"$OUT"; echo $?)"
+
+# Cross-check with the shared fixtures (scripts/testdata/env-syntax): the same files drive ingest/tg_check.py and
+# scripts/sync-secrets.sh, so the three parsers cannot drift. This script only reveals present / missing / invalid.
+fixtures_run=0
+for f in "$ROOT"/scripts/testdata/env-syntax/*.env; do
+  name="$(basename "$f")"; first="$(head -n 1 "$f")"
+  new_case "fx-$name"
+  { cat "$f"; grep -v '^TG_BOT_TOKEN=' "$TMP/fx-$name/root/.env"; } > "$TMP/fx-$name/env.new"; mv "$TMP/fx-$name/env.new" "$TMP/fx-$name/root/.env"
+  run "fx-$name"; fixtures_run=$((fixtures_run + 1))
+  case "$first" in
+    "# expect-invalid") assert "fixture $name: rejected as invalid" "$([ "$RC" = 1 ] && grep -q 'unsupported syntax' <<<"$OUT"; echo $?)" ;;
+    "# expect-value:"|"# expect-value: ") assert "fixture $name: empty value counts as missing" "$([ "$RC" = 1 ] && grep -q 'missing or empty: TG_BOT_TOKEN' <<<"$OUT"; echo $?)" ;;
+    "# expect-value: "*) assert "fixture $name: accepted" "$([ "$RC" = 0 ]; echo $?)" ;;
+    *) assert "fixture $name: has an expectation line" 1 ;;
+  esac
+done
+assert "fixtures were found" "$([ "$fixtures_run" -ge 10 ]; echo $?)"
+new_case crlf; sed -i 's/$/\r/' "$TMP/crlf/root/.env"; run crlf
+assert ".env with CRLF line endings accepted" "$([ "$RC" = 0 ]; echo $?)"
 
 # Version and python edge cases.
 new_case rc; set_deno rc 2.4.0-rc.1; run rc
