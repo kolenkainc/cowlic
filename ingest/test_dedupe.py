@@ -367,5 +367,82 @@ class Report(unittest.TestCase):
         self.assertEqual(collapse(r, collect_pairs=True).pairs, [("b", "a")])
 
 
+class DropStored(unittest.TestCase):
+    """Cross-source dedupe against rows read from D1: (title, primary artist, duration_s)."""
+
+    def drop(self, records, rows):
+        return dedupe.drop_stored(records, rows)
+
+    def test_exact_match_is_dropped_and_input_is_untouched(self):
+        r = [rec("lfm:" + "a" * 16, "Song", "Art", 200)]
+        before = copy.deepcopy(r)
+        res = self.drop(r, [("Song", "Art", 200)])
+        self.assertEqual((res.new, res.listed, res.stored, res.stored_without_duration), ([], 1, 1, 0))
+        self.assertEqual(r, before)
+
+    def test_normalised_artist_and_tag_rules(self):
+        res = self.drop([rec("a", "Song - Remastered 2011", "ART!", 201.5)], [("Song (Deluxe Edition)", "art", 200)])
+        self.assertEqual(res.new, [])
+
+    def test_different_artist_or_title_stays(self):
+        r = [rec("a", "Song", "Other", 200), rec("b", "Other Song", "Art", 200)]
+        self.assertEqual(ids_of(self.drop(r, [("Song", "Art", 200)])), ["a", "b"])
+
+    def test_duration_beyond_tolerance_stays_within_is_dropped(self):
+        r = [rec("a", dur=203.0), rec("b", dur=203.1), rec("c", dur=197.0), rec("d", dur=196.9)]
+        self.assertEqual(ids_of(self.drop(r, [("Song", "Art", 200)])), ["b", "d"])
+
+    def test_several_stored_durations_in_any_order(self):
+        rows = [("Song", "Art", 300), ("Song", "Art", 100), ("Song", "Art", 200)]
+        r = [rec("a", dur=201), rec("b", dur=150), rec("c", dur=299), rec("d", dur=101), rec("e", dur=250)]
+        self.assertEqual(ids_of(self.drop(r, rows)), ["b", "e"])
+
+    def test_live_and_explicit_variants_stay_distinct(self):
+        r = [rec("a", "Song - Live", "Art", 200), rec("b", "Song (Live at X)", "Art", 200),
+             rec("c", "Song", "Art", 200, explicit=True)]
+        self.assertEqual(ids_of(self.drop(r, [("Song", "Art", 200)])), ["a", "b", "c"])
+        self.assertEqual(self.drop([rec("a", "Song - Live", "Art", 200)], [("Song (Live)", "Art", 200)]).new, [])
+
+    def test_record_without_duration_matches_on_artist_and_title(self):
+        r = [rec("a", dur=None), rec("b", dur=0), rec("c", "Nope", dur=None)]
+        res = self.drop(r, [("Song", "Art", 200)])
+        self.assertEqual((ids_of(res), res.stored, res.stored_without_duration), (["c"], 2, 2))
+
+    def test_stored_row_without_duration_matches_on_artist_and_title(self):
+        res = self.drop([rec("a", dur=500)], [("Song", "Art", None)])
+        self.assertEqual((res.new, res.stored_without_duration), ([], 1))
+        res = self.drop([rec("a", dur=500)], [("Song", "Art", None), ("Song", "Art", 500)])
+        self.assertEqual((res.new, res.stored_without_duration), ([], 0))  # matched by duration
+
+    def test_uncomparable_records_and_rows_never_match(self):
+        r = [rec("a", "", "Art", 200), rec("b", "Song", "", 200, artists=[], album_artist=""),
+             rec("c", "x" * 400, "Art", 200)]
+        res = self.drop(r, [("", "Art", 200), ("Song", "", 200), ("x" * 400, "Art", 200), (None, "Art", 1), ("Song", 3, 1)])
+        self.assertEqual(ids_of(res), ["a", "b", "c"])
+
+    def test_empty_inputs(self):
+        self.assertEqual(self.drop([], [("Song", "Art", 200)]).listed, 0)
+        r = [rec("a")]
+        self.assertEqual(self.drop(r, []).new, r)
+
+    def test_non_dict_record_raises(self):
+        with self.assertRaises(TypeError):
+            self.drop(["x"], [])
+
+    def test_order_kept_and_many_stored_rows_are_fast(self):
+        rows = [(f"Title {i}", f"Artist {i % 500}", 100 + i % 300) for i in range(20000)]
+        records = [rec(f"n{i}", f"Title {i * 7}", f"Artist {(i * 7) % 500}", 100 + (i * 7) % 300) for i in range(2000)]
+        records += [rec(f"u{i}", f"Unseen {i}", "Artist 1", 150) for i in range(2000)]
+        t = time.monotonic()
+        res = self.drop(records, rows)
+        self.assertLess(time.monotonic() - t, 5)
+        self.assertEqual(ids_of(res), [f"u{i}" for i in range(2000)])  # all n* are stored (i * 7 < 20000), order kept
+        self.assertEqual(res.stored, 2000)
+
+
+def ids_of(result):
+    return [r["song_id"] for r in result.new]
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -177,6 +177,68 @@ def collapse(records: Iterable[dict], merge_variants: bool = False, tolerance: f
                         uncomparable=uncomparable, pairs=pairs)
 
 
+@dataclass
+class StoredResult:
+    new: list[dict]  # the records that are not stored yet, input order, the same dict objects
+    listed: int
+    stored: int  # records found among the stored rows (dropped)
+    stored_without_duration: int  # of `stored`: matched on artist + title key only (a side had no usable duration)
+
+
+def drop_stored(records: Iterable[dict], stored_rows: Iterable[tuple], merge_variants: bool = False,
+                tolerance: float = DURATION_TOLERANCE_S) -> StoredResult:
+    """Cross-source dedupe: the records that are NOT already stored. `stored_rows` are (title, primary artist,
+    duration_s) read from D1. Pure, no I/O, the records are never modified.
+
+    A record is stored when a row has the same normalised artist, the same title key (title_key: live and explicit
+    variants stay distinct unless merge_variants) and a duration within +-tolerance. When a side has no usable
+    duration only artist + title key are compared (counted in stored_without_duration). Records that cannot be
+    compared (no title, no artist, over-long text) are never dropped. Stored rows that cannot be compared are
+    ignored. Complexity O((n + m) log m)."""
+    index: dict[tuple, list] = {}  # key -> [sorted durations, has a row without duration]
+    for row in stored_rows:
+        title, artist, dur = row
+        if not isinstance(title, str) or not isinstance(artist, str):
+            continue
+        key_title, live, explicit = title_key(title)
+        name = normalize(artist) if len(artist) <= MAX_TEXT_LEN else ""
+        if not key_title or not name:
+            continue
+        entry = index.setdefault((key_title, name) if merge_variants else (key_title, name, live, explicit), [[], False])
+        d = _duration({"duration": dur})
+        if d is None:
+            entry[1] = True
+        else:
+            entry[0].append(d)
+    for entry in index.values():
+        entry[0].sort()
+    recs = list(records)
+    new: list[dict] = []
+    without_duration = 0
+    for i, rec in enumerate(recs):
+        if not isinstance(rec, dict):
+            raise TypeError(f"record {i} is not a dict")
+        name, dur, artist = rec.get("name"), _duration(rec), _primary_artist(rec)
+        title, live, explicit = title_key(name) if isinstance(name, str) else ("", False, False)
+        explicit = explicit or rec.get("explicit") is True
+        entry = index.get((title, artist) if merge_variants else (title, artist, live, explicit)) if title and artist else None
+        if entry is None:
+            new.append(rec)
+            continue
+        durs, row_without = entry
+        if dur is None:  # compared on artist + title key only
+            without_duration += 1
+            continue
+        lo = bisect.bisect_left(durs, dur - tolerance - _EPS)
+        if lo < len(durs) and durs[lo] <= dur + tolerance + _EPS:
+            continue
+        if row_without:  # a stored row without a duration: artist + title key only
+            without_duration += 1
+            continue
+        new.append(rec)
+    return StoredResult(new=new, listed=len(recs), stored=len(recs) - len(new), stored_without_duration=without_duration)
+
+
 def _safe(value: str) -> str:
     """An id for a log line: control characters (newlines included) replaced, length bounded."""
     return "".join(c if c.isprintable() else "?" for c in value[:64])
