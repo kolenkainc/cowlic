@@ -1,6 +1,15 @@
+import contextlib
+import io
+import os
+import re
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import ingest
 
@@ -26,7 +35,7 @@ class IngestTest(unittest.TestCase):
             self.assertEqual(sql.count("?"), len(params))
             self.assertNotIn("Al", sql)  # values travel only as params
         # statement text is constant, independent of hostile input
-        evil = dict(SONG, name="x'); DROP TABLE tracks;--", album_name="a'--", song_id="sp1")
+        evil = dict(song(1), name="x'); DROP TABLE tracks;--", album_name="a'--", song_id="sp1")
         self.assertEqual([s for s, _ in ingest.upsert_statements(evil, 1, "f", 1, None)], [s for s, _ in stmts])
         self.assertIn("COALESCE", stmts[1][0])
         self.assertEqual(stmts[2][1][0], ingest.track_id("sp1"))
@@ -118,6 +127,148 @@ class RunTest(unittest.TestCase):
     def test_missing_fields_fail_only_that_track(self):
         _, c, _ = self.go([{"song_id": sid(1)}, song(2)])
         self.assertEqual(c["new"], 1)
+
+
+# ---- fake spotdl: exercises spotdl_run / download / the Summary step without touching YouTube ----
+
+CID, SECRET = "cid0123456789abcdefCID", "Sec0123456789abcdefSECRET0123"
+WORKFLOW = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "ingest.yml"
+
+# argv: <subcommand> ... --client-id ID --client-secret SECRET. Behaviour comes from FAKE_MODE; it writes no mp3.
+FAKE_SPOTDL = r"""
+import os, sys
+a = sys.argv
+cid, secret = a[a.index("--client-id") + 1], a[a.index("--client-secret") + 1]
+mode = os.environ["FAKE_MODE"]
+if mode == "block":
+    print("yt_dlp.utils.DownloadError: ERROR: [youtube] x: Sign in to confirm you're not a bot", file=sys.stderr)
+elif mode == "noisy":
+    for i in range(100):
+        print(f"line {i}")
+elif mode == "upper":
+    print(f"client {cid.upper()} secret {secret.upper()}")
+elif mode == "wrapped":
+    print(f"client {cid[:7]}\n{cid[7:]} secret {secret[:9]}\n  {secret[9:]}")
+elif mode == "ansi":
+    print(f"client {cid[:6]}\x1b[31m{cid[6:]}\x1b[0m secret \x1b[1m{secret[:4]}\x1b[0m{secret[4:]}")
+elif mode == "command":
+    print("harmless\n::add-mask::topsecret\n  ::warning::x\n##[add-mask]y")
+sys.exit(0)
+"""
+
+
+def download_log(work: Path, mode: str) -> str:
+    """Runs ingest.run() with the real download() step against the fake spotdl; returns what it printed."""
+    os.environ["FAKE_MODE"] = mode
+    real = ingest.real_deps(None)
+    deps = ingest.Deps(lambda s: SimpleNamespace(video_id="v"), real.download, None, None, None, None)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        counts = ingest.run([song(1)], deps, set(), {}, work, False)
+    assert counts["failed"] == 1, counts
+    return out.getvalue()
+
+
+class FakeSpotdlCase(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.work = Path(tmp.name)
+        fake = self.work / "fake_spotdl.py"
+        fake.write_text(FAKE_SPOTDL)
+        for p in (mock.patch.object(ingest, "SPOTDL_CMD", [sys.executable, str(fake)]),
+                  mock.patch.dict(os.environ, {"SPOTIFY_CLIENT_ID": CID, "SPOTIFY_CLIENT_SECRET": SECRET,
+                                               "FAKE_MODE": ""})):
+            p.start()
+            self.addCleanup(p.stop)
+
+
+class SpotdlOutputTest(FakeSpotdlCase):
+    def test_exit_zero_without_file_surfaces_block_message(self):
+        out = download_log(self.work, "block")
+        self.assertIn("expected exactly one mp3 after download", out)
+        self.assertIn("Sign in to confirm you're not a bot", out)
+
+    def test_surfaced_tail_is_limited(self):
+        out = download_log(self.work, "noisy")
+        self.assertIn("line 99", out)
+        self.assertIn("line 85", out)  # exactly TAIL_LINES (15) lines: 85..99
+        self.assertNotIn("line 84", out)
+
+    def test_redaction_forms(self):
+        for mode in ("upper", "wrapped", "ansi"):
+            with self.subTest(mode):
+                out = download_log(self.work, mode)
+                self.assertIn("***", out)
+                flat = re.sub(r"\s+", "", out).lower()
+                for secret in (CID, SECRET):
+                    self.assertNotIn(secret.lower(), flat)
+                self.assertNotIn("\x1b", out)
+
+    def test_redact_plain(self):
+        self.assertEqual(ingest.redact(f"a {SECRET} b", [SECRET, "", CID]), "a *** b")
+
+    def test_spotdl_output_cannot_issue_workflow_commands(self):
+        out = download_log(self.work, "command")
+        for line in out.splitlines():
+            self.assertFalse(line.lstrip().startswith(("::", "##[")), line)
+        self.assertIn("add-mask", out)  # still visible, just not at a line start
+
+    def test_hostile_track_title_is_neutralised(self):
+        out = io.StringIO()
+        evil = dict(song(1), name="x\n::add-mask::hello\r::warning::y")
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(out):
+            ingest.run([evil], Fakes(Path(d), fail_upload=[sid(1)]).deps(), set(), {}, Path(d), False)
+        self.assertIn("add-mask", out.getvalue())
+        for line in out.getvalue().splitlines():
+            self.assertFalse(line.startswith("::"), line)
+
+
+def summary_script() -> str:
+    """Body of the Summary step's `run: |` block, taken from the real workflow file."""
+    lines = WORKFLOW.read_text().splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.strip() == "- name: Summary")
+    run = next(i for i in range(start, len(lines)) if lines[i].strip() == "run: |")
+    indent = len(lines[run]) - len(lines[run].lstrip())
+    body = []
+    for ln in lines[run + 1:]:
+        if ln.strip() and len(ln) - len(ln.lstrip()) <= indent:
+            break
+        body.append(ln)
+    return "\n".join(body)
+
+
+@unittest.skipUnless(shutil.which("bash"), "bash needed")
+class SummaryStepTest(unittest.TestCase):
+    def summary(self, log_text: str) -> str:
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "ingest.log").write_text(log_text)
+            out = Path(d) / "summary.md"
+            subprocess.run(["bash", "-c", summary_script()], check=True,
+                           env={"PATH": os.environ["PATH"], "RUNNER_TEMP": d, "GITHUB_STEP_SUMMARY": str(out),
+                                "JOB_STATUS": "failure"})
+            return out.read_text()
+
+    def test_block_message_from_surfaced_output_is_flagged(self):
+        case = SpotdlOutputTest("test_exit_zero_without_file_surfaces_block_message")
+        case.setUp()
+        try:
+            log_text = download_log(case.work, "block")
+        finally:
+            case.doCleanups()
+        self.assertIn("YouTube appears to block", self.summary(log_text))
+
+    def test_telegram_429_is_not_a_youtube_block(self):
+        text = self.summary("ERROR A - T: IngestError: 429: Too Many Requests: retry after 5\n")
+        self.assertNotIn("YouTube appears to block", text)
+
+    def test_backtick_lines_cannot_break_out_of_the_block(self):
+        text = self.summary("ERROR x\n````\n<script>alert(1)</script>\n# heading\n")
+        for needle in ("````", "<script>", "# heading"):
+            hits = [ln for ln in text.splitlines() if needle in ln]
+            self.assertTrue(hits)
+            for ln in hits:
+                self.assertTrue(ln.startswith("    "), ln)
 
 
 if __name__ == "__main__":
