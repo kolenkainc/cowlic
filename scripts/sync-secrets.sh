@@ -67,6 +67,7 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < "$ENV_FILE"
 
 # Parse and validate the whole manifest before touching anything.
+declare -A DESTS=()   # needs bash >= 4 (also used for ENVV below)
 keys=(); targets=(); remotes=(); ghenvs=()
 lineno=0
 while IFS= read -r line || [ -n "$line" ]; do
@@ -86,10 +87,13 @@ while IFS= read -r line || [ -n "$line" ]; do
   case "$target" in
     gh-env-secret)
       [[ "$ghenv" =~ $NAME_RE ]] || die "manifest line $lineno: gh-env-secret needs an environment name, e.g. gh-env-secret@ingest" ;;
-    gh-secret|gh-variable|worker-secret)
+    worker-secret)
       [ -z "$ghenv" ] || die "manifest line $lineno: '@environment' is only valid for gh-env-secret" ;;
     *) die "manifest line $lineno: unknown target '$target'" ;;
   esac
+  dest="$target@$ghenv:$remote"
+  [ -z "${DESTS[$dest]:-}" ] || die "manifest line $lineno: duplicate destination $dest (first defined on line ${DESTS[$dest]})"
+  DESTS["$dest"]="$lineno"
   keys+=("$key"); targets+=("$target"); remotes+=("$remote"); ghenvs+=("$ghenv")
 done < "$MANIFEST"
 
@@ -121,23 +125,32 @@ done
 # Preflight before any write: tools and files the selected entries need.
 need_gh=0; need_worker=0
 for i in "${selected[@]}"; do
-  case "${targets[$i]}" in gh-*) need_gh=1 ;; worker-secret) need_worker=1 ;; esac
+  case "${targets[$i]}" in gh-env-secret) need_gh=1 ;; worker-secret) need_worker=1 ;; esac
 done
 if [ "$need_gh" -eq 1 ]; then command -v gh > /dev/null || die "gh not found on PATH; nothing was synced"; fi
 if [ "$need_worker" -eq 1 ]; then
   command -v npx > /dev/null || die "npx not found on PATH; nothing was synced"
   [ -r "$ROOT/worker/wrangler.local.toml" ] || die "worker/wrangler.local.toml is missing (gitignored, holds the real D1 id); nothing was synced"
 fi
-# Every GitHub environment the selected entries write to must exist (owner creates it). Checked
-# last among the preflights but before the first write, so a missing environment never leaves a
-# half-synced state. {owner}/{repo} are resolved by gh from the clone (we cd to the repo root).
+# Every GitHub environment found in the selected entries is probed here, for all entries, before the
+# first write (independent of manifest order). The probe is the endpoint `gh secret set --env` itself
+# needs (the environment's public key), so it checks the permission the writes need. {owner}/{repo}
+# are resolved by gh from the clone (we cd to the repo root). gh's first stderr line is shown (it
+# carries the HTTP status, never a secret value).
 declare -A seen_env=()
 for i in "${selected[@]}"; do
   e="${ghenvs[$i]}"
   [ -n "$e" ] && [ -z "${seen_env[$e]:-}" ] || continue
   seen_env["$e"]=1
-  gh api "repos/{owner}/{repo}/environments/$e" > /dev/null 2>&1 < /dev/null \
-    || die "GitHub environment '$e' not found or not accessible (gh api repos/{owner}/{repo}/environments/$e failed). Create it in the repo settings (restricted to master) or check gh auth; nothing was synced"
+  perr="$(gh api "repos/{owner}/{repo}/environments/$e/secrets/public-key" 2>&1 > /dev/null < /dev/null)" && continue
+  first="$(printf '%s\n' "$perr" | head -n 1 | tr -d '\000-\037' | cut -c1-200)"
+  case "$perr" in
+    *"HTTP 401"*) why="not authenticated or bad token (401): run gh auth login / check GH_TOKEN" ;;
+    *"HTTP 404"*) why="environment not found, or the token cannot see the repository (404): create the environment (restricted to master) in the repo settings" ;;
+    *"HTTP 403"*) why="forbidden (403): the token lacks permission to write environment secrets" ;;
+    *) why="request failed (network or other error)" ;;
+  esac
+  die "GitHub environment '$e' preflight failed: $why. gh said: ${first:-<no output>}. Nothing was synced"
 done
 
 synced=()
@@ -148,8 +161,6 @@ for i in "${selected[@]}"; do
   rc=0
   case "$target" in
     gh-env-secret) printf '%s' "${ENVV[$key]}" | gh secret set "$remote" --env "$ghenv" || rc=$? ;;
-    gh-secret)     printf '%s' "${ENVV[$key]}" | gh secret set "$remote" || rc=$? ;;
-    gh-variable)   printf '%s' "${ENVV[$key]}" | gh variable set "$remote" || rc=$? ;;
     worker-secret) printf '%s' "${ENVV[$key]}" | (cd "$ROOT/worker" && npx --no-install wrangler secret put "$remote" -c wrangler.local.toml) || rc=$? ;;
   esac
   if [ "$rc" -ne 0 ]; then
