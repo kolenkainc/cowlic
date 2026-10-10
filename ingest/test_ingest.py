@@ -339,6 +339,27 @@ class SpotdlOutputTest(FakeSpotdlCase):
         self.assertEqual(f(f"auth {jwt} end"), "auth <token> end")
         self.assertEqual(f("path /a1b2c3d4e5/f6g7h8i9j0/k1l2m3n4o5 end"), "path /<token> end")
 
+    def test_wrapped_url_continuation_is_masked(self):
+        out = ingest.scrub_cause("&ip=203.0.113.7&sig=abc123&lsig=def&pot=xyz&Key=k1 tail")
+        for gone in ("203.0.113.7", "abc123", "def", "xyz", "k1"):
+            self.assertNotIn(gone, out)
+        self.assertIn("tail", out)
+
+    def test_html_escaped_separators_are_masked(self):
+        out = ingest.scrub_cause("h/videoplayback&amp;ip=203.0.113.7&amp;sig=abc&amp;expire=1760000000 end")
+        for gone in ("203.0.113.7", "sig=abc"):
+            self.assertNotIn(gone, out)
+        self.assertIn("end", out)
+
+    def test_scrub_is_linear_on_long_input(self):
+        import time
+        t = time.monotonic()
+        ingest.scrub_cause("a" * 100_000)
+        ingest.scrub_cause("a." * 50_000)
+        for _ in range(1000):
+            ingest.scrub_cause("ab12" * 400)
+        self.assertLess(time.monotonic() - t, 1.0)
+
     def test_scrub_keeps_ordinary_text(self):
         for text in ("is that ok?", "issue #12 failed", "C# is fine", "Sign in to confirm you're not a bot"):
             self.assertEqual(ingest.scrub_cause(text), text)

@@ -99,8 +99,10 @@ IPV4 = re.compile(r"(?<![\w.])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[
 IPV6 = re.compile(  # full form, or compressed form (it contains "::"); a bare 13:10:00 timestamp is not matched
     rf"(?<![\w:.-])(?:(?:{_H}:){{7}}{_H}|(?:{_H}:){{1,7}}:(?:{_H}(?::{_H}){{0,6}})?|::{_H}(?::{_H}){{0,6}})(?![\w:.-])"
 )
+SECRET_PARAM = re.compile(r"(?i)\b(sig|lsig|pot|signature|token|key)=[^\s&;]+")  # also on a wrapped URL's 2nd line
 OPAQUE_TOKEN = re.compile(r"[A-Za-z0-9_+=-]{24,}")  # long base64/hex/url-safe run: a token, not readable text
-JOINED_RUN = re.compile(r"[A-Za-z0-9_+=-]+(?:[./][A-Za-z0-9_+=-]+)+")  # pieces joined by . or / (JWT, signed paths)
+# the lookbehind makes a run start only at its beginning: without it a long run is rescanned from every position
+JOINED_RUN = re.compile(r"(?<![A-Za-z0-9_+=-])[A-Za-z0-9_+=-]+(?:[./][A-Za-z0-9_+=-]+)+")  # pieces joined by . or / (JWT, signed paths)
 
 
 def _query(m: re.Match) -> str:
@@ -127,8 +129,10 @@ def _joined(m: re.Match) -> str:
 def scrub_cause(ln: str) -> str:
     """Log text is public: drop URL query strings and fragments (keeping a YouTube v=<id>), mask ip= values and
     bare IPv4/IPv6 addresses, and mask long opaque tokens (also ones joined by . or /)."""
+    ln = ln.replace("&amp;", "&")  # HTML-escaped separators
     ln = ENCODED_DELIM.sub(lambda m: "?" if m[0][2] in "Ff" else "#", ln)
     ln = URL_QUERY.sub(_query, ln)
+    ln = SECRET_PARAM.sub(r"\1=<stripped>", ln)
     ln = IP_PARAM.sub("ip=<ip>", ln)
     ln = IPV6.sub("<ip>", IPV4.sub("<ip>", ln))
     ln = JOINED_RUN.sub(_joined, ln)
