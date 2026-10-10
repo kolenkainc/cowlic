@@ -29,6 +29,7 @@ Last.fm API terms we follow (https://www.last.fm/api/tos; clause numbers are [R]
 Method pages: https://www.last.fm/api/show/user.getWeeklyChartList, .../user.getWeeklyArtistChart.
 """
 import argparse
+import contextlib
 import datetime
 import http.client
 import json
@@ -46,7 +47,8 @@ import tg_check
 from ingest import redact
 
 API = "https://ws.audioscrobbler.com/2.0/"
-READ_METHODS = frozenset({"user.getWeeklyChartList", "user.getWeeklyArtistChart"})  # read-only allowlist
+READ_METHODS = frozenset({"user.getWeeklyChartList", "user.getWeeklyArtistChart",
+                          "artist.getTopAlbums", "album.getInfo"})  # read-only allowlist
 HTTP_TIMEOUT = 15.0
 MIN_INTERVAL = 1.0  # seconds between two calls
 MAX_RETRIES = 3  # retries per call after error 29/11/16, HTTP 5xx or a network error
@@ -79,7 +81,14 @@ Fetch = Callable[[str, float], tuple[int, dict]]
 
 
 class LastfmError(Exception):
-    """Failure talking to Last.fm. The message is redacted: never the key, never a URL with its query."""
+    """Failure talking to Last.fm. The message is redacted: never the key, never a URL with its query.
+    `code` is the Last.fm API error code when the failure is one, else None."""
+
+    code: int | None = None
+
+
+class CallLimitReached(LastfmError):
+    """The request budget of the client (or of a `call_budget` block) is used up."""
 
 
 class ResponseTooLarge(LastfmError):
@@ -158,8 +167,20 @@ class LastfmClient:
         self.calls = 0
         self._last: float | None = None
 
-    def _err(self, msg: str) -> LastfmError:
-        return LastfmError(redact(msg, [self._key, urllib.parse.quote(self._key)]))
+    def _err(self, msg: str, code: int | None = None) -> LastfmError:
+        e = LastfmError(redact(msg, [self._key, urllib.parse.quote(self._key)]))
+        e.code = code
+        return e
+
+    @contextlib.contextmanager
+    def call_budget(self, n: int):
+        """Allow at most `n` more HTTP requests inside the block (retries count), never more than the client limit."""
+        old = self._max_calls
+        self._max_calls = min(old, self.calls + n)
+        try:
+            yield
+        finally:
+            self._max_calls = old
 
     def _pace(self) -> None:
         if self._last is not None:
@@ -175,7 +196,7 @@ class LastfmClient:
         for attempt in range(MAX_RETRIES + 1):
             last = attempt == MAX_RETRIES
             if self.calls >= self._max_calls:
-                raise self._err(f"call limit of {self._max_calls} reached; stopping")
+                raise CallLimitReached(str(self._err(f"call limit of {self._max_calls} reached; stopping")))
             self._pace()
             self.calls += 1
             try:
@@ -196,7 +217,7 @@ class LastfmClient:
                         raise self._err(ERROR_MESSAGES.get(code, f"Last.fm error {code}") + f" after {MAX_RETRIES} retries")
                     self._wait(attempt, f"error {code}")
                     continue
-                raise self._err(ERROR_MESSAGES.get(code) or self._generic(code, body))
+                raise self._err(ERROR_MESSAGES.get(code) or self._generic(code, body), code)
             if status >= 500 or status == 429:
                 if last:
                     raise self._err(f"Last.fm kept answering HTTP {status} after {MAX_RETRIES} retries")
