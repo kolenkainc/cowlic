@@ -134,7 +134,8 @@ class Enumerate(unittest.TestCase):
         self.assertEqual(songs, [{
             "song_id": sid("T", 1), "name": "Song 1", "artists": ["Art", "Guest"], "album_artist": "Art",
             "album_name": "Album 1", "year": 2019, "track_number": 1, "disc_number": 1, "duration": 200.5,
-            "url": f"https://open.spotify.com/track/{sid('T', 1)}", "cover_url": "https://i.scdn.co/1"}])
+            "url": f"https://open.spotify.com/track/{sid('T', 1)}", "cover_url": "https://i.scdn.co/1",
+            "album_type": "album", "release_date": "2019-05-03", "explicit": None}])
         self.assertEqual(ingest.primary_artist(songs[0]), "Art")
         self.assertTrue(ingest.SPOTIFY_ID.fullmatch(songs[0]["song_id"]))
         stmts = ingest.upsert_statements(songs[0], 10, "f", 1, None)  # the pipeline's own writer accepts it
