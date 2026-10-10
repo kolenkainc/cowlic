@@ -268,6 +268,41 @@ Find the logs in Grafana (Explore, Loki data source of your stack):
 Set the time range to the last 24 hours or more (one run a day). Free tier retention is about 14 days. Whether
 the first live push works is verified by the owner in #108.
 
+### Watch the Last.fm report live (`scripts/run-lastfm-report.sh`)
+
+The match-rate report (`ingest/lastfm_report.py`, see below) bypasses the nightly wrapper. To watch it in Grafana
+while it runs, start it through the report wrapper; every argument goes to the report unchanged:
+
+```bash
+scripts/run-lastfm-report.sh --lastfm-user <your-name> --years 5 --artists 100
+```
+
+Why a second wrapper and a few flags on the shipper (`--job`, `--logs-only`, `--offset-file`, `--final`,
+`--filter`), not only a flag: the report needs its own lock, log, background loop and signal handling, which do not
+belong in the nightly wrapper, whose path stays byte-identical. The shipper stays the one place for validation,
+redaction, cleaning and the final guard.
+
+- Output (stdout and stderr) goes through the shipper's `--filter` (same redaction and cleaning as a push) into
+  `${XDG_STATE_HOME:-~/.local/state}/cowlic/lastfm-report.log` (mode 0600, rotated by size like `ingest.log`) and to
+  the terminal. The report's exit code is the wrapper's; 128+N if interrupted by signal N.
+- Every `COWLIC_REPORT_SHIP_INTERVAL` seconds (default 20) the new complete lines (at most 256 KiB per push, offset
+  kept in `.lastfm-report.offset`) are pushed with the label `job="cowlic-report"`, and once more at the end. The
+  same failure isolation as the nightly: 30 s hard limit per push, no retry loop (a failed batch is simply sent
+  again with the next one), an unreachable Grafana or a bad token never changes the exit code. Only the final push
+  prints one status line.
+- Logs only: no metrics and no `last-run.json`, so the nightly panels (`Last run`, metrics, `run_summary`) keep
+  meaning the 21:10 run only.
+- Safety: the user name is taken from `--lastfm-user` and handed to the filter and the shipper through the
+  environment (`COWLIC_EXTRA_SECRET`, never argv); it is removed from the local log and from every shipped line.
+  The arguments are never echoed, logged or shipped. `LASTFM_API_KEY` is redacted as well (the shipper loads `.env`
+  itself; the shell never reads it). The lines carry artist and track names, i.e. your own listening data, sent to
+  your own Grafana Cloud, as the nightly log already does.
+- Stopping: the report and the background loop run in their own process groups and are always stopped when the
+  wrapper ends or gets SIGINT, SIGTERM or SIGHUP; a second report while one runs exits with 75.
+
+Explore (Loki data source): `{job="cowlic-report"}`; the dashboard has a `Last.fm report (live, logs only)` panel
+for it. Set the time range to the last 15 minutes while it runs.
+
 ### Run metrics (optional)
 
 Added in #105, decided in #106. Right after the log push the same step sends ONE line of Influx line protocol

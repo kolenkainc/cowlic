@@ -723,5 +723,166 @@ class ConfigTests(Base):
         self.assertEqual(f.requests, [])
 
 
+class LogsOnlyTests(Base):
+    """--job, --logs-only, follow mode (offset file, bounded batch) and the filter mode."""
+    USER = "sentinelLfmUser"
+
+    def setUp(self):
+        super().setUp()
+        self.log = Path(self.tmp.name, "lastfm-report.log")
+        self.off = Path(self.tmp.name, ".offset")
+
+    def logs_only(self, fake, offset=0, final=False, env=None, job="cowlic-report", offset_file=True, extra=()):
+        out = io.StringIO()
+        point = lambda raw, path=sg.PUSH_PATH: fake.base + path  # noqa: E731
+        with contextlib.redirect_stdout(out), mock.patch.object(sg, "validate_url", side_effect=point):
+            sg.ship_logs_only(str(self.log), offset, str(self.off) if offset_file else None, job, final,
+                              env=env or self.env(), redact=fake_redact, extra_secrets=extra)
+        return out.getvalue()
+
+    def lines_of(self, req):
+        return [v[1] for s in json.loads(req["body"])["streams"] for v in s["values"]]
+
+    def test_job_label_and_default(self):
+        self.log.write_text("one\n")
+        f = self.fake()
+        self.logs_only(f)
+        jobs = {s["stream"]["job"] for s in json.loads(f.requests[0]["body"])["streams"]}
+        self.assertEqual(jobs, {"cowlic-report"})
+        self.assertEqual(sg.build_payload(["x"], None, "info", 1, 2, "h")["streams"][0]["stream"]["job"],
+                         "cowlic-ingest")  # the nightly default
+
+    def test_job_allowlist(self):
+        for bad in ("", "Cowlic", "a b", "a\"b", "1abc", "a" * 33, 'x"}', "a;b", "../x"):
+            with self.assertRaises(Exception, msg=bad):
+                sg._job(bad)
+        self.assertEqual(sg._job("cowlic-report"), "cowlic-report")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(sg, "ship_logs_only") as m:
+            self.assertEqual(sg.main(["--logs-only", "--job", "Bad Job", "--log", "x", "--offset", "0"]), 0)
+        m.assert_not_called()
+        self.assertIn("bad arguments", out.getvalue())
+
+    def test_logs_only_sends_no_metrics_and_no_summary(self):
+        self.log.write_text("one\ntwo\n")
+        f = self.fake()
+        env = dict(self.env(), INGEST_GRAFANA_PROM_URL=f"https://{HOST}", INGEST_GRAFANA_PROM_USER="42")
+        with mock.patch.object(sg, "ship_metrics") as m:
+            self.logs_only(f, env=env)
+        m.assert_not_called()
+        self.assertEqual([r["path"] for r in f.requests], ["/loki/api/v1/push"])
+        self.assertEqual(self.lines_of(f.requests[0]), ["one", "two"])
+        self.assertFalse(any("run_summary" in ln for ln in self.lines_of(f.requests[0])))
+
+    def test_main_logs_only_needs_no_last_run(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(sg, "ship_logs_only") as m, \
+                mock.patch.object(sg, "ship") as nightly:
+            sg.main(["--logs-only", "--log", "x", "--offset", "0", "--offset-file", "o"])
+        m.assert_called_once()
+        nightly.assert_not_called()
+
+    def test_incremental_offset_moves_and_ships_each_line_once(self):
+        f = self.fake()
+        self.log.write_text("a1\na2\n")
+        self.logs_only(f)
+        self.assertEqual(self.off.read_text().strip(), str(len("a1\na2\n")))
+        self.assertEqual(oct(self.off.stat().st_mode & 0o777), "0o600")
+        with open(self.log, "a") as fh:
+            fh.write("b1\nunfinished")
+        self.logs_only(f)
+        self.assertEqual([self.lines_of(r) for r in f.requests], [["a1", "a2"], ["b1"]])
+        self.logs_only(f)  # nothing new: no push
+        self.assertEqual(len(f.requests), 2)
+        self.logs_only(f, final=True)  # the final call also takes the unfinished line
+        self.assertEqual(self.lines_of(f.requests[2]), ["unfinished"])
+
+    def test_initial_offset_skips_older_lines(self):
+        self.log.write_text("old\nnew\n")
+        f = self.fake()
+        self.logs_only(f, offset=len("old\n"))
+        self.assertEqual(self.lines_of(f.requests[0]), ["new"])
+
+    def test_failed_push_keeps_offset_for_retry_but_content_rejection_moves_on(self):
+        self.log.write_text("a\n")
+        f = self.fake(500)
+        self.logs_only(f)
+        self.assertFalse(self.off.exists())
+        g = self.fake(429)
+        self.logs_only(g)
+        self.assertFalse(self.off.exists())
+        h = self.fake(400)
+        self.logs_only(h)
+        self.assertEqual(self.off.read_text().strip(), "2")
+
+    def test_batch_is_bounded_and_cut_at_a_line(self):
+        with mock.patch.object(sg, "MAX_BATCH_BYTES", 25):
+            self.log.write_text("".join(f"line-{i:03d}\n" for i in range(10)))  # 9 bytes per line
+            f = self.fake()
+            self.logs_only(f)
+            self.assertEqual(self.lines_of(f.requests[0]), ["line-000", "line-001"])
+            self.assertEqual(self.off.read_text().strip(), "18")
+            self.logs_only(f)
+            self.assertEqual(self.lines_of(f.requests[1]), ["line-002", "line-003"])
+
+    def test_rotated_log_or_bad_offset_sends_nothing(self):
+        self.log.write_text("short\n")
+        self.off.write_text("500\n")
+        f = self.fake()
+        out = self.logs_only(f)
+        self.assertEqual(f.requests, [])
+        self.assertIn("rotated", out)
+        self.off.write_text("3\n")  # not at a line start
+        self.logs_only(f)
+        self.assertEqual(f.requests, [])
+        self.off.write_text("-1")
+        with self.assertRaises(sg.ShipError):
+            self.logs_only(f)
+
+    def test_redaction_of_extra_secret_token_and_final_guard(self):
+        self.log.write_text(f"user {self.USER} token {CANARY_TOKEN} line\n")
+        f = self.fake()
+        self.logs_only(f, extra=[self.USER])
+        body = f.requests[0]["body"].decode()
+        self.assertNotIn(self.USER, body)
+        self.assertNotIn(CANARY_TOKEN, body)
+        self.assertNotIn(self.USER.lower(), body.lower())
+        # the final guard: a redactor that lets the token through must make the push refuse
+        self.log.write_text(f"leak {CANARY_TOKEN}\n")
+        self.off.unlink()
+        g = self.fake()
+        with self.assertRaises(sg.ShipError):
+            out = io.StringIO()
+            point = lambda raw, path=sg.PUSH_PATH: g.base + path  # noqa: E731
+            with contextlib.redirect_stdout(out), mock.patch.object(sg, "validate_url", side_effect=point):
+                sg.ship_logs_only(str(self.log), 0, str(self.off), "cowlic-report", False, env=self.env(),
+                                  redact=lambda t, s: t)
+        self.assertEqual(g.requests, [])
+
+    def test_url_validation_is_reused(self):
+        self.log.write_text("a\n")
+        env = dict(self.env(), INGEST_GRAFANA_LOKI_URL="https://evil.example.com")
+        with self.assertRaises(sg.ShipError):
+            sg.ship_logs_only(str(self.log), 0, None, "cowlic-report", False, env=env, redact=fake_redact)
+
+    def test_filter_redacts_user_and_key_per_line(self):
+        src = io.BytesIO(f"hello {self.USER}\nkey {CANARY_TOKEN}\x1b[31m red\nplain\n".encode())
+        dst = io.BytesIO()
+        sg.filter_stream(src, dst, [self.USER, CANARY_TOKEN], fake_redact)
+        out = dst.getvalue().decode()
+        self.assertNotIn(self.USER, out)
+        self.assertNotIn(CANARY_TOKEN, out)
+        self.assertNotIn("\x1b", out)
+        self.assertEqual(out.count("\n"), 3)
+        self.assertIn("plain\n", out)
+
+    def test_filter_fails_closed_per_line(self):
+        def boom(text, secrets):
+            raise RuntimeError("x")
+        dst = io.BytesIO()
+        sg.filter_stream(io.BytesIO(b"secret stuff\n"), dst, ["s"], boom)
+        self.assertEqual(dst.getvalue(), b"[line withheld: redaction failed]\n")
+
+
 if __name__ == "__main__":
     unittest.main()
