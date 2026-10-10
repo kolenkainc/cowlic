@@ -3,10 +3,12 @@ import contextlib
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -20,7 +22,25 @@ from test_followed import aid, art
 from test_ingest import GOOD_URL, FixedToday, Fakes, sid, song
 
 REPO = Path(__file__).resolve().parent.parent
+REAL_SPOTDL_RUN = ingest.spotdl_run  # the guard in NoNetwork replaces the module attribute
 KEY = "k" * 32  # a well-formed fake API key (never a real one)
+
+
+class NoNetwork(unittest.TestCase):
+    """Base of every test here: a forgotten patch fails fast instead of going online (a first draft once reached the
+    real Cloudflare API through a default argument)."""
+
+    def setUp(self):
+        super().setUp()
+
+        def refuse(*a, **k):
+            raise AssertionError("a test reached the network")
+        for target, name in ((ingest, "d1_query"), (ingest, "d1_batch"), (ingest, "tg_upload"), (ingest, "tg_delete"),
+                             (ingest, "spotdl_run"), (lastfm, "_OPEN"), (urllib.request, "urlopen"),
+                             (socket.socket, "connect")):
+            p = mock.patch.object(target, name, refuse)
+            p.start()
+            self.addCleanup(p.stop)
 
 
 def lrec(artist, title, duration=None):
@@ -44,7 +64,7 @@ def lf_deps(fakes):
 SECTION = "lastfm_artists:\n  user: some_user\n"
 
 
-class ParserTest(unittest.TestCase):
+class ParserTest(NoNetwork):
     def test_full_section(self):
         cfg = ingest.parse_source_config(f"""- {GOOD_URL}
 
@@ -154,8 +174,9 @@ lastfm_artists:
         self.assertNotIn("api_key", ingest.LastfmConfig.__dataclass_fields__)
 
 
-class StateKeyTest(unittest.TestCase):
+class StateKeyTest(NoNetwork):
     def setUp(self):
+        super().setUp()
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.path = Path(self._tmp.name) / "st.json"
@@ -178,10 +199,11 @@ class StateKeyTest(unittest.TestCase):
         self.assertEqual(set(loaded.artists), {"lfm:" + "a" * 16})
 
 
-class FlowTest(unittest.TestCase):
+class FlowTest(NoNetwork):
     """run_lastfm with a fake enumerator, the real dedupe and the real run(); the state file is a real temp file."""
 
     def setUp(self):
+        super().setUp()
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.dir = Path(self._tmp.name)
@@ -338,6 +360,18 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(self.out.count("(matched by title only)"), 1)
         self.assertIn("1 matched by title only", ingest.lastfm_summary(lr))
 
+    def test_artists_with_nothing_left_after_normalising_are_skipped_and_counted(self):
+        self.assertEqual(ingest.lastfm_artist_key("!!!"), ingest.lastfm_artist_key("???"))  # why they must not run
+        self.records = {"Band 1": [lrec("Band 1", "a")]}
+        lr = self.go([rank(1, "!!!"), rank(2, "???"), rank(1), rank(3, "   ")])
+        self.assertEqual((self.calls, lr.unusable, lr.listed, lr.scanned), (["Band 1"], 3, 1, 1))
+
+    def test_a_name_with_double_colons_cannot_start_a_workflow_command_in_the_log(self):
+        self.records = {"::error::x": []}
+        self.go([rank(1, "::error::x")])
+        for line in self.out.splitlines():
+            self.assertNotIn("::", line)
+
     def test_a_record_already_in_d1_is_not_downloaded_again(self):
         r = lrec("Band 1", "a")
         self.existing.add(r["song_id"])
@@ -346,10 +380,11 @@ class FlowTest(unittest.TestCase):
         self.assertEqual((self.f.uploaded, lr.counts["exists"], lr.scanned), ([], 1, 1))
 
 
-class MainTest(unittest.TestCase):
+class MainTest(NoNetwork):
     """main() end to end with fakes for the ranking, the enumerator, D1, spotdl and the downloader."""
 
     def setUp(self):
+        super().setUp()
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.dir = Path(self._tmp.name)
@@ -359,7 +394,8 @@ class MainTest(unittest.TestCase):
         self.ranking = [rank(1), rank(2)]
         self.enum_calls, self.d1_calls, self.stored_rows, self.rank_args = [], [], [], []
 
-    def run_main(self, sources, argv=(), key=KEY, ranking_error=None, playlist_songs=None, deps=None, followed=None):
+    def run_main(self, sources, argv=(), key=KEY, ranking_error=None, playlist_songs=None, deps=None, followed=None,
+                 use_real_ranking=False, ranking_fn=None, stored_error=None):
         (self.dir / "s.yml").write_text(sources)
         env = {k: "x" for k in ingest.REQUIRED_ENV}
 
@@ -372,6 +408,8 @@ class MainTest(unittest.TestCase):
 
         def top_artists(client, user, years=5, now=None, max_artists=100, out=None):
             self.rank_args.append((user, years, max_artists))
+            if ranking_fn:
+                return ranking_fn(client, user, years, now, max_artists, out)
             if ranking_error:
                 raise ranking_error
             return list(self.ranking)
@@ -383,6 +421,8 @@ class MainTest(unittest.TestCase):
         def d1(sql, params=None):
             self.d1_calls.append(sql)
             if sql == ingest.STORED_ROWS_SQL:
+                if stored_error:
+                    raise stored_error
                 return [{"title": t, "artist": a, "duration_s": d} for t, a, d in self.stored_rows]
             return []
 
@@ -398,7 +438,7 @@ class MainTest(unittest.TestCase):
                 mock.patch.object(ingest, "real_deps", lambda ytm, thr: deps or lf_deps(self.f)), \
                 mock.patch.object(ingest, "real_lastfm_enumerator", lambda client: enumerate_artist), \
                 mock.patch.object(ingest, "real_enumerator", lambda cid, secret: lambda a, g, m: []), \
-                mock.patch.object(lastfm, "top_artists", top_artists), \
+                mock.patch.object(lastfm, "top_artists", lastfm.top_artists if use_real_ranking else top_artists), \
                 mock.patch.object(spotify_user, "get_access_token", lambda: "t"), \
                 mock.patch.object(spotify_user, "followed_artists", lambda tok: list(followed or [])), \
                 mock.patch.dict(sys.modules, {"ytmusicapi": SimpleNamespace(YTMusic=lambda: None)}), \
@@ -419,7 +459,8 @@ class MainTest(unittest.TestCase):
         sec = r["lastfm_artists"]
         self.assertEqual((sec["status"], sec["added"], r["counts"]["added"]), ("done", 3, 3))
         self.assertEqual(sec["artists"], {"listed": 2, "excluded": 0, "skipped_recent": 0, "scanned": 2, "failed": 0,
-                                          "not_started": 0, "dropped_stored": 0})
+                                          "not_started": 0, "dropped_stored": 0,
+                                          "unusable": 0})
         self.assertIn("lastfm artists: 2 ranked", self.out)
         self.assertIn("done: 3 new", self.out)
         self.assertNotIn(KEY, self.out + json.dumps(r))
@@ -445,48 +486,120 @@ class MainTest(unittest.TestCase):
         self.assertIn("LASTFM_API_KEY", self.out)
         self.assertNotIn("not a key!", self.out)
 
-    def test_private_or_failing_profile_is_a_config_error_with_exit_2(self):
-        for msg in ("no weekly charts in the window: the profile has no listening history there, or it is private",
-                    "Last.fm refused the API key (error 10)", "Last.fm rate limit exceeded after 3 retries"):
+    def test_a_failing_ranking_never_stops_the_playlists(self):
+        """Outage, 5xx, rate limit: the playlist is ingested first, the phase is a counted failure (exit 1)."""
+        for msg in ("Last.fm kept answering HTTP 503 after 3 retries", "Last.fm rate limit exceeded after 3 retries",
+                    "malformed Last.fm response: `weeklyartistchart` is missing"):
             with self.subTest(msg):
                 self.d1_calls.clear()
+                self.f.uploaded.clear()
                 code, r = self.run_main(f"- {GOOD_URL}\n{SECTION}", ranking_error=lastfm.LastfmError(msg),
                                         playlist_songs=[song(10)])
-                self.assertEqual((code, r["failure_class"], r["stop_reason"]), (2, "config", None))
+                self.assertEqual((code, r["failure_class"], r["stop_reason"]), (1, "partial", "done"))
+                self.assertEqual(self.f.uploaded, [sid(10)])
+                self.assertEqual((r["playlists"][0]["status"], r["playlists"][0]["added"]), ("done", 1))
+                self.assertEqual(r["lastfm_artists"]["status"], "failed")
+                self.assertEqual(r["counts"]["added"], 1)
                 self.assertIn(msg, self.out)
+                self.assertIn("the Last.fm phase failed", self.out)
                 self.assertNotIn("Traceback", self.out)
-                self.assertEqual((self.d1_calls, self.f.uploaded), ([], []))
+                self.assertNotIn(ingest.STORED_ROWS_SQL, self.d1_calls)
+                self.assertEqual(self.enum_calls, [])
+
+    def test_config_refusals_exit_2_but_only_after_the_playlists_ran(self):
+        cases = [lastfm.LastfmError("Last.fm: user not found (error 6)"), lastfm.LastfmError("invalid key (error 10)"),
+                 lastfm.LastfmError("profile is private (error 17)"), lastfm.LastfmError("key suspended (error 26)"),
+                 lastfm.LastfmError("no weekly charts in the window: the profile has no listening history there, or it is private"),
+                 lastfm.LastfmError("the weekly charts hold no artists: the listening history is empty or private")]
+        for e, code_ in zip(cases, (6, 10, 17, 26, None, None)):
+            e.code = code_
+            with self.subTest(str(e)):
+                self.f.uploaded.clear()
+                code, r = self.run_main(f"- {GOOD_URL}\n{SECTION}", ranking_error=e, playlist_songs=[song(10)])
+                self.assertEqual((code, r["failure_class"], r["exit_code"]), (2, "config", 2))
+                self.assertEqual(self.f.uploaded, [sid(10)])  # the playlist ran and is reported
+                self.assertEqual(r["playlists"][0]["added"], 1)
+                self.assertEqual(r["lastfm_artists"]["status"], "failed")
+                self.assertIn(str(e), self.out)
+                self.assertIn("exit code 2", self.out)
+
+    def test_the_real_top_artists_classifies_an_empty_profile_as_config(self):
+        """No fake ranking: the real top_artists with a fake fetch answering an empty chart list."""
+        def fetch(url, timeout):
+            return 200, {"weeklychartlist": {"chart": []}}
+        real = lastfm.LastfmClient
+        with mock.patch.object(lastfm, "LastfmClient", lambda k, **kw: real(k, fetch=fetch, sleep=lambda s: None, **kw)):
+            code, r = self.run_main(f"- {GOOD_URL}\n{SECTION}", use_real_ranking=True, playlist_songs=[song(10)])
+        self.assertEqual((code, r["failure_class"]), (2, "config"))
+        self.assertEqual(self.f.uploaded, [sid(10)])
 
     def test_error_text_never_contains_the_key(self):
         err = lastfm.LastfmError(f"boom {KEY}")
         code, _ = self.run_main(SECTION, ranking_error=err)
-        self.assertEqual(code, 2)
+        self.assertEqual(code, 1)
         self.assertNotIn(KEY, self.out)
 
-    def test_the_real_client_never_receives_the_key_in_a_log(self):
+    def test_the_real_client_gets_the_key_only_in_the_request_and_after_the_playlists(self):
         """No fake for the ranking: the real client gets a fake fetch that answers an invalid-key error."""
         seen = []
 
         def fetch(url, timeout):
             seen.append(url)
-            return 200, {"error": 10, "message": "Invalid API key"}
+            return 200, {"error": 10, "message": f"Invalid API key {KEY}"}
         real = lastfm.LastfmClient
-        with mock.patch.object(lastfm, "top_artists", lastfm.__dict__["top_artists"]), \
-                mock.patch.object(lastfm, "LastfmClient", lambda k, **kw: real(k, fetch=fetch, sleep=lambda s: None, **kw)):
-            (self.dir / "s.yml").write_text(SECTION)
-            res = self.dir / "r.json"
-            full = ["ingest.py", "--sources", str(self.dir / "s.yml"), "--result-json", str(res)]
-            out = io.StringIO()
-            with mock.patch.dict(os.environ, {**{k: "x" for k in ingest.REQUIRED_ENV}, "LASTFM_API_KEY": KEY}), \
-                    mock.patch("tg_check.load_env"), mock.patch.object(sys, "argv", full), \
-                    mock.patch.object(ingest, "js_runtime_problem", return_value=None), \
-                    mock.patch.object(ingest, "d1_query", side_effect=AssertionError("no work before the ranking")), \
-                    contextlib.redirect_stdout(out):
-                code = ingest.main()
-        self.assertEqual(code, 2)
-        self.assertEqual(len(seen), 1)
-        self.assertIn(KEY, seen[0])  # the key goes only into the request
-        self.assertNotIn(KEY, out.getvalue())
+        with mock.patch.object(lastfm, "LastfmClient", lambda k, **kw: real(k, fetch=fetch, sleep=lambda s: None, **kw)):
+            code, r = self.run_main(f"- {GOOD_URL}\n{SECTION}", use_real_ranking=True, playlist_songs=[song(10)])
+        self.assertEqual((code, r["failure_class"]), (2, "config"))
+        self.assertEqual((len(seen), self.f.uploaded), (1, [sid(10)]))
+        self.assertIn(KEY, seen[0])
+        self.assertNotIn(KEY, self.out + json.dumps(r))
+
+    def test_max_minutes_also_bounds_the_ranking(self):
+        now = [0.0]
+        calls = []
+
+        class FakeClient:
+            def __init__(self, key, **kw):
+                pass
+
+            def call(self, method, **params):
+                calls.append(method)
+                now[0] += 30  # every request takes 30 s
+                return {}
+
+        def top(client, user, years=5, now=None, max_artists=100, out=None):
+            for _ in range(50):
+                client.call("user.getWeeklyArtistChart", user=user)
+            return [rank(1)]
+        orig = ingest.RunLimits
+        with mock.patch.object(lastfm, "LastfmClient", FakeClient), \
+                mock.patch.object(ingest, "RunLimits", lambda n, m: orig(n, m, clock=lambda: now[0])):
+            code, r = self.run_main(f"- {GOOD_URL}\n{SECTION}", ["--max-minutes", "1"], playlist_songs=[song(10)],
+                                    ranking_fn=top)
+        self.assertEqual((code, r["stop_reason"], r["lastfm_artists"]["status"]), (0, "time", "stopped"))
+        self.assertLessEqual(len(calls), 3)  # not 50
+        self.assertEqual(self.f.uploaded, [sid(10)])
+        self.assertEqual(self.enum_calls, [])
+
+    def test_a_limit_already_hit_skips_the_ranking_altogether(self):
+        code, r = self.run_main(f"- {GOOD_URL}\n{SECTION}", ["--max-new", "1"], playlist_songs=[song(10), song(11)])
+        self.assertEqual((code, r["stop_reason"], r["lastfm_artists"]["status"], self.rank_args), (0, "cap", "stopped", []))
+
+    def test_a_d1_error_reading_the_stored_rows_is_a_counted_failure_not_a_traceback(self):
+        code, r = self.run_main(f"- {GOOD_URL}\n{SECTION}", playlist_songs=[song(10)],
+                                stored_error=ingest.IngestError(f"D1 API error 500 {KEY}"))
+        self.assertEqual((code, r["failure_class"], r["stop_reason"]), (1, "partial", "done"))
+        self.assertEqual(self.f.uploaded, [sid(10)])
+        self.assertEqual((r["lastfm_artists"]["status"], r["counts"]["added"]), ("failed", 1))
+        self.assertIn("ERROR lastfm phase failed: IngestError: D1 API error 500", self.out)
+        self.assertNotIn(KEY, self.out)
+        self.assertEqual(self.enum_calls, [])
+
+    def test_a_sign_in_during_the_phase_is_not_swallowed_by_the_failure_catch(self):
+        deps = lf_deps(self.f)
+        deps.download = mock.Mock(side_effect=ingest.YouTubeSignInRequired("YouTube asks to sign in (bot check)"))
+        code, r = self.run_main(SECTION, deps=deps)
+        self.assertEqual((code, r["failure_class"]), (3, "youtube-sign-in"))
 
     def test_disabled_section_needs_no_key_and_runs_nothing_extra(self):
         code, r = self.run_main(f"- {GOOD_URL}\nlastfm_artists:\n  enabled: false\n", key=None, playlist_songs=[song(10)])
@@ -570,6 +683,27 @@ class MainTest(unittest.TestCase):
         code, r = self.run_main(SECTION, deps=deps)
         self.assertEqual((code, r["lastfm_artists"]["matched_title_only"], r["counts"]["matched_title_only"]), (0, 3, 3))
         self.assertIn("3 matched by title only", self.out)
+
+
+class SpotdlEnvTest(NoNetwork):
+    """The spotdl child process must never see the Last.fm key (it needs no Last.fm access)."""
+
+    CODE = "import os; print('SEEN' if 'LASTFM_API_KEY' in os.environ else 'HIDDEN')"
+
+    def child_says(self, hidden):
+        env = {"SPOTIFY_CLIENT_ID": "cid", "SPOTIFY_CLIENT_SECRET": "csecret", "LASTFM_API_KEY": KEY}
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, env), \
+                mock.patch.object(ingest, "SPOTDL_CMD", [sys.executable, "-c", self.CODE]), \
+                mock.patch.object(ingest, "SPOTDL_HIDDEN_ENV", hidden):
+            _, tail = REAL_SPOTDL_RUN(["save", "u"], Path(d))
+        return tail
+
+    def test_the_child_does_not_see_the_key(self):
+        self.assertEqual(self.child_says(ingest.SPOTDL_HIDDEN_ENV), "HIDDEN")
+        self.assertIn("LASTFM_API_KEY", ingest.SPOTDL_HIDDEN_ENV)
+
+    def test_the_check_can_fail(self):
+        self.assertEqual(self.child_says(ingest.SPOTDL_HIDDEN_ENV - {"LASTFM_API_KEY"}), "SEEN")
 
 
 class LazyImportTest(unittest.TestCase):

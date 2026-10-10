@@ -661,7 +661,7 @@ and with `followed_artists`; the playlists run first, then the followed artists,
 # lastfm_artists:
 #   enabled: true         # default true
 #   user: <last.fm user>  # required when enabled: 2-15 letters, digits, _ or -, not a URL
-#   years: 5              # listening window, 1..10; default 5 (a window over 7 years may exceed the client's request budget)
+#   years: 5              # listening window, 1..10; default 5 (about 53 weekly-chart requests per year)
 #   max_artists: 100      # size of the ranking, 1..10000 (Last.fm client limit: 1000); default 100
 #   rescan_days: 7        # a fully scanned artist is looked at again after this many days, 0..3650; default 7
 #   exclude:              # artist names, compared case-insensitively without punctuation; one per line, as is
@@ -670,11 +670,18 @@ and with `followed_artists`; the playlists run first, then the followed artists,
 
 Same strictness as `followed_artists`: two-space keys, four-space list items, unknown or repeated keys, inline
 comments and quotes are errors. The API key is NOT a `sources.yml` key: set `LASTFM_API_KEY` in `.env` (never
-logged). A missing or malformed key, a private or empty profile, or a Last.fm refusal ends the run with exit 2 before
-any work (`config`). The ranking is read at the start of every run and not cached (Last.fm caching follows response
-headers, which the client does not read); a per-artist failure is counted (exit 1) and the others go on. The result
+logged, and hidden from the spotdl child process). A missing or malformed key ends the run with exit 2 before any work
+(`config`). The ranking is read AFTER the playlists and followed artists, so a Last.fm problem never stops them; it is
+not cached (Last.fm caching follows response headers, which the client does not read) and `--max-minutes` bounds it
+too. If Last.fm refuses it for a reason only you can fix (unknown user, invalid or suspended key, private or empty
+profile: error codes 6, 10, 17, 26) the playlists are still ingested and reported, then the run exits 2 (`config`);
+an outage, 5xx or rate limit, or a D1 error while reading the stored rows, is a failed Last.fm phase (exit 1, result
+status `failed`). A per-artist failure is counted (exit 1) and the others go on. The result
 JSON gets an additive `lastfm_artists` object (counts only, including `dropped_stored`); title-only matches are
 counted in `matched_title_only` and logged as `(matched by title only)`.
+
+The 21:10 nightly timer must not use the `lastfm_artists` section (the first run is slow and unbounded by default);
+a separate bootstrap process comes in Release 3 (#163, #168).
 
 Known limitations:
 

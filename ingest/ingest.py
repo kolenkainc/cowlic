@@ -556,7 +556,7 @@ def tg_delete(message_id: int) -> None:
     tg_check._send(req)
 
 SPOTDL_HIDDEN_ENV = {"TG_BOT_TOKEN", "TG_CHANNEL_ID", "INGEST_CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_TOKEN",
-                     "CLOUDFLARE_ACCOUNT_ID", "D1_DATABASE_ID", "SPOTIFY_USER_REFRESH_TOKEN"}
+                     "CLOUDFLARE_ACCOUNT_ID", "D1_DATABASE_ID", "SPOTIFY_USER_REFRESH_TOKEN", "LASTFM_API_KEY"}
 TAIL_LINES = 15  # lines of spotdl output kept in an error, so a YouTube block stays diagnosable
 LINE_MAX = 400
 # spotdl hides the real yt-dlp error (logger.debug(exception)) below DEBUG, and always prints its "Some YouTube
@@ -1246,6 +1246,8 @@ def followed_summary(fr: FollowedRun) -> str:
 class LastfmRun(FollowedRun):
     """What the Last.fm phase did (the counters of FollowedRun; `deferred` stays 0: max_artists sizes the ranking)."""
     dropped_stored: int = 0     # records dropped because the same track is already stored under another id
+    unusable: int = 0           # ranked artists skipped: nothing left of the name after normalising
+    config_error: bool = False  # the ranking was refused for a reason only the owner can fix (exit 2 after the playlists)
 
 
 def lastfm_artist_key(name: str) -> str:
@@ -1277,6 +1279,9 @@ def run_lastfm(lr: LastfmRun, cfg: LastfmConfig, artists: list[dict],
     import lastfm
     first: dict[str, dict] = {}
     for a in artists:
+        if not normalize(a["name"]):  # "!!!" and "???" would share one state key: skipped and counted
+            lr.unusable += 1
+            continue
         first.setdefault(lastfm_artist_key(a["name"]), a)  # first (best ranked) occurrence wins
     lr.listed = len(first)
     excluded = {normalize(x) for x in cfg.exclude}
@@ -1292,7 +1297,7 @@ def run_lastfm(lr: LastfmRun, cfg: LastfmConfig, artists: list[dict],
             lr.status, lr.not_started = "stopped", left
             log(f"stopped: {limits.stop_reason}: limit reached; {left} artist(s) not started; the next run continues")
             return
-        label = printable(a["name"])
+        label = printable(a["name"]).replace("::", ":?")  # no "::" in a log line from outside data
         try:
             songs = enumerate_artist(a)
             result = dedupe_mod.collapse(songs, collect_pairs=True)
@@ -1347,7 +1352,8 @@ def lastfm_summary(lr: LastfmRun) -> str:
 # {status: done | stopped | interrupted, the track counts of the artist phase, artists: {listed, excluded,
 # skipped_recent, deferred, scanned, failed, not_started}}; its track counts are also part of `counts`.
 # Added in #152 (additive, only when sources.yml has an enabled lastfm_artists section): `lastfm_artists` = the same
-# shape, artists: {listed, excluded, skipped_recent, scanned, failed, not_started, dropped_stored}; its counts (and
+# shape, artists: {listed, excluded, skipped_recent, scanned, failed, not_started, dropped_stored, unusable}; status
+# `failed` when the ranking or the stored-rows read failed (exit 1, or 2 for a refusal only the owner can fix); its counts (and
 # its `matched_title_only`) are also part of `counts`.
 RESULT_COUNT_KEYS = ("added", "skipped", "no_match", "too_big", "failed", "not_attempted", "cooldown")
 
@@ -1405,7 +1411,7 @@ def build_result(urls: list[str], results: dict | None, interrupted: YouTubeSign
                           "artists": {"listed": lastfm.listed, "excluded": lastfm.excluded,
                                       "skipped_recent": lastfm.recent, "scanned": lastfm.scanned,
                                       "failed": lastfm.failed, "not_started": lastfm.not_started,
-                                      "dropped_stored": lastfm.dropped_stored}}
+                                      "dropped_stored": lastfm.dropped_stored, "unusable": lastfm.unusable}}
         counts = {k: counts[k] + lastfm_section[k] for k in RESULT_COUNT_KEYS}
     title_only = sum(p.get("matched_title_only", 0)
                      for p in (*playlists, *[x for x in (section, lastfm_section) if x]))
@@ -1417,6 +1423,8 @@ def build_result(urls: list[str], results: dict | None, interrupted: YouTubeSign
         cls = "none"
     elif exit_code == EXIT_YOUTUBE_SIGN_IN:
         cls = FAILURE_YOUTUBE_SIGN_IN
+    elif exit_code == EXIT_CONFIG:  # only the Last.fm ranking is refused after the playlists ran (#152)
+        cls = "config"
     elif results is not None:
         cls = "partial"
     else:
@@ -1506,25 +1514,90 @@ def positive_float(text: str) -> float:
     return v
 
 
-def open_lastfm(cfg: LastfmConfig, sources: Path | None) -> tuple[list[dict], Callable | None, int]:
-    """(ranking, enumerator, 0), or ([], None, EXIT_CONFIG) after logging why the Last.fm source cannot run: no or a
-    malformed LASTFM_API_KEY, an unknown/private/empty profile, a refused or failing Last.fm. Messages come from the
-    client already redacted and name the variable, never its value. Imports ingest/lastfm*.py lazily (only here)."""
+def prepare_lastfm(cfg: LastfmConfig, sources: Path | None):
+    """(client, 0), or (None, EXIT_CONFIG) after logging why the Last.fm source cannot run. Offline checks only: no
+    or a malformed LASTFM_API_KEY, an invalid user name. Nothing is fetched here: the ranking is read by
+    run_lastfm_phase AFTER the playlists, so a Last.fm problem can never stop them. Messages name the variable,
+    never its value. Imports ingest/lastfm.py lazily (only here)."""
     import lastfm
-    key = ""
     try:
         key = lastfm.api_key_from_env()
+        lastfm.parse_user(cfg.user)
         # one client for the run: the ranking needs about 53 requests per year, each artist has its own budget
         budget = 1 + cfg.years * lastfm.WEEKS_PER_YEAR_BOUND + 4 + cfg.max_artists * LASTFM_ARTIST_CALLS
-        client = lastfm.LastfmClient(key, max_calls=budget, out=log)
-        ranking = lastfm.top_artists(client, cfg.user, cfg.years, max_artists=cfg.max_artists, out=log)
+        return lastfm.LastfmClient(key, max_calls=budget, out=log), 0
     except lastfm.LastfmError as e:
-        log(f"ERROR cannot read the Last.fm ranking: {redact(str(e), [key])}; lastfm_artists is enabled in {sources}: "
-            f"set LASTFM_API_KEY in .env (docs/local-ingest.md), check the user name and that the profile is public, "
-            f"or set `enabled: false` in the lastfm_artists section; exit code {EXIT_CONFIG}")
-        return [], None, EXIT_CONFIG
+        log(f"ERROR lastfm_artists is enabled in {sources} but cannot run: {e}; set LASTFM_API_KEY in .env "
+            f"(docs/local-ingest.md) and check `user`, or set `enabled: false` in the lastfm_artists section; "
+            f"exit code {EXIT_CONFIG}")
+        return None, EXIT_CONFIG
+
+
+class RankingStopped(Exception):
+    """--max-minutes ran out while the ranking was being read."""
+
+
+class DeadlineClient:
+    """Wraps the Last.fm client for the ranking only: every request first checks the run's limits, so --max-minutes
+    also bounds the ranking (about 260 requests at 1 per second)."""
+
+    def __init__(self, client, limits: "RunLimits | None"):
+        self._client, self._limits = client, limits
+
+    def call(self, method: str, **params):
+        if self._limits and self._limits.exhausted():
+            raise RankingStopped()
+        return self._client.call(method, **params)
+
+
+LASTFM_CONFIG_CODES = (6, 10, 17, 26)  # unknown user, invalid key, private/refused profile, suspended key
+LASTFM_EMPTY_PROFILE = ("no weekly charts in the window", "the weekly charts hold no artists")  # lastfm.top_artists
+
+
+def lastfm_config_problem(e: Exception) -> bool:
+    """True for a refusal only the owner can fix (exit 2): Last.fm codes 6, 10, 17, 26, or an empty/private profile.
+    An outage, 5xx, rate limit or malformed answer is a failure of the phase (exit 1) instead."""
+    return getattr(e, "code", None) in LASTFM_CONFIG_CODES or str(e).startswith(LASTFM_EMPTY_PROFILE)
+
+
+def run_lastfm_phase(lr: LastfmRun, cfg: LastfmConfig, client, deps: Deps, existing: set, covers: dict, work: Path,
+                     dry: bool, limits: RunLimits, state: RunState) -> None:
+    """The Last.fm phase, run after the playlists and followed artists: ranking, stored rows, artists. Every failure
+    that is not a sign-in challenge is logged (redacted, one line) and ends the phase with status `failed`; the
+    playlist results and everything already uploaded stay. `lr.config_error` marks a refusal for exit 2."""
+    import lastfm
+    key = os.environ.get("LASTFM_API_KEY", "")
+    if limits.stop_reason or limits.exhausted():  # no point in a 5 minute ranking
+        lr.status = "stopped"
+        log("stopped: limit reached before the Last.fm ranking was read; the next run continues")
+        return
+    try:
+        ranking = lastfm.top_artists(DeadlineClient(client, limits), cfg.user, cfg.years, max_artists=cfg.max_artists,
+                                     out=log)
+    except RankingStopped:
+        limits.stop("time")
+        lr.status = "stopped"
+        log("stopped: time: --max-minutes limit reached while the Last.fm ranking was read; the next run continues")
+        return
+    except (lastfm.LastfmError, OSError) as e:
+        lr.status = "failed"
+        text = redact(str(e), [key])
+        if lastfm_config_problem(e):
+            lr.config_error = True
+            log(f"ERROR cannot read the Last.fm ranking: {text}; check LASTFM_API_KEY, the user name and that the "
+                f"profile is public, or set `enabled: false` in the lastfm_artists section; exit code {EXIT_CONFIG}")
+        else:
+            log(f"ERROR cannot read the Last.fm ranking: {text}; the playlists are not affected; the next run tries again")
+        return
     log(f"lastfm artists: {len(ranking)} ranked over the last {cfg.years} year(s)")
-    return ranking, real_lastfm_enumerator(client), 0
+    try:
+        run_lastfm(lr, cfg, ranking, real_lastfm_enumerator(client), read_stored_rows(d1_query), deps, existing,
+                   covers, work, dry, limits, state)
+    except YouTubeSignInRequired:
+        raise
+    except (IngestError, OSError) as e:  # for example a D1 error while reading the stored rows
+        lr.status = "failed"
+        log(f"ERROR lastfm phase failed: {type(e).__name__}: {redact(str(e), [key])}")
 
 
 def execute(args: argparse.Namespace, state: dict) -> int:
@@ -1570,10 +1643,9 @@ def execute(args: argparse.Namespace, state: dict) -> int:
         log(f"followed artists: {len(followed_artists_list)} listed by Spotify")
 
     lastfm_cfg = config.lastfm if config.lastfm and config.lastfm.enabled else None
-    lastfm_ranking: list[dict] = []
-    lastfm_enumerate = None
-    if lastfm_cfg:  # before any work: no key, a bad user or a private/empty profile is a config error, nothing runs
-        lastfm_ranking, lastfm_enumerate, code = open_lastfm(lastfm_cfg, args.sources)
+    lastfm_client = None
+    if lastfm_cfg:  # before any work, offline checks only: no or a malformed key, an invalid user is a config error
+        lastfm_client, code = prepare_lastfm(lastfm_cfg, args.sources)
         if code:
             return code
 
@@ -1611,8 +1683,8 @@ def execute(args: argparse.Namespace, state: dict) -> int:
             if lastfm_cfg:
                 lr = state["lastfm"] = LastfmRun()
                 try:
-                    run_lastfm(lr, lastfm_cfg, lastfm_ranking, lastfm_enumerate, read_stored_rows(d1_query),
-                               deps, existing, covers, work, args.dry_run, limits, track_state)
+                    run_lastfm_phase(lr, lastfm_cfg, lastfm_client, deps, existing, covers, work, args.dry_run,
+                                     limits, track_state)
                 except YouTubeSignInRequired as e:
                     e.results, e.playlists_not_attempted = results, 0
                     raise
@@ -1630,14 +1702,18 @@ def execute(args: argparse.Namespace, state: dict) -> int:
              for k in (*COUNT_KEYS, "cooldown", "matched_title_only")}
     broken = len(results) - len(ok)
     artists_failed = (fr.failed if fr else 0) + (lr.failed if lr else 0)
+    phase_failed = bool(lr and lr.status == "failed")
     if fr:
         log(followed_summary(fr))
     if lr:
         log(lastfm_summary(lr))
     log(f"done: {summary(total)}" + (f"; {broken} playlist(s) could not be read" if broken else "")
-        + (f"; {artists_failed} artist(s) could not be enumerated" if artists_failed else ""))
+        + (f"; {artists_failed} artist(s) could not be enumerated" if artists_failed else "")
+        + ("; the Last.fm phase failed" if phase_failed else ""))
     log(f"stop reason: {stop_reason(results, None, limits)}")
-    return 1 if broken or total["failed"] or artists_failed else 0
+    if lr and lr.config_error:  # the playlists ran and are reported; the owner must fix the Last.fm side
+        return EXIT_CONFIG
+    return 1 if broken or total["failed"] or artists_failed or phase_failed else 0
 
 
 if __name__ == "__main__":
