@@ -74,7 +74,7 @@ def roundtrip(token: str, chat_id: str, path: Path) -> None:
                                  headers={"content-type": f"multipart/form-data; boundary={boundary}"})
     msg = _send(req)["result"]
     audio = msg["audio"]
-    print(f"uploaded: message_id={msg['message_id']} size={audio.get('file_size')} bytes")
+    print(f"uploaded: message_id={msg['message_id']} file_id={audio['file_id']} size={audio.get('file_size')} bytes")
 
     info = call(token, "getFile", file_id=audio["file_id"])["result"]
     with urllib.request.urlopen(f"{API}/file/bot{token}/{info['file_path']}", timeout=120) as r:
