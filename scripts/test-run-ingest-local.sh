@@ -33,6 +33,7 @@ SH
   # Stub python: records its args, prints a line, optionally sleeps, exits with STUB_RC.
   cat > "$R/ingest/.venv/bin/python" <<'PY'
 #!/bin/sh
+[ "${1:-}" != -I ] || exec python3 "$@"  # the wrapper validates the result JSON with `python -I -c ...`
 echo "$@" > "$STUB_ARGS_FILE"
 if [ -e /proc/self/fd/9 ]; then echo leaked > "$STUB_ARGS_FILE.fd9"; fi
 echo "stub ingest output"
@@ -177,6 +178,11 @@ assert "last-run: crash (no result), stale result not used" "$([ "$(jget failure
 
 new_case lr_garbage; STUB_RC=1; STUB_RESULT="not json, class partial"; export STUB_RC STUB_RESULT; run
 assert "last-run: garbage result is dropped, still valid JSON" "$(valid_json && [ "$(jget result)" = null ] && [ "$(jget failure_class)" = crash ] && echo 0 || echo 1)"
+
+for bad in '{garbage}' "$RES_OK"$'\n'"$RES_OK" "$RES_OK junk}"; do
+  new_case lr_bad; STUB_RC=1; STUB_RESULT="$bad"; export STUB_RC STUB_RESULT; run
+  assert "last-run: invalid result ($(printf '%.12s' "$bad")) gives valid JSON, result null, crash" "$(valid_json && [ "$(jget result)" = null ] && [ "$(jget failure_class)" = crash ] && echo 0 || echo 1)"
+done
 
 STUB_RC=0; STUB_RESULT=""; export STUB_RC STUB_RESULT
 new_case lr_novenv; rm -rf "$R/ingest/.venv"; run

@@ -60,7 +60,13 @@ write_last_run() { # exit_code
   local rc="$1" class="none" result="null" tmp
   if [ -s "$RESULT" ]; then
     result="$(<"$RESULT")"
+    # Must be one valid JSON object, checked with the venv python (bounded by timeout); without a usable
+    # venv python or on any doubt the result is dropped (null), so last-run.json is always valid JSON.
     case "$result" in "{"*"}") ;; *) result="null" ;; esac
+    if [ "$result" != null ]; then
+      if [ -x "$VENV_PY" ] && timeout 10 "$VENV_PY" -I -c 'import json,sys; assert isinstance(json.load(sys.stdin), dict)' \
+        < "$RESULT" > /dev/null 2>&1; then :; else result="null"; fi
+    fi
     class="$(printf '%s' "$result" | sed -n 's/.*"failure_class": *"\([a-z-]*\)".*/\1/p')"
   fi
   case "$class" in none | partial | config | youtube-sign-in) ;; *) class="" ;; esac
