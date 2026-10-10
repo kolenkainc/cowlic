@@ -8,11 +8,14 @@ or an exception message) and the exit code is always 0. No retry; the next run i
 
 Config (local .env through tg_check.load_env, or the environment; key NAMES only here):
   INGEST_GRAFANA_LOKI_URL, INGEST_GRAFANA_LOKI_USER, INGEST_GRAFANA_TOKEN. Any missing: one line, nothing sent.
+  Optional run metrics (one Influx line protocol push per run): INGEST_GRAFANA_PROM_URL and INGEST_GRAFANA_PROM_USER
+  (the token is shared). Both absent: no metrics. Sent after the log push, only when the log step is configured.
 
 What leaves the machine: the part of ingest.log written since the run started (bytes from --offset, already
 redacted by ingest; redacted again here with the token as an extra secret, control characters dropped, long
 lines cut, line count capped) plus one `run_summary` logfmt line built only from allowlisted fields of
 last-run.json. Labels: job, host, level.
+Metrics: numbers only, taken from the same validated fields (see metrics_line); tags job and host, nothing per track.
 """
 import argparse
 import base64
@@ -30,6 +33,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 PUSH_PATH = "/loki/api/v1/push"
+METRICS_PATH = "/api/v1/push/influx/write"
 HOST_RE = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)*\.grafana\.net")
 REQUEST_TIMEOUT_S = 5
 OVERALL_DEADLINE_S = 15
@@ -64,7 +68,7 @@ def strict_json(data: bytes):
     return json.loads(data.decode("utf-8"), parse_constant=_no_constant)
 
 
-def validate_url(raw: str) -> str:
+def validate_url(raw: str, path: str = PUSH_PATH) -> str:
     """Return the full push URL, or raise ShipError. https only, host ends in .grafana.net, no userinfo, no
     query or fragment, port 443 or none, path empty or the push path (appended when absent)."""
     try:
@@ -82,9 +86,9 @@ def validate_url(raw: str) -> str:
         raise ShipError("unexpected port")
     if u.query or u.fragment:
         raise ShipError("url has a query or fragment")
-    if u.path not in ("", "/", PUSH_PATH):
+    if u.path not in ("", "/", path):
         raise ShipError("unexpected url path")
-    return f"https://{host}{PUSH_PATH}"
+    return f"https://{host}{path}"
 
 
 def read_config(env=os.environ) -> tuple[str, str, str]:
@@ -96,6 +100,19 @@ def read_config(env=os.environ) -> tuple[str, str, str]:
         if CONTROL_RE.search(v) or v != v.strip() or not v.isascii() or ":" in user:
             raise ShipError("invalid credentials format")
     return validate_url(url), user, token
+
+
+def read_metrics_config(env, token: str) -> tuple[str, str] | None:
+    """(push URL, Basic auth value) for the metrics push, None when metrics are not asked for (both keys absent).
+    Raises ShipError for one key alone or a bad value."""
+    url, user = env.get("INGEST_GRAFANA_PROM_URL", ""), env.get("INGEST_GRAFANA_PROM_USER", "")
+    if not url and not user:
+        return None
+    if not (url and user):
+        raise ShipError("not configured")
+    if CONTROL_RE.search(user) or user != user.strip() or not user.isascii() or ":" in user:
+        raise ShipError("invalid credentials format")
+    return validate_url(url, METRICS_PATH), "Basic " + base64.b64encode(f"{user}:{token}".encode()).decode()
 
 
 def read_run_text(log_path: str, offset: int) -> tuple[str, int]:
@@ -224,6 +241,20 @@ def summary_line(run: dict) -> str:
     return "run_summary " + " ".join(parts)
 
 
+def metrics_line(run: dict, host: str) -> str:
+    """One Influx line protocol line. Measurement cowlic_ingest, tags job and host, integer gauges only: every
+    field becomes the series cowlic_ingest_<field>. Values come from parse_last_run (validated ints and a fixed
+    failure class list); the host passed the label regex. No timestamp: the server stamps it."""
+    dur = max(0, int((run["finished"] - run["started"]).total_seconds()))
+    fields = {"last_run_timestamp_seconds": int(run["finished"].timestamp()),
+              "success": 1 if run["exit_code"] == 0 else 0, "exit_code": run["exit_code"],
+              "duration_seconds": dur}
+    fields.update({k: run["counts"][k] for k in COUNT_KEYS if k in run["counts"]})
+    for cls in FAILURE_CLASSES[1:]:  # "none" is the absence of the others
+        fields["failure_" + cls.replace("-", "_")] = 1 if run["failure_class"] == cls else 0
+    return f"cowlic_ingest,job=cowlic-ingest,host={host} " + ",".join(f"{k}={v}i" for k, v in fields.items()) + "\n"
+
+
 def host_label() -> str:
     h = socket.gethostname()
     return h if re.fullmatch(r"[A-Za-z0-9._-]{1,63}", h) else "unknown"
@@ -257,12 +288,12 @@ def make_opener() -> urllib.request.OpenerDirector:
     return op
 
 
-def post(url: str, body: bytes, auth: str, opener=None) -> str:
+def post(url: str, body: bytes, auth: str, opener=None, content_type: str = "application/json") -> str:
     """One POST, no retry. Returns a class-only result string ("ok (HTTP 204)", "failed (HTTP 429)",
     "failed (URLError)"); never raises, never echoes the URL or an exception message."""
     opener = opener or make_opener()
     req = urllib.request.Request(url, data=body, method="POST", headers={
-        "Content-Type": "application/json", "Authorization": auth, "User-Agent": "cowlic-ingest"})
+        "Content-Type": content_type, "Authorization": auth, "User-Agent": "cowlic-ingest"})
     result: list[str] = []
 
     def work():
@@ -295,7 +326,7 @@ def ship(log_path: str, offset: int, last_run_path: str, env=os.environ, opener=
     lines = sanitize_lines(text, [token, auth.split(" ", 1)[1]], redact)
     if omitted:
         lines.insert(0, f"grafana: {omitted} bytes omitted at the start of this run's log")
-    summary, level = None, "info"
+    summary, level, run = None, "info", None
     try:
         run = parse_last_run(last_run_path, started_at)
         summary, level = summary_line(run), ("info" if run["exit_code"] == 0 else "error")
@@ -318,10 +349,35 @@ def ship(log_path: str, offset: int, last_run_path: str, env=os.environ, opener=
         return body
 
     result = post(url, encode(lines, summary), auth, opener)
-    say(f"loki push {result}")
+    status, followup = [f"loki push {result}"], None
     if result in ("failed (HTTP 400)", "failed (HTTP 413)") and lines and summary is not None:
         # the body was probably rejected for its content or size: one small push with just the summary
-        say(f"summary-only push {post(url, encode([], summary), auth, opener)}")
+        followup = f"summary-only push {post(url, encode([], summary), auth, opener)}"
+    try:  # optional and isolated: whatever happens here only changes the status line
+        sent = ship_metrics(env, token, run, host, opener)
+        if sent is not None:
+            status.append(f"metrics push {sent}")
+    except ShipError as e:
+        status.append(f"metrics skipped ({e})")
+    except Exception as e:  # noqa: BLE001 - class name only
+        status.append(f"metrics failed ({type(e).__name__})")
+    say("; ".join(status))  # the wrapper logs only the first line, so everything is on it
+    if followup:
+        say(followup)
+
+
+def ship_metrics(env, token: str, run, host: str, opener=None) -> str | None:
+    """Push the run's numbers. None: not asked for. Raises ShipError when asked for but impossible."""
+    cfg = read_metrics_config(env, token)
+    if cfg is None:
+        return None
+    if run is None:
+        raise ShipError("no last-run.json for this run")
+    url, auth = cfg
+    body = metrics_line(run, host).encode()
+    if any(s.encode() in body for s in (token, auth.split(" ", 1)[1])):  # last guard on the exact bytes sent
+        raise ShipError("secret found in payload, not sent")
+    return post(url, body, auth, opener, content_type="text/plain")
 
 
 def main(argv: list[str]) -> int:
