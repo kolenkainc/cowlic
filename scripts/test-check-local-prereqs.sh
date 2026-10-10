@@ -16,12 +16,13 @@ assert() { # name, condition result
 # new_case NAME: fresh fake root + bin with only the tools the script needs (grep, head via symlinks).
 new_case() {
   C="$TMP/$1"; mkdir -p "$C/bin" "$C/root/ingest/.venv/bin"
-  for t in grep head; do ln -s "$(command -v "$t")" "$C/bin/$t"; done
+  for t in grep head timeout; do ln -s "$(command -v "$t")" "$C/bin/$t"; done
   for t in ffmpeg flock; do printf '#!/bin/sh\nexit 0\n' > "$C/bin/$t"; chmod +x "$C/bin/$t"; done
   set_deno "$1" 2.9.5
   # Venv python stub: succeeds for every -c check unless the module name is in STUB_BAD_MOD.
   cat > "$C/root/ingest/.venv/bin/python" <<'PY'
 #!/bin/sh
+case "$2" in *version_info*) [ -z "${STUB_OLD_PY:-}" ] || exit 1 ;; esac
 case "$2" in *"import ${STUB_BAD_MOD:-@@}"*) exit 1 ;; esac
 exit 0
 PY
@@ -77,7 +78,55 @@ assert ".env key missing: names the key" "$(grep -q 'TG_CHANNEL_ID' <<<"$OUT"; e
 new_case noenv; rm "$TMP/noenv/root/.env"; run noenv
 assert ".env missing: exit 1" "$([ "$RC" = 1 ]; echo $?)"
 
-# Values must never be printed.
+# .env edge cases, mirroring tg_check.load_env + ingest.py (empty value = missing, export not accepted).
+env_case() { # name, sed expression applied to .env
+  new_case "$1"; sed -i "$2" "$TMP/$1/root/.env"; run "$1"
+}
+env_case empty 's/^TG_BOT_TOKEN=x/TG_BOT_TOKEN=/'
+assert ".env empty value: exit 1" "$([ "$RC" = 1 ]; echo $?)"
+assert ".env empty value: names key" "$(grep -q 'MISSING  .env.*TG_BOT_TOKEN' <<<"$OUT"; echo $?)"
+env_case blank 's/^TG_BOT_TOKEN=x/TG_BOT_TOKEN=   /'
+assert ".env blank value: exit 1" "$([ "$RC" = 1 ]; echo $?)"
+env_case export 's/^TG_BOT_TOKEN=x/export TG_BOT_TOKEN=x/'
+assert ".env export form: exit 1" "$([ "$RC" = 1 ]; echo $?)"
+assert ".env export form: hint" "$(grep -q "export' is not supported" <<<"$OUT"; echo $?)"
+env_case spaced 's/^TG_BOT_TOKEN=x/  TG_BOT_TOKEN = x/'
+assert ".env leading space and spaced = accepted" "$([ "$RC" = 0 ]; echo $?)"
+env_case commented 's/^TG_BOT_TOKEN=x/#TG_BOT_TOKEN=x/'
+assert ".env commented key: exit 1" "$([ "$RC" = 1 ]; echo $?)"
+env_case indcomm 's/^TG_BOT_TOKEN=x/  # TG_BOT_TOKEN=x/'
+assert ".env indented comment: exit 1" "$([ "$RC" = 1 ]; echo $?)"
+env_case prefix 's/^TG_BOT_TOKEN=x/XTG_BOT_TOKEN=x/'
+assert ".env prefix match not counted: exit 1" "$([ "$RC" = 1 ]; echo $?)"
+env_case firstwins 's/^TG_BOT_TOKEN=x/TG_BOT_TOKEN=\nTG_BOT_TOKEN=x/'
+assert ".env first definition wins (empty then set): exit 1" "$([ "$RC" = 1 ]; echo $?)"
+
+# Version and python edge cases.
+new_case rc; set_deno rc 2.4.0-rc.1; run rc
+assert "deno 2.4.0-rc.1 accepted" "$([ "$RC" = 0 ]; echo $?)"
+new_case oldpy; run_old() { set +e; OUT="$(STUB_OLD_PY=1 PATH="$TMP/oldpy/bin" CHECK_REPO_ROOT="$TMP/oldpy/root" "$BASH_BIN" "$SCRIPT" 2>&1)"; RC=$?; set -e; }; run_old
+assert "python < 3.10 (venv): exit 1" "$([ "$RC" = 1 ]; echo $?)"
+assert "python < 3.10 (venv): message" "$(grep -q 'MISSING  python:' <<<"$OUT"; echo $?)"
+new_case fb; rm -rf "$TMP/fb/root/ingest/.venv"; printf '#!/bin/sh\nexit 0\n' > "$TMP/fb/bin/python3"; chmod +x "$TMP/fb/bin/python3"; run fb
+assert "no venv, python3 present: only venv MISSING" "$([ "$(grep -c MISSING <<<"$OUT")" = 1 ]; echo $?)"
+new_case fbold; rm -rf "$TMP/fbold/root/ingest/.venv"; printf '#!/bin/sh\nexit 1\n' > "$TMP/fbold/bin/python3"; chmod +x "$TMP/fbold/bin/python3"; run fbold
+assert "no venv, python3 too old: reported" "$(grep -q 'MISSING  python3' <<<"$OUT"; echo $?)"
+new_case nopy; rm -rf "$TMP/nopy/root/ingest/.venv"; run nopy
+assert "no venv, no python3: reported" "$(grep -q 'MISSING  python3: not on PATH' <<<"$OUT"; echo $?)"
+
+# Drift: the script's copies must equal the ones in ingest/ingest.py.
+req_list() { sed -n '/^REQUIRED_ENV *[=]/,/[])]/p' "$1" | sed 's/^REQUIRED_ENV *=//' | grep -o '[A-Z][A-Z0-9_]*' | tr '\n' ' '; }
+[ -n "$(req_list "$ROOT/ingest/ingest.py")" ] || { echo "FAIL could not extract REQUIRED_ENV from ingest.py"; failures=$((failures + 1)); }
+assert "REQUIRED_ENV matches ingest.py" "$([ "$(req_list "$ROOT/ingest/ingest.py")" = "$(req_list "$SCRIPT")" ]; echo $?)"
+py_min="$(sed -n 's/^MIN_DENO = (\([0-9]*\), \([0-9]*\), \([0-9]*\)).*/\1.\2.\3/p' "$ROOT/ingest/ingest.py")"
+sh_min="$(sed -n 's/^MIN_DENO="\([0-9.]*\)".*/\1/p' "$SCRIPT")"
+assert "MIN_DENO matches ingest.py ($py_min)" "$([ -n "$py_min" ] && [ "$py_min" = "$sh_min" ]; echo $?)"
+
+# Values must never be printed (also on the error path).
+new_case errsecret; sed -i 's/^TG_CHANNEL_ID=x/TG_CHANNEL_ID=/; s/^TG_BOT_TOKEN=x/TG_BOT_TOKEN=SECRETVALUE123/; s/^D1_DATABASE_ID=x/export D1_DATABASE_ID=SECRETVALUE456/' "$TMP/errsecret/root/.env"; run errsecret
+assert "error path: exit 1" "$([ "$RC" = 1 ]; echo $?)"
+assert "error path: no .env value in output" "$(! grep -q SECRETVALUE <<<"$OUT"; echo $?)"
+
 new_case secret; sed -i 's/^TG_BOT_TOKEN=x/TG_BOT_TOKEN=SECRETVALUE123/' "$TMP/secret/root/.env"; run secret
 assert "no .env value in output" "$(! grep -q SECRETVALUE123 <<<"$OUT"; echo $?)"
 

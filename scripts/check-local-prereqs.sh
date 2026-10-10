@@ -20,11 +20,13 @@ ROOT="${CHECK_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 ENV_FILE="$ROOT/.env"
 VENV_PY="$ROOT/ingest/.venv/bin/python"
 MIN_DENO="2.3.0"
-# Keep in sync with REQUIRED_ENV in ingest/ingest.py.
+# Copies of REQUIRED_ENV and MIN_DENO in ingest/ingest.py; scripts/test-check-local-prereqs.sh fails on drift.
 REQUIRED_ENV=(TG_BOT_TOKEN TG_CHANNEL_ID SPOTIFY_CLIENT_ID SPOTIFY_CLIENT_SECRET
               CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID D1_DATABASE_ID)
+TIMEOUT_S=30  # as in ingest.py for deno; skipped when `timeout` is not installed (stock macOS)
 
 fail=0
+with_timeout() { if command -v timeout >/dev/null 2>&1; then timeout "$TIMEOUT_S" "$@"; else "$@"; fi; }
 ok() { printf 'ok       %s\n' "$1"; }
 missing() { printf 'MISSING  %s: %s\n' "$1" "$2"; fail=1; }
 
@@ -46,7 +48,7 @@ else missing "ffmpeg" "not on PATH. Debian/Ubuntu: sudo apt install ffmpeg; macO
 if ! command -v deno >/dev/null 2>&1; then
   missing "deno" "not on PATH, need >= $MIN_DENO. macOS: brew install deno; Linux: release from https://github.com/denoland/deno/releases"
 else
-  dv="$(deno --version 2>/dev/null | head -n 1)"
+  dv="$(with_timeout deno --version 2>/dev/null | head -n 1)"
   if [[ "$dv" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]]; then
     if version_ge "${BASH_REMATCH[1]}" "$MIN_DENO"; then ok "deno ${BASH_REMATCH[1]} (>= $MIN_DENO)"
     else missing "deno" "version ${BASH_REMATCH[1]} is older than $MIN_DENO. Upgrade: deno upgrade, or brew upgrade deno"; fi
@@ -57,16 +59,16 @@ fi
 
 if [ -x "$VENV_PY" ]; then
   ok "ingest/.venv"
-  if "$VENV_PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then ok "python >= 3.10 (venv)"
+  if with_timeout "$VENV_PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then ok "python >= 3.10 (venv)"
   else missing "python" "venv python is older than 3.10. Recreate: rm -rf ingest/.venv; python3 -m venv ingest/.venv (with a newer python3)"; fi
   for mod in spotdl ytmusicapi; do
-    if "$VENV_PY" -c "import $mod" >/dev/null 2>&1; then ok "python module $mod"
+    if with_timeout "$VENV_PY" -c "import $mod" >/dev/null 2>&1; then ok "python module $mod"
     else missing "python module $mod" "not importable in ingest/.venv. Run: ingest/.venv/bin/pip install -r ingest/requirements.txt"; fi
   done
 else
   missing "ingest/.venv" "not found. Run: python3 -m venv ingest/.venv && ingest/.venv/bin/pip install -r ingest/requirements.txt (Debian/Ubuntu: sudo apt install python3-venv first)"
   if command -v python3 >/dev/null 2>&1; then
-    if python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then ok "python3 >= 3.10"
+    if with_timeout python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then ok "python3 >= 3.10"
     else missing "python3" "older than 3.10. Debian/Ubuntu: sudo apt install python3; macOS: brew install python@3.12"; fi
   else
     missing "python3" "not on PATH. Debian/Ubuntu: sudo apt install python3 python3-venv; macOS: brew install python@3.12"
@@ -80,12 +82,23 @@ if ((BASH_VERSINFO[0] >= 4)); then ok "bash ${BASH_VERSINFO[0]}.${BASH_VERSINFO[
 else missing "bash" "version ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]} is older than 4. macOS: brew install bash and use it for the wrapper"; fi
 
 if [ -f "$ENV_FILE" ] && [ -r "$ENV_FILE" ]; then
-  absent=()
+  # Same rules as tg_check.load_env + ingest.py: a line counts when it has "=" and its stripped text does not
+  # start with "#"; the key is the stripped text before the first "=" (so "export KEY=v" defines "export KEY");
+  # the first definition of a key wins; an empty value counts as missing. Values never reach output.
+  absent=() ; exported=()
   for k in "${REQUIRED_ENV[@]}"; do
-    grep -Eq "^(export[[:space:]]+)?$k=" "$ENV_FILE" >/dev/null 2>&1 || absent+=("$k")
+    if ! grep -E "^[[:space:]]*$k[[:space:]]*=" "$ENV_FILE" 2>/dev/null | head -n 1 \
+         | grep -Eq "=[[:space:]]*[^[:space:]]" >/dev/null 2>&1; then
+      absent+=("$k")
+      grep -Eq "^[[:space:]]*export[[:space:]]+$k[[:space:]]*=" "$ENV_FILE" >/dev/null 2>&1 && exported+=("$k")
+    fi
   done
   if ((${#absent[@]} == 0)); then ok ".env has all required keys"
-  else missing ".env" "no definition for: ${absent[*]} (names only checked; fill them in, see the runbook)"; fi
+  else
+    hint=""
+    ((${#exported[@]})) && hint=" ('export' is not supported, write KEY=value: ${exported[*]})"
+    missing ".env" "missing or empty: ${absent[*]}$hint. Fill them in, see the runbook"
+  fi
 else
   missing ".env" "not found or unreadable at the repo root. Create it with the required keys: ${REQUIRED_ENV[*]}"
 fi
