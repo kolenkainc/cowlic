@@ -162,6 +162,54 @@ class Listener(unittest.TestCase):
             su.wait_for_callback("S1", 0.5, port)
         self.assertLess(time.monotonic() - t0, 5)
 
+    def test_idle_connection_does_not_block_a_valid_callback(self):
+        port = free_port()
+        with mock.patch.object(su, "CONN_TIMEOUT", 0.5):
+            t, res = self.run_listener(port, timeout=10.0)
+            idle = socket.create_connection(("127.0.0.1", port), timeout=5)  # connects, sends nothing
+            self.addCleanup(idle.close)
+            t0 = time.monotonic()
+            self.assertEqual(get(port, "/callback?code=abc&state=S1"), 200)
+            t.join(10)
+        self.assertEqual(res, {"code": "abc"})
+        self.assertLess(time.monotonic() - t0, 5)
+
+    def test_overall_deadline_holds_with_only_idle_connections(self):
+        port = free_port()
+        socks = []
+        res = {}
+
+        def target():
+            try:
+                su.wait_for_callback("S1", 1.0, port)
+            except su.UserAuthError as e:
+                res["err"] = e
+        t = threading.Thread(target=target)
+        t0 = time.monotonic()
+        t.start()
+        for _ in range(100):
+            try:
+                socks.append(socket.create_connection(("127.0.0.1", port), timeout=5))
+                break
+            except OSError:
+                time.sleep(0.05)
+        for _ in range(3):
+            try:
+                socks.append(socket.create_connection(("127.0.0.1", port), timeout=5))
+            except OSError:
+                break
+        for s in socks:
+            self.addCleanup(s.close)
+        t.join(8)
+        self.assertFalse(t.is_alive())
+        self.assertLess(time.monotonic() - t0, 4)  # CONN_TIMEOUT is 5 s: only the deadline can end it this soon
+        self.assertIn("timed out", str(res["err"]))
+
+    def test_too_many_query_parameters_is_a_clean_error(self):
+        q = "&".join(f"p{i}=1" for i in range(20)) + "&state=S1&code=abc"
+        with self.assertRaisesRegex(su.UserAuthError, "too many"):
+            su.parse_callback(q, "S1")
+
     def test_binds_loopback_only(self):
         seen = {}
         real = su.HTTPServer

@@ -44,6 +44,7 @@ REDIRECT_URI = f"http://{HOST}:{PORT}{CALLBACK_PATH}"
 REFRESH_KEY = "SPOTIFY_USER_REFRESH_TOKEN"
 LOGIN_TIMEOUT = 300.0  # seconds to wait for the browser redirect
 HTTP_TIMEOUT = 15.0
+CONN_TIMEOUT = 5.0  # max seconds a single browser connection may stay silent
 RELOGIN = "run `python ingest/spotify_user.py login` again"
 ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 
@@ -90,7 +91,10 @@ def authorize_url(client_id: str, challenge: str, state: str) -> str:
 def parse_callback(query: str, expected_state: str) -> str:
     """Return the authorization code from the redirect query, or raise UserAuthError. Accepts exactly
     {code, state} or {error, state}, each once; the state is compared in constant time before anything else."""
-    params = urllib.parse.parse_qs(query, keep_blank_values=True, max_num_fields=10)
+    try:
+        params = urllib.parse.parse_qs(query, keep_blank_values=True, max_num_fields=10)
+    except ValueError:  # more than 10 fields
+        raise UserAuthError("callback rejected: too many query parameters") from None
     if any(len(v) != 1 for v in params.values()):
         raise UserAuthError("callback rejected: a query parameter is repeated")
     got = {k: v[0] for k, v in params.items()}
@@ -106,10 +110,15 @@ def parse_callback(query: str, expected_state: str) -> str:
 
 
 def wait_for_callback(expected_state: str, timeout: float = LOGIN_TIMEOUT, port: int = PORT) -> str:
-    """One-shot listener on 127.0.0.1 only. Returns the code, or raises (bad callback, timeout, port busy)."""
+    """One-shot listener on 127.0.0.1 only. Returns the code, or raises (bad callback, timeout, port busy).
+    A bad callback to /callback (wrong state, error, extra parameters) aborts the login by design: fail closed.
+    The server is single-threaded, so every connection gets a socket timeout (at most CONN_TIMEOUT, and never
+    past the overall deadline); an idle connection cannot hold the listener beyond the deadline."""
     result: dict = {}
 
     class Handler(BaseHTTPRequestHandler):
+        timeout = CONN_TIMEOUT  # StreamRequestHandler applies it as the socket timeout; refreshed per request below
+
         def do_GET(self):
             url = urllib.parse.urlsplit(self.path)
             if url.path != CALLBACK_PATH:
@@ -145,6 +154,7 @@ def wait_for_callback(expected_state: str, timeout: float = LOGIN_TIMEOUT, port:
             if left <= 0:
                 raise UserAuthError(f"timed out after {int(timeout)} s waiting for the browser redirect")
             server.timeout = min(left, 1.0)
+            Handler.timeout = max(0.05, min(left, CONN_TIMEOUT))
             server.handle_request()
     if "error" in result:
         raise result["error"]
