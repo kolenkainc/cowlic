@@ -22,27 +22,61 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cowlic"
 LOG="$STATE_DIR/ingest.log"
 LOCK="$STATE_DIR/ingest.lock"
+LAST_RUN="$STATE_DIR/last-run.json"
+RESULT="$STATE_DIR/.ingest-result.json"  # written by ingest.py (--result-json), read into last-run.json, removed
 VENV_PY="$ROOT/ingest/.venv/bin/python"
 LOG_MAX_BYTES="${COWLIC_LOG_MAX_BYTES:-5242880}"  # rotate before a run when the log is at least this big
 LOG_KEEP="${COWLIC_LOG_KEEP:-5}"                  # rotated files kept: ingest.log.1 .. ingest.log.$LOG_KEEP
 
 # Exit codes of the wrapper itself. Ingest codes pass through unchanged (see describe_ingest_exit),
-# so these stay clear of 0..64 and of 125..255 (shell and signal range). #66 adds an ingest code for the
-# YouTube sign-in failure and #31 writes last-run.json: both hook in at describe_ingest_exit.
+# so these stay clear of 0..64 and of 125..255 (shell and signal range). Ingest codes: 0 ok, 1 failed,
+# 2 bad usage, 3 YouTube sign-in required.
 EXIT_PREREQ=78  # venv, prerequisites check or state dir not usable; nothing ran
 EXIT_LOCKED=75  # another run holds the lock; nothing ran
 
-log() { printf '%s run-ingest-local: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a "$LOG"; }
+now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+log() { printf '%s run-ingest-local: %s\n' "$(now_utc)" "$*" | tee -a "$LOG"; }
 
 # Single place for the ingest exit-code mapping. Prints the failure class for the log line.
-# Any non-zero code is a failure. To follow #66 (sign-in code) and #31 (last-run.json), add cases here.
+# Any non-zero code is a failure.
 describe_ingest_exit() {
   case "$1" in
     0) echo "ok" ;;
     1) echo "failed" ;;
+    3) echo "failed (youtube-sign-in)" ;;
     *) echo "failed (unmapped exit code)" ;;
   esac
 }
+
+# last-run.json: the status of the latest run, next to the log. Written after EVERY run that got past the lock
+# (a lock-blocked invocation never touches it). Atomic (temp file in the same directory + rename), mode 0600.
+# Fields: started_at, finished_at (UTC ISO 8601), exit_code, failure_class (none | partial | config |
+# youtube-sign-in | crash), log_file (name only), result (ingest.py's --result-json object: playlists with
+# status and counts added/skipped/no_match/too_big/failed/not_attempted, counts; or null when ingest.py did not
+# produce one). Only counts, class names, timestamps and playlist URLs without query: no secret ever goes in.
+# failure_class "crash": ingest.py ended with a non-zero code without writing its result (traceback, kill).
+STARTED_AT=""
+write_last_run() { # exit_code
+  local rc="$1" class="none" result="null" tmp
+  if [ -s "$RESULT" ]; then
+    result="$(<"$RESULT")"
+    case "$result" in "{"*"}") ;; *) result="null" ;; esac
+    class="$(printf '%s' "$result" | sed -n 's/.*"failure_class": *"\([a-z-]*\)".*/\1/p')"
+  fi
+  case "$class" in none | partial | config | youtube-sign-in) ;; *) class="" ;; esac
+  if [ "$rc" = 0 ]; then class="none"
+  elif [ "$rc" = "$EXIT_PREREQ" ]; then class="config"
+  elif [ -z "$class" ] || [ "$class" = none ]; then class="crash"
+  fi
+  tmp="$(mktemp "$STATE_DIR/.last-run.XXXXXX")" || { log "WARN could not write last-run.json"; return 0; }
+  printf '{"started_at": "%s", "finished_at": "%s", "exit_code": %d, "failure_class": "%s", "log_file": "%s", "result": %s}\n' \
+    "$STARTED_AT" "$(now_utc)" "$rc" "$class" "$(basename "$LOG")" "$result" > "$tmp" \
+    && chmod 600 "$tmp" && mv -f "$tmp" "$LAST_RUN" \
+    || { rm -f "$tmp"; log "WARN could not write last-run.json"; }
+}
+
+# Ends the run after the lock was taken: writes last-run.json, then exits with the code.
+finish() { write_last_run "$1"; rm -f "$RESULT"; exit "$1"; }
 
 rotate_log() {
   [ -f "$LOG" ] || return 0
@@ -69,16 +103,19 @@ if ! command -v flock >/dev/null 2>&1; then
 fi
 exec 9>"$LOCK"
 if ! flock -n 9; then
-  log "another run is active (lock $LOCK); exiting without doing anything"
+  # stderr only: the running run owns the log and last-run.json, a blocked invocation touches neither
+  echo "$(now_utc) run-ingest-local: another run is active (lock $LOCK); exiting without doing anything" >&2
   exit "$EXIT_LOCKED"
 fi
 
+STARTED_AT="$(now_utc)"
+rm -f "$RESULT"  # no stale result of an earlier run can be mistaken for this one
 rotate_log
 log "start"
 
 if [ ! -x "$VENV_PY" ]; then
   log "ERROR ingest/.venv not found. Run: python3 -m venv ingest/.venv && ingest/.venv/bin/pip install -r ingest/requirements.txt"
-  exit "$EXIT_PREREQ"
+  finish "$EXIT_PREREQ"
 fi
 
 PREREQ="$ROOT/scripts/check-local-prereqs.sh"
@@ -89,7 +126,7 @@ if [ -x "$PREREQ" ]; then
   if ((prereq_rc != 0)); then
     log "ERROR prerequisites check failed:"
     printf '%s\n' "$prereq_out" | tee -a "$LOG"
-    exit "$EXIT_PREREQ"
+    finish "$EXIT_PREREQ"
   fi
   # Log the warnings only (the "ok" lines are noise on every run).
   while IFS= read -r line; do
@@ -100,8 +137,8 @@ fi
 # Pipe through tee for the log; the ingest exit code comes from PIPESTATUS, so tee cannot hide it.
 # -u: unbuffered, so a run killed by systemd's timeout still leaves its latest output in the log.
 # 9>&-: the lock descriptor is not inherited by ingest and its children.
-"$VENV_PY" -u "$ROOT/ingest/ingest.py" --sources "$ROOT/sources.yml" 9>&- 2>&1 | tee -a "$LOG"
+"$VENV_PY" -u "$ROOT/ingest/ingest.py" --sources "$ROOT/sources.yml" --result-json "$RESULT" 9>&- 2>&1 | tee -a "$LOG"
 rc=${PIPESTATUS[0]}
 
 log "finished: exit code $rc, $(describe_ingest_exit "$rc")"
-exit "$rc"
+finish "$rc"

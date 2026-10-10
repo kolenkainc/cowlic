@@ -36,6 +36,12 @@ SH
 echo "$@" > "$STUB_ARGS_FILE"
 if [ -e /proc/self/fd/9 ]; then echo leaked > "$STUB_ARGS_FILE.fd9"; fi
 echo "stub ingest output"
+# --result-json PATH: write STUB_RESULT (a JSON object) there unless the stub plays a crash (no result).
+prev=""
+for a in "$@"; do
+  [ "$prev" = --result-json ] && [ -n "${STUB_RESULT:-}" ] && printf '%s\n' "$STUB_RESULT" > "$a"
+  prev="$a"
+done
 [ -z "${STUB_SLEEP:-}" ] || sleep "$STUB_SLEEP"
 exit "${STUB_RC:-0}"
 PY
@@ -130,6 +136,63 @@ rm -f "$(LOGF)"; rc=0
 env SENTINEL_SECRET="SENTINEL_ENV_VALUE" SHELLOPTS=xtrace XDG_STATE_HOME="$S" bash "$R/scripts/run-ingest-local.sh" > "$C/out" 2>&1 || rc=$?
 assert "no env value in output with SHELLOPTS=xtrace" "$(grep -q SENTINEL "$C/out" && echo 1 || echo 0)"
 assert "wrapper does not read .env" "$(grep -Eq '(\.|source)[[:space:]].*\.env|cat .*\.env' "$ROOT/scripts/run-ingest-local.sh" && echo 1 || echo 0)"
+
+# 8. last-run.json
+LASTF() { echo "$S/cowlic/last-run.json"; }
+jget() { python3 -I -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+for k in sys.argv[2].split("."): d=d[k]
+print(json.dumps(d) if isinstance(d,(dict,list)) or d is None else d)' "$(LASTF)" "$1"; }
+valid_json() { python3 -I -c 'import json,sys; json.load(open(sys.argv[1]))' "$(LASTF)" 2>/dev/null; }
+RES_OK='{"failure_class": "none", "exit_code": 0, "playlists": [{"url": "https://open.spotify.com/playlist/AAAAAAAAAAAAAAAAAAAAAA", "status": "done", "added": 2, "skipped": 1, "no_match": 0, "too_big": 0, "failed": 0, "not_attempted": 0}], "counts": {"added": 2, "skipped": 1, "no_match": 0, "too_big": 0, "failed": 0, "not_attempted": 0, "playlists_unreadable": 0, "playlists_not_attempted": 0}}'
+res_with() { printf '%s' "$RES_OK" | sed "s/\"failure_class\": \"none\"/\"failure_class\": \"$1\"/"; }
+ISO='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+
+new_case lr_ok; STUB_RC=0; STUB_RESULT="$RES_OK"; export STUB_RC STUB_RESULT
+SENTINEL_SECRET="SENTINEL_ENV_VALUE" XDG_STATE_HOME="$S" bash "$R/scripts/run-ingest-local.sh" > "$C/out" 2>&1 || true
+assert "last-run: written, valid JSON" "$(valid_json && echo 0 || echo 1)"
+assert "last-run: mode 0600" "$([ "$(stat -c %a "$(LASTF)")" = 600 ] && echo 0 || echo 1)"
+assert "last-run: class none, exit 0" "$([ "$(jget failure_class)" = none ] && [ "$(jget exit_code)" = 0 ] && echo 0 || echo 1)"
+assert "last-run: UTC timestamps" "$([[ "$(jget started_at)" =~ $ISO ]] && [[ "$(jget finished_at)" =~ $ISO ]] && echo 0 || echo 1)"
+assert "last-run: log file name only" "$([ "$(jget log_file)" = ingest.log ] && echo 0 || echo 1)"
+assert "last-run: playlists and counts from ingest" "$([ "$(jget result.counts.added)" = 2 ] && grep -q 'playlist/AAAAAAAAAAAAAAAAAAAAAA' "$(LASTF)" && echo 0 || echo 1)"
+assert "last-run: no state dir path or secret in it" "$(grep -qE "SENTINEL|$S|/home/" "$(LASTF)" && echo 1 || echo 0)"
+assert "last-run: no temp or result file left" "$([ -z "$(ls -A "$S/cowlic" | grep -E '^\.(last-run|ingest-result)')" ] && echo 0 || echo 1)"
+
+new_case lr_partial; STUB_RC=1; STUB_RESULT="$(res_with partial)"; export STUB_RC STUB_RESULT; run
+assert "last-run: partial" "$([ "$(jget failure_class)" = partial ] && [ "$(jget exit_code)" = 1 ] && echo 0 || echo 1)"
+
+new_case lr_signin; STUB_RC=3; STUB_RESULT="$(res_with youtube-sign-in)"; export STUB_RC STUB_RESULT; run
+assert "last-run: youtube-sign-in keeps counts" "$([ "$(jget failure_class)" = youtube-sign-in ] && [ "$(jget exit_code)" = 3 ] && [ "$(jget result.counts.added)" = 2 ] && echo 0 || echo 1)"
+
+new_case lr_crash; STUB_RC=1; STUB_RESULT=""; export STUB_RC STUB_RESULT
+mkdir -p "$S/cowlic"; printf '%s\n' "$(res_with partial)" > "$S/cowlic/.ingest-result.json"  # stale file of an earlier run
+run
+assert "last-run: crash (no result), stale result not used" "$([ "$(jget failure_class)" = crash ] && [ "$(jget result)" = null ] && echo 0 || echo 1)"
+
+new_case lr_garbage; STUB_RC=1; STUB_RESULT="not json, class partial"; export STUB_RC STUB_RESULT; run
+assert "last-run: garbage result is dropped, still valid JSON" "$(valid_json && [ "$(jget result)" = null ] && [ "$(jget failure_class)" = crash ] && echo 0 || echo 1)"
+
+STUB_RC=0; STUB_RESULT=""; export STUB_RC STUB_RESULT
+new_case lr_novenv; rm -rf "$R/ingest/.venv"; run
+assert "last-run: missing venv is config, no result" "$([ "$(jget failure_class)" = config ] && [ "$(jget exit_code)" = 78 ] && [ "$(jget result)" = null ] && echo 0 || echo 1)"
+new_case lr_prereq; STUB_PREREQ_FAIL=1; export STUB_PREREQ_FAIL; run; unset STUB_PREREQ_FAIL
+assert "last-run: failed prerequisites is config" "$([ "$(jget failure_class)" = config ] && echo 0 || echo 1)"
+
+# lock contention: the blocked invocation leaves last-run.json and the running run's log alone
+new_case lr_lock; mkdir -p "$S/cowlic"; echo '{"sentinel": true}' > "$(LASTF)"; STUB_SLEEP=3; export STUB_SLEEP
+( XDG_STATE_HOME="$S" bash "$R/scripts/run-ingest-local.sh" > "$C/out1" 2>&1 ) &
+bg=$!
+for _ in $(seq 50); do [ -s "$STUB_ARGS_FILE" ] && break; sleep 0.1; done
+log_before="$(cat "$(LOGF)")"
+run
+assert "last-run: locked run exits 75" "$([ "$rc" = 75 ] && echo 0 || echo 1)"
+assert "last-run: locked run leaves it untouched" "$([ "$(cat "$(LASTF)")" = '{"sentinel": true}' ] && echo 0 || echo 1)"
+assert "last-run: locked run does not touch the running log" "$([ "$(cat "$(LOGF)")" = "$log_before" ] && echo 0 || echo 1)"
+wait "$bg" || true
+unset STUB_SLEEP
+assert "last-run: replaced by the run that held the lock" "$(valid_json && [ "$(jget exit_code)" = 0 ] && echo 0 || echo 1)"
+unset STUB_RESULT
 
 if ((failures)); then echo "$failures check(s) failed"; exit 1; fi
 echo "All checks passed."

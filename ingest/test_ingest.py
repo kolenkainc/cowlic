@@ -1,6 +1,8 @@
 import contextlib
 import io
+import json
 import os
+import stat
 import re
 import shutil
 import subprocess
@@ -679,6 +681,112 @@ class YouTubeSignInTest(FakeSpotdlCase):
         self.assertIn("do not add cookies", lines[0])
         self.assertEqual(ingest.FAILURE_YOUTUBE_SIGN_IN, "youtube-sign-in")
         self.assertNotIn("done:", out)
+
+
+class ResultJsonTest(unittest.TestCase):
+    """--result-json: counts and class names only, written atomically with mode 0600."""
+    C1 = {"new": 2, "exists": 1, "no_match": 1, "too_big": 0, "failed": 0}
+    C2 = {"new": 0, "exists": 3, "no_match": 0, "too_big": 1, "failed": 2}
+
+    def test_success_result(self):
+        r = ingest.build_result([GOOD_URL, GOOD_URL2], {GOOD_URL: self.C1, GOOD_URL2: self.C2}, None, 0)
+        self.assertEqual((r["failure_class"], r["exit_code"]), ("none", 0))
+        self.assertEqual([p["status"] for p in r["playlists"]], ["done", "done"])
+        self.assertEqual(r["playlists"][0]["added"], 2)
+        self.assertEqual(r["playlists"][0]["skipped"], 1)
+        self.assertEqual((r["counts"]["added"], r["counts"]["skipped"], r["counts"]["failed"]), (2, 4, 2))
+
+    def test_partial_and_unreadable_playlist(self):
+        r = ingest.build_result([GOOD_URL, GOOD_URL2], {GOOD_URL: self.C1, GOOD_URL2: None}, None, 1)
+        self.assertEqual(r["failure_class"], "partial")
+        self.assertEqual(r["playlists"][1]["status"], "unreadable")
+        self.assertEqual(r["counts"]["playlists_unreadable"], 1)
+
+    def test_config_failure_before_any_playlist_ran(self):
+        r = ingest.build_result([GOOD_URL], None, None, 1)
+        self.assertEqual(r["failure_class"], "config")
+        self.assertEqual(r["playlists"][0]["status"], "not_attempted")
+        self.assertEqual(ingest.build_result([], None, None, 1)["playlists"], [])
+
+    def test_youtube_sign_in_result_uses_the_exception_counts(self):
+        e = ingest.YouTubeSignInRequired("x")
+        e.counts, e.tracks_not_attempted, e.playlists_not_attempted = dict(self.C1), 2, 1
+        e.results = {GOOD_URL: self.C2}
+        r = ingest.build_result([GOOD_URL, GOOD_URL2, GOOD_URL3], None, e, ingest.EXIT_YOUTUBE_SIGN_IN)
+        self.assertEqual((r["failure_class"], r["exit_code"]), ("youtube-sign-in", 3))
+        self.assertEqual([p["status"] for p in r["playlists"]], ["done", "interrupted", "not_attempted"])
+        self.assertEqual((r["playlists"][1]["added"], r["playlists"][1]["not_attempted"]), (2, 3))  # 2 + challenged
+        self.assertEqual((r["counts"]["added"], r["counts"]["not_attempted"], r["counts"]["playlists_not_attempted"]),
+                         (2, 3, 1))
+
+    def test_sign_in_while_fetching_has_no_track_counts(self):
+        e = ingest.YouTubeSignInRequired("x")  # counts None: raised by the playlist fetch
+        r = ingest.build_result([GOOD_URL], None, e, 3)
+        self.assertEqual((r["playlists"][0]["status"], r["counts"]["not_attempted"]), ("interrupted", 0))
+
+    def test_playlist_url_query_is_dropped_and_nothing_else_leaks(self):
+        url = GOOD_URL + "?si=abcdef0123456789"
+        r = ingest.build_result([url], {url: self.C1}, None, 0)
+        self.assertEqual(r["playlists"][0]["url"], GOOD_URL)
+        self.assertNotIn("si=", json.dumps(r))
+
+    def test_write_is_private_atomic_and_valid(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "r.json"
+            ingest.write_result(p, {"failure_class": "none"})
+            self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o600)
+            self.assertEqual(json.loads(p.read_text()), {"failure_class": "none"})
+            self.assertEqual([x.name for x in Path(d).iterdir()], ["r.json"])  # no temp file left
+            with mock.patch("os.replace", side_effect=OSError("boom")), contextlib.redirect_stdout(io.StringIO()) as out:
+                ingest.write_result(p, {"failure_class": "partial"})
+            self.assertEqual(json.loads(p.read_text()), {"failure_class": "none"})  # old content intact
+            self.assertEqual([x.name for x in Path(d).iterdir()], ["r.json"])
+            self.assertIn("WARN could not write the result file", out.getvalue())
+
+    def run_main(self, argv, run_playlists):
+        env = {k: "x" for k in ingest.REQUIRED_ENV}
+        with mock.patch.dict(os.environ, env), mock.patch("tg_check.load_env"), \
+                mock.patch.object(sys, "argv", ["ingest.py", *argv]), \
+                mock.patch.object(ingest, "d1_query", return_value=[]), \
+                mock.patch.object(ingest, "js_runtime_problem", return_value=None), \
+                mock.patch.object(ingest, "real_deps", return_value=None), \
+                mock.patch.dict(sys.modules, {"ytmusicapi": SimpleNamespace(YTMusic=lambda: None)}), \
+                mock.patch.object(ingest, "run_playlists", run_playlists), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return ingest.main()
+
+    def test_main_writes_the_file_in_every_outcome(self):
+        ok = {"new": 1, "exists": 0, "no_match": 0, "too_big": 0, "failed": 0}
+
+        def sign_in(urls, *a):
+            e = ingest.YouTubeSignInRequired("x")
+            e.counts, e.results = dict(ok), {}
+            raise e
+
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "r.json"
+            res = ["--result-json", str(p)]
+            self.assertEqual(self.run_main([GOOD_URL, *res], lambda urls, *a: {u: ok for u in urls}), 0)
+            self.assertEqual(json.loads(p.read_text())["failure_class"], "none")
+            self.assertEqual(self.run_main([GOOD_URL, *res], lambda urls, *a: {u: None for u in urls}), 1)
+            self.assertEqual(json.loads(p.read_text())["failure_class"], "partial")
+            self.assertEqual(self.run_main([GOOD_URL, *res], sign_in), 3)
+            self.assertEqual(json.loads(p.read_text())["failure_class"], "youtube-sign-in")
+            self.assertEqual(self.run_main(["https://example.invalid/x", *res], None), 1)
+            self.assertEqual(json.loads(p.read_text())["failure_class"], "config")
+            p.unlink()
+            self.assertEqual(self.run_main([GOOD_URL], lambda urls, *a: {u: ok for u in urls}), 0)  # option is optional
+            self.assertFalse(p.exists())
+
+    def test_a_crash_writes_no_file(self):
+        def boom(*a):
+            raise RuntimeError("boom")
+
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "r.json"
+            with self.assertRaises(RuntimeError):
+                self.run_main([GOOD_URL, "--result-json", str(p)], boom)
+            self.assertFalse(p.exists())
 
 
 if __name__ == "__main__":
