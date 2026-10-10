@@ -231,9 +231,18 @@ What is sent, and only that:
 
 - The lines of THIS run: the part of `ingest.log` from the byte offset the wrapper recorded just before its
   `start` line (log rotation happens only there, under the lock, so the offset holds for the whole run). If the
-  file is shorter than the offset or the offset is not at a line start, no log lines are sent. Lines are the ones
-  ingest already redacted; the shipper redacts again with the token as an extra secret, drops control characters,
-  cuts lines at 4096 characters and keeps at most 2000 lines (first 1000 and the tail).
+  file is shorter than the offset or the offset is not at a line start, no log lines are sent (this also happens
+  on the run after one that was killed mid-line, because the log then has no trailing newline: that run ships
+  only the summary). Lines are the ones ingest already redacted; the shipper cleans the whole text before
+  splitting it into lines: redact (token and its Basic credential as extra secrets), drop control, format and
+  line-separator characters, redact again (so a secret cannot be rebuilt by removing characters between its
+  letters). The same cleaning applies to the summary line, and a last check refuses to send a body that still
+  contains the token. Lines are cut at 4096 characters, at most 2000 lines are kept (first 1000 and the tail) and
+  the body is capped at about 1 MiB (the first quarter and the tail of the run, with one "omitted" line). If
+  Loki answers 400 or 413 to the push, ONE small follow-up push with just the `run_summary` line is made; any
+  other failure is not retried.
+- The 30 s limit can be lowered for tests with `COWLIC_SHIP_TIMEOUT`; only a positive integer up to 120 is
+  accepted, anything else (including 0, which would mean no limit) falls back to 30.
 - One `run_summary` line built from allowlisted, validated fields of `last-run.json` (parsed strictly: NaN and
   Infinity are rejected; if the file is unusable or is not from this run, no summary line and the run is
   unaffected): `run_summary exit_code=0 failure_class=none added=2 skipped=1 no_match=0 too_big=0 failed=0

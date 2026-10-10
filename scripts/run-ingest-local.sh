@@ -89,7 +89,8 @@ write_last_run() { # exit_code
 # dropped, result ignored. Only the first line of its stdout is logged, reduced to a harmless character set.
 SHIP="$ROOT/ingest/ship_grafana.py"
 SHIP_TIMEOUT_S="${COWLIC_SHIP_TIMEOUT:-30}"  # hard limit for the shipper (the test lowers it)
-case "$SHIP_TIMEOUT_S" in '' | *[!0-9]*) SHIP_TIMEOUT_S=30 ;; esac
+case "$SHIP_TIMEOUT_S" in '' | *[!0-9]* | 0* ) SHIP_TIMEOUT_S=30 ;; esac  # positive integer only: timeout 0 means no limit
+[ "${#SHIP_TIMEOUT_S}" -le 3 ] && [ "$SHIP_TIMEOUT_S" -le 120 ] || SHIP_TIMEOUT_S=30  # sane maximum: 120 s
 ship_grafana() {
   [ -x "$VENV_PY" ] && [ -f "$SHIP" ] || return 0
   local out ship_rc=0 line

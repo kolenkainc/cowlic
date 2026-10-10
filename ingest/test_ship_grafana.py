@@ -173,6 +173,56 @@ class PayloadTests(Base):
         self.assertNotIn(base64.b64encode(f"{CANARY_USER}:{CANARY_TOKEN}".encode()).decode(), raw)
         self.assertIn("fine line", raw)
 
+    def test_unsafe_chars_between_token_characters_do_not_rebuild_it(self):
+        # control/format characters must be stripped BEFORE redaction, or stripping rebuilds the plain token
+        for sep in ("\x00", "\x01", "\x08", "\x0b", "\x0c", "\x1b", "\x1f", "\x7f", "\x85", "​", "⁠",
+                    "﻿", " ", "­", "​\x01"):
+            with self.subTest(sep=repr(sep)):
+                self.log.write_text(f"leak {sep.join(CANARY_TOKEN)} end\nok line\n")
+                f = self.fake()
+                self.run_ship(f)
+                raw = f.requests[-1]["body"].decode()
+                self.assertNotIn(CANARY_TOKEN, raw)
+                self.assertNotIn(CANARY_TOKEN, json.loads(raw)["streams"][0]["values"][0][1].replace(sep, ""))
+                lines = [v[1] for s in json.loads(raw)["streams"] for v in s["values"]]
+                self.assertFalse(any(CANARY_TOKEN in ln for ln in lines))
+                self.assertTrue(all(c in "\n\t" or ord(c) >= 0x20 and ord(c) != 0x7f for ln in lines for c in ln))
+
+    def test_base64_credential_with_separators(self):
+        b64 = base64.b64encode(f"{CANARY_USER}:{CANARY_TOKEN}".encode()).decode()
+        self.log.write_text(f"x {chr(1).join(b64)} y\n")
+        f = self.fake()
+        self.run_ship(f)
+        self.assertNotIn(b64, f.requests[0]["body"].decode())
+
+    def test_ansi_sequences_removed_whole(self):
+        self.assertEqual(sg.sanitize_lines("\x1b[31mred\x1b[0m and \x1b]0;title\x07x\n", [CANARY_TOKEN], fake_redact),
+                         ["red and x"])
+
+    def test_strip_unsafe_keeps_newline_and_tab(self):
+        self.assertEqual(sg.strip_unsafe("a\x00b\tc\nd​e\x1b[f"), "ab\tc\nde[f")
+
+    def test_summary_goes_through_cleaning_and_final_guard(self):
+        self.log.write_text("x\n")
+        f = self.fake()
+        seen = []
+
+        def spy(text, secrets):
+            seen.append(text)
+            return fake_redact(text, secrets)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(sg, "validate_url", return_value=f.url):
+            sg.ship(str(self.log), 0, str(self.lr), env=self.env(), redact=spy)
+        self.assertTrue(any(t.startswith("run_summary") for t in seen))
+        # a summary that somehow carries the token is never sent
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(sg, "validate_url", return_value=f.url), \
+                mock.patch.object(sg, "summary_line", return_value=f"run_summary {CANARY_TOKEN}"), \
+                mock.patch.object(sg, "clean_text", side_effect=lambda t, s, r: t):
+            n = len(f.requests)
+            with self.assertRaises(sg.ShipError):
+                sg.ship(str(self.log), 0, str(self.lr), env=self.env(), redact=fake_redact)
+            self.assertEqual(len(f.requests), n)
+
     def test_ingest_redact_is_the_real_one(self):
         # end to end with the real ingest.redact through the default import (no redact= override)
         self.log.write_text(f"leak {CANARY_TOKEN}\n")
@@ -301,11 +351,38 @@ class FailureTests(Base):
         self.log.write_text("a line\n")
 
     def test_http_errors_are_reported_by_code_only(self):
-        for code in (400, 401, 429, 500):
+        for code in (401, 429, 500):
             f = self.fake(code)
             out = self.run_ship(f)
             self.assertEqual(len(f.requests), 1, "no retry")
             self.assertEqual(out.strip(), f"grafana: loki push failed (HTTP {code})")
+
+    def test_rejected_body_gets_one_summary_only_followup(self):
+        for code in (400, 413):
+            f = self.fake(code)
+            out = self.run_ship(f)
+            self.assertEqual(len(f.requests), 2)
+            second = [v[1] for s in json.loads(f.requests[1]["body"])["streams"] for v in s["values"]]
+            self.assertEqual(len(second), 1)
+            self.assertTrue(second[0].startswith("run_summary"))
+            self.assertIn(f"loki push failed (HTTP {code})", out)
+
+    def test_no_followup_without_summary(self):
+        self.lr.write_text("garbage")
+        f = self.fake(400)
+        self.run_ship(f)
+        self.assertEqual(len(f.requests), 1)
+
+    def test_body_size_capped_and_summary_kept(self):
+        self.log.write_text("".join(f"{i:05d} " + "y" * 3000 + "\n" for i in range(1900)))
+        f = self.fake()
+        self.run_ship(f)
+        body = f.requests[0]["body"]
+        self.assertLess(len(body), sg.MAX_BODY_BYTES + 100_000)
+        lines = [v[1] for s in json.loads(body)["streams"] for v in s["values"]]
+        self.assertTrue(any("size cap" in ln for ln in lines))
+        self.assertTrue(any(ln.startswith("run_summary") for ln in lines))
+        self.assertTrue(lines[-2].startswith("01899 "))  # the tail of the run survives
 
     def test_unreachable_host(self):
         f = self.fake()

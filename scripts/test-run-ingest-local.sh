@@ -268,6 +268,22 @@ assert "ship hang: lock released" "$(flock -n "$S/cowlic/ingest.lock" true && ec
 assert "ship: default hard limit is 30 s" "$(grep -q 'COWLIC_SHIP_TIMEOUT:-30' "$ROOT/scripts/run-ingest-local.sh" && echo 0 || echo 1)"
 unset STUB_SHIP STUB_RESULT
 
+# COWLIC_SHIP_TIMEOUT: only a positive integer up to 120 is honoured, anything else (0 means "no limit" to
+# timeout) falls back to 30. A recording timeout shim in front of the real one shows the limit that was used.
+REAL_TIMEOUT="$(command -v timeout)"; ORIG_PATH="$PATH"
+for pair in "0:30" "00:30" "abc:30" "-5:30" "1.5:30" "121:30" "99999999999999999999:30" "5:5" "120:120" ":30"; do
+  val="${pair%:*}"; want="${pair##*:}"
+  new_case "ship_to_$val"; mkdir -p "$C/bin"
+  printf '#!/bin/sh\n[ "$3" = "%s" ] && echo "$@" > "%s"\nexec "%s" "$@"\n' "$want" "$C/to_ok" "$REAL_TIMEOUT" > "$C/bin/timeout"
+  chmod +x "$C/bin/timeout"
+  # the shim only records calls whose limit argument equals the expected one; the stub shipper exits at once
+  STUB_RC=0 STUB_SHIP=ok; export STUB_RC STUB_SHIP
+  PATH="$C/bin:$ORIG_PATH"; COWLIC_SHIP_TIMEOUT="$val"; export COWLIC_SHIP_TIMEOUT; run
+  PATH="$ORIG_PATH"; unset COWLIC_SHIP_TIMEOUT
+  assert "ship timeout '$val' gives limit $want" "$([ -s "$C/to_ok" ] && grep -q ship_grafana.py "$C/to_ok" && echo 0 || echo 1)"
+done
+unset STUB_SHIP
+
 # wrapper failures before ingest also go through finish: still exit 78 whatever the shipper does
 new_case ship_novenv; rm -rf "$R/ingest/.venv"; STUB_RC=0; export STUB_RC; run
 assert "ship: missing venv still exits 78 and ships nothing" "$([ "$rc" = 78 ] && [ ! -e "$STUB_SHIP_ARGS_FILE" ] && echo 0 || echo 1)"

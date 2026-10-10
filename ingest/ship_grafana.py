@@ -23,6 +23,7 @@ import socket
 import sys
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -38,7 +39,9 @@ MAX_LINES = 2000
 KEEP_HEAD = 1000  # when over MAX_LINES: first KEEP_HEAD and last MAX_LINES - KEEP_HEAD - 1 lines
 FAILURE_CLASSES = ("none", "partial", "config", "youtube-sign-in", "crash")
 COUNT_KEYS = ("added", "skipped", "no_match", "too_big", "failed", "not_attempted")
-CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")  # credential validation only
+UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+MAX_BODY_BYTES = 1024 * 1024
 LEVEL_RE = re.compile(r"^(?:\S+ run-ingest-local: )?(ERROR|WARN|WARNING)\b")
 ISO_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 MAX_COUNT = 10**9
@@ -119,11 +122,23 @@ def read_run_text(log_path: str, offset: int) -> tuple[str, int]:
     return text, omitted
 
 
+def strip_unsafe(text: str) -> str:
+    """Drop control, format (U+200B, U+2060, U+FEFF ...), surrogate and line/paragraph separator characters.
+    Only \\n and \\t stay. Must run BEFORE redaction: otherwise they can rebuild a token redaction missed."""
+    return "".join(c for c in text if c in "\n\t" or unicodedata.category(c) not in UNSAFE_CATEGORIES)
+
+
+def clean_text(text: str, secrets: list[str], redact) -> str:
+    """Redact, strip unsafe characters, redact again. The first pass removes ANSI sequences (a bare strip would
+    leave their parameters behind); the second catches a secret that only appears once the unsafe characters
+    between its characters are gone. Used for EVERY text that is sent."""
+    return redact(strip_unsafe(redact(text, secrets)), secrets)
+
+
 def sanitize_lines(text: str, secrets: list[str], redact) -> list[str]:
-    text = redact(text, secrets)  # whole text: a token wrapped over two lines is still matched
+    text = clean_text(text, secrets, redact)  # whole text: a token wrapped over two lines is still matched
     lines = []
     for ln in text.splitlines():
-        ln = CONTROL_RE.sub("", ln)
         if not ln.strip():
             continue
         if len(ln) > MAX_LINE_CHARS:
@@ -133,7 +148,29 @@ def sanitize_lines(text: str, secrets: list[str], redact) -> list[str]:
         tail = MAX_LINES - KEEP_HEAD - 1
         dropped = len(lines) - KEEP_HEAD - tail
         lines = lines[:KEEP_HEAD] + [f"grafana: {dropped} lines omitted (cap {MAX_LINES})"] + lines[-tail:]
-    return lines
+    return cap_bytes(lines)
+
+
+def cap_bytes(lines: list[str]) -> list[str]:
+    """Keep the pushed body near MAX_BODY_BYTES: first quarter and the tail of the budget, one marker between."""
+    if sum(len(ln.encode()) + 40 for ln in lines) <= MAX_BODY_BYTES:
+        return lines
+    head_budget, tail_budget = MAX_BODY_BYTES // 4, MAX_BODY_BYTES - MAX_BODY_BYTES // 4 - 1024
+    head, used = [], 0
+    for ln in lines:
+        used += len(ln.encode()) + 40
+        if used > head_budget:
+            break
+        head.append(ln)
+    tail, used = [], 0
+    for ln in reversed(lines[len(head):]):
+        used += len(ln.encode()) + 40
+        if used > tail_budget:
+            break
+        tail.append(ln)
+    tail.reverse()
+    omitted = len(lines) - len(head) - len(tail)
+    return head + [f"grafana: {omitted} lines omitted (size cap)"] + tail
 
 
 def level_of(line: str) -> str:
@@ -269,9 +306,22 @@ def ship(log_path: str, offset: int, last_run_path: str, env=os.environ, opener=
     if not lines and summary is None:
         say("nothing to ship")
         return
-    payload = build_payload(lines, summary, level, t0, time.time_ns(), host_label())
-    body = json.dumps(payload, separators=(",", ":")).encode()
-    say(f"loki push {post(url, body, auth, opener)}")
+    secrets = [token, auth.split(" ", 1)[1]]
+    if summary is not None:  # built from validated fields only, but it goes through the same cleaning
+        summary = clean_text(summary, secrets, redact)
+    host = host_label()
+
+    def encode(ls, sm):
+        body = json.dumps(build_payload(ls, sm, level, t0, time.time_ns(), host), separators=(",", ":")).encode()
+        if any(s.encode() in body for s in secrets):  # last guard on the exact bytes sent
+            raise ShipError("secret found in payload, not sent")
+        return body
+
+    result = post(url, encode(lines, summary), auth, opener)
+    say(f"loki push {result}")
+    if result in ("failed (HTTP 400)", "failed (HTTP 413)") and lines and summary is not None:
+        # the body was probably rejected for its content or size: one small push with just the summary
+        say(f"summary-only push {post(url, encode([], summary), auth, opener)}")
 
 
 def main(argv: list[str]) -> int:
