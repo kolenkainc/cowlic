@@ -61,6 +61,9 @@ try {
   check("search3 matches title", x.searchResult3?.song?.[0]?.id === "t1");
   x = await j("search3&query=%25");
   check("search3 escapes LIKE wildcard", !x.searchResult3?.song?.length);
+  // The offset-clamp regression is guarded by scripts/paging-check.mjs (stub D1); this library has one track.
+  x = await j("getAlbumList2&type=alphabeticalByName&size=5&offset=1000");
+  check("getAlbumList2 offset past the end -> empty", !x.albumList2?.album?.length);
 
   // Endpoints Symfonium calls during sync: valid empty / no-op responses.
   for (const name of [
