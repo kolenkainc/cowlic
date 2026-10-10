@@ -1425,5 +1425,113 @@ class SignInStopsArtistStyleRunTest(unittest.TestCase):
         self.assertEqual((r["stop_reason"], r["counts"]["added"]), ("cap", 4))  # the cap of 5 attempts ends it
 
 
+LFM = "lfm:" + "0123456789abcdef"
+
+
+class SongIdTest(unittest.TestCase):
+    """The id check accepts exactly a Spotify id or lfm: + 16 lowercase hex (#150)."""
+
+    VALID = ["1HNODBooDQImveVtlDdJL4", sid(1), LFM, "lfm:" + "0" * 16]
+    INVALID = ["", "lfm:", "lfm:" + "a" * 15, "lfm:" + "a" * 17, "lfm:" + "A" * 16, "lfm:" + "g" * 16, "LFM:" + "a" * 16,
+               " lfm:" + "a" * 16, "lfm:" + "a" * 16 + "\n", "lfm:" + "a" * 15 + "\x00", "a" * 21, "a" * 23, "a" * 21 + "\n",
+               "a" * 21 + "-", "../x", "lfm:" + "a" * 8 + "/" + "a" * 7, "lfm::" + "a" * 15]
+
+    def run_track(self, song_id):
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(io.StringIO()):
+            return ingest.run([dict(song(1), song_id=song_id)], Fakes(Path(d)).deps(), set(), {}, Path(d), False)
+
+    def test_regex(self):
+        for v in self.VALID:
+            self.assertTrue(ingest.SONG_ID.fullmatch(v), v)
+        for v in self.INVALID:
+            self.assertFalse(ingest.SONG_ID.fullmatch(v), repr(v))
+
+    def test_process_track_accepts_and_rejects(self):
+        for v in self.VALID:
+            self.assertEqual(self.run_track(v)["new"], 1, v)
+        for v in self.INVALID:
+            c = self.run_track(v)
+            self.assertEqual((c["failed"], c["new"]), (1, 0), repr(v))
+
+    def test_lastfm_track_is_stored_under_a_stable_id(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Fakes(Path(d))
+            ex = set()
+            with contextlib.redirect_stdout(io.StringIO()):
+                ingest.run([dict(song(1), song_id=LFM)], f.deps(), ex, {}, Path(d), False)
+            self.assertIn(LFM, ex)
+            self.assertEqual(f.batches[0][2][1][1], LFM)
+            self.assertEqual(f.batches[0][2][1][0], ingest.track_id(LFM))
+
+    def test_run_state_persists_and_reloads_an_lfm_id(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "s.json"
+            today = FixedToday()
+            st = ingest.RunState.load(path, None, today)
+            st.record(LFM, "no_match")
+            st.record("lfm:" + "A" * 16, "no_match")  # not recorded: invalid
+            st.record("lfm:short", "failed")
+            self.assertEqual(list(json.loads(path.read_text())["tracks"]), [LFM])
+            again = ingest.RunState.load(path, None, today)
+            self.assertTrue(again.in_cooldown(LFM))
+            self.assertEqual(list(again.entries), [LFM])
+
+    def test_run_state_load_drops_a_malformed_lfm_id(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "s.json"
+            entry = {"status": "no_match", "retry_after": "2999-01-01"}
+            path.write_text(json.dumps({"version": 1, "tracks": {LFM: entry, "lfm:" + "G" * 16: entry}}))
+            with contextlib.redirect_stdout(io.StringIO()):
+                st = ingest.RunState.load(path, None, FixedToday())
+            self.assertEqual(list(st.entries), [LFM])
+
+
+class CrossSourceTest(unittest.TestCase):
+    """drop_stored_lastfm / read_stored_rows: the call contract for the Last.fm source (not wired yet)."""
+
+    ROWS = [("Song", "Art", 200), ("Other", "Art", 100)]
+
+    def lf(self, n, name="Song", artist="Art", dur=200):
+        return dict(song(n), song_id="lfm:" + f"{n:016x}", name=name, artists=[artist], album_artist=artist, duration=dur)
+
+    def drop(self, records):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            feed = ingest.drop_stored_lastfm(records, self.ROWS)
+        return feed, out.getvalue()
+
+    def test_only_lfm_records_are_filtered_and_order_is_kept(self):
+        sp = dict(song(1), name="Song", artists=["Art"], album_artist="Art", duration=200)  # same song, Spotify id
+        feed, out = self.drop([self.lf(2), sp, self.lf(3, "New"), self.lf(4, dur=400)])
+        self.assertEqual([r["song_id"] for r in feed], [sp["song_id"], self.lf(3)["song_id"], self.lf(4)["song_id"]])
+        self.assertIn("1 of 3 already stored", out)
+
+    def test_log_has_counts_only(self):
+        _, out = self.drop([self.lf(2, "Secret Title", "Secret Artist"), self.lf(5)])
+        self.assertNotIn("Secret", out)
+        self.assertNotIn("lfm:", out)
+
+    def test_no_lfm_records_is_a_pass_through_without_a_log_line(self):
+        records = [song(1), song(2)]
+        feed, out = self.drop(records)
+        self.assertIs(feed, records)
+        self.assertEqual(out, "")
+
+    def test_read_stored_rows_is_one_parameterless_select(self):
+        calls = []
+
+        def query(sql, params=None):
+            calls.append((sql, params))
+            return [{"title": "T", "artist": "A", "duration_s": 5}]
+
+        self.assertEqual(ingest.read_stored_rows(query), [("T", "A", 5)])
+        self.assertEqual(len(calls), 1)
+        sql = calls[0][0]
+        self.assertTrue(sql.startswith("SELECT ") and "?" not in sql and ";" not in sql)
+        for word in ("INSERT", "UPDATE", "DELETE", "DROP", "ALTER"):
+            self.assertNotIn(word, sql.upper())
+        self.assertIsNone(calls[0][1])
+
+
 if __name__ == "__main__":
     unittest.main()

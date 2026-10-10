@@ -45,6 +45,9 @@ REQUIRED_ENV = ["TG_BOT_TOKEN", "TG_CHANNEL_ID", "SPOTIFY_CLIENT_ID", "SPOTIFY_C
 
 
 SPOTIFY_ID = re.compile(r"[A-Za-z0-9]{22}")
+# a song id is a Spotify id or a synthetic Last.fm id: "lfm:" + 16 lowercase hex (built by the Last.fm source, #149)
+SONG_ID = re.compile(r"(?:[A-Za-z0-9]{22}|lfm:[0-9a-f]{16})")
+LASTFM_ID_PREFIX = "lfm:"
 COVER_MAX_BYTES = 10 * 1024 * 1024
 UNKNOWN_ARTIST, UNKNOWN_ALBUM = "Unknown Artist", "Unknown Album"
 
@@ -551,7 +554,7 @@ class Deps:
 def process_track(song: dict, deps: Deps, existing: set, covers: dict, work: Path, dry: bool = False) -> str:
     """Returns one of: exists, no_match, too_big, dry_run, new. Raises on any other failure."""
     sid = song.get("song_id") or ""
-    if not SPOTIFY_ID.fullmatch(sid):
+    if not SONG_ID.fullmatch(sid):
         raise IngestError("invalid song_id")
     if sid in existing:
         return "exists"
@@ -585,6 +588,30 @@ def process_track(song: dict, deps: Deps, existing: set, covers: dict, work: Pat
         raise
     existing.add(sid)
     return "new"
+
+
+STORED_ROWS_SQL = ("SELECT t.title AS title, ar.name AS artist, t.duration_s AS duration_s FROM tracks t "
+                   "JOIN albums al ON al.id = t.album_id JOIN artists ar ON ar.id = al.artist_id")
+
+
+def read_stored_rows(query: Callable[[str], list[dict]] = d1_query) -> list[tuple]:
+    """(title, artist, duration_s) of every stored track: one read-only parameterless SELECT, once per run."""
+    return [(r["title"], r["artist"], r["duration_s"]) for r in query(STORED_ROWS_SQL)]
+
+
+def drop_stored_lastfm(records: list[dict], stored_rows: list[tuple]) -> list[dict]:
+    """Cross-source dedupe for a feed that holds Last.fm records (song_id lfm:...): those already stored under another
+    id (a Spotify playlist track) are dropped, Spotify-id records pass untouched to the `existing` check of
+    process_track. Order is kept. Logs counts only. Call contract for the Last.fm source (not wired yet)."""
+    import dedupe as dedupe_mod
+    lfm = [r for r in records if str(r.get("song_id", "")).startswith(LASTFM_ID_PREFIX)]
+    if not lfm:
+        return records
+    res = dedupe_mod.drop_stored(lfm, stored_rows)
+    gone = {id(r) for r in lfm} - {id(r) for r in res.new}
+    log(f"lastfm: {res.stored} of {res.listed} already stored under another id"
+        f" ({res.stored_without_duration} matched without a duration)")
+    return [r for r in records if id(r) not in gone]
 
 
 def real_deps(ytm, throttle: "Throttle | None" = None) -> Deps:
@@ -790,7 +817,7 @@ class RunState:
         for sid, e in data["tracks"].items():
             try:
                 due = datetime.date.fromisoformat(e["retry_after"])
-                ok = SPOTIFY_ID.fullmatch(sid) and e["status"] in COOLDOWN_STATUSES
+                ok = SONG_ID.fullmatch(sid) and e["status"] in COOLDOWN_STATUSES
             except (KeyError, TypeError, ValueError):
                 ok = False
             if not ok:
@@ -818,7 +845,7 @@ class RunState:
     def record(self, sid: str, status: str) -> None:
         """Remember a no_match/failed track; a retry period of 0 days remembers nothing."""
         days = self.retry_days[status]
-        if days <= 0 or not SPOTIFY_ID.fullmatch(sid):
+        if days <= 0 or not SONG_ID.fullmatch(sid):
             return
         self.entries[sid] = {"status": status, "retry_after": (self.today() + datetime.timedelta(days=days)).isoformat()}
         self.save()
