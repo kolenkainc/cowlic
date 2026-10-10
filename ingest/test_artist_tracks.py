@@ -2,7 +2,9 @@
 import contextlib
 import io
 import os
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import urllib.parse
 from unittest import mock
 
@@ -412,6 +414,67 @@ class NoSecrets(unittest.TestCase):
                 mock.patch.object(at.tg_check, "load_env"), contextlib.redirect_stderr(err):
             self.assertEqual(at.main(["not-an-artist"]), 1)
         self.assertIn("not a Spotify artist", err.getvalue())
+
+
+class NoRedirect(unittest.TestCase):
+    """Two real loopback servers: A answers every request with a 302 to B. B must never see a request, so neither
+    the Bearer token nor the Basic header (client secret) can leave the first host."""
+
+    def setUp(self):
+        self.hits_b = []
+        hits = self.hits_b
+
+        class B(BaseHTTPRequestHandler):
+            def _h(self):
+                hits.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"items": [], "next": null, "access_token": "leaked"}')
+            do_GET = do_POST = _h
+
+            def log_message(self, *a):
+                pass
+        self.b = HTTPServer(("127.0.0.1", 0), B)
+        target = f"http://127.0.0.1:{self.b.server_port}/x"
+
+        class A(BaseHTTPRequestHandler):
+            def _h(self):
+                self.send_response(302)
+                self.send_header("Location", target)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            do_GET = do_POST = _h
+
+            def log_message(self, *a):
+                pass
+        self.a = HTTPServer(("127.0.0.1", 0), A)
+        self.threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in (self.a, self.b)]
+        for t in self.threads:
+            t.start()
+        self.url = f"http://127.0.0.1:{self.a.server_port}/v1/x"
+
+    def tearDown(self):
+        for s in (self.a, self.b):
+            s.shutdown()
+            s.server_close()
+
+    def test_data_request_does_not_follow_a_redirect(self):
+        status, _, body = at.default_fetch(self.url, {"Authorization": f"Bearer {CANARY}"}, 5)
+        self.assertEqual((status, body), (302, {}))
+        self.assertEqual(self.hits_b, [])
+
+    def test_token_request_does_not_follow_a_redirect(self):
+        with self.assertRaises(at.ArtistTracksError) as cm:
+            at.client_credentials_token("cid", SECRET, 5, url=self.url)
+        self.assertIn("302", str(cm.exception))
+        self.assertEqual(self.hits_b, [])
+
+    def test_catalog_reports_the_redirect_as_a_failure(self):
+        cat = at.Catalog(lambda: CANARY, [SECRET], sleep=lambda s: None, min_interval=0, out=lambda s: None)
+        with self.assertRaises(at.ArtistTracksError):
+            cat.get(self.url)
+        self.assertEqual(self.hits_b, [])
 
 
 if __name__ == "__main__":

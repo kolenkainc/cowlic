@@ -95,10 +95,18 @@ def parse_market(value: str) -> str:
 
 # ---- HTTP ----
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):  # never follow: Authorization must not leave the API host
+        return None  # the 30x then surfaces as an HTTPError and is reported as a failed request
+
+
+_OPEN = urllib.request.build_opener(_NoRedirect).open
+
+
 def default_fetch(url: str, headers: dict, timeout: float) -> tuple[int, dict, dict]:
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _OPEN(req, timeout=timeout) as r:
             status, hdrs, raw = r.status, r.headers, r.read()
     except urllib.error.HTTPError as e:
         status, hdrs, raw = e.code, e.headers, e.read()
@@ -111,13 +119,14 @@ def default_fetch(url: str, headers: dict, timeout: float) -> tuple[int, dict, d
     return status, {k.lower(): v for k, v in hdrs.items()}, body if isinstance(body, dict) else {}
 
 
-def client_credentials_token(client_id: str, client_secret: str, timeout: float = HTTP_TIMEOUT) -> str:
+def client_credentials_token(client_id: str, client_secret: str, timeout: float = HTTP_TIMEOUT,
+                             url: str = TOKEN_URL) -> str:
     basic = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
     req = urllib.request.Request(
-        TOKEN_URL, data=b"grant_type=client_credentials",
+        url, data=b"grant_type=client_credentials",
         headers={"Authorization": f"Basic {basic}", "Content-Type": "application/x-www-form-urlencoded"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _OPEN(req, timeout=timeout) as r:
             status, raw = r.status, r.read()
     except urllib.error.HTTPError as e:
         status, raw = e.code, e.read()
