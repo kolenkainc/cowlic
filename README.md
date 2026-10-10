@@ -23,4 +23,4 @@ Self-hosted, serverless аналог Spotify для прослушивания �
 
 ## Статус
 
-The Worker (Subsonic API) and ingest (Spotify -> YouTube Music -> Telegram -> D1) are implemented. Ingest runs locally on the owner's machine, not in GitHub Actions: YouTube answers every download from GitHub-hosted runners with "Sign in to confirm you're not a bot" (see #15), so the workflow was removed and the ingest secrets live only in the local `.env`. Details: [docs/architecture.md](docs/architecture.md), sections 2.1, 3 and 4.
+The Worker (Subsonic API) and ingest (Spotify -> YouTube Music -> Telegram -> D1) are implemented. Ingest runs locally on the owner's machine, not in GitHub Actions: YouTube answers every download from GitHub-hosted runners with "Sign in to confirm you're not a bot" (see #15), so the workflow was removed. GitHub no longer uses secrets for ingest (the old `ingest` environment secrets are to be deleted via #75, none should be added); the ingest configuration lives in the local `.env`. Details: [docs/architecture.md](docs/architecture.md), sections 2.1, 3 and 4.
