@@ -19,6 +19,10 @@ from pathlib import Path
 API = "https://api.telegram.org"
 
 
+class TelegramError(Exception):
+    """Telegram API failure. The message never contains the request URL (it holds the bot token)."""
+
+
 def load_env() -> None:
     env = Path(__file__).resolve().parent.parent / ".env"
     if not env.exists():
@@ -42,7 +46,7 @@ def _send(req: urllib.request.Request) -> dict:
     except urllib.error.HTTPError as e:
         # Report Telegram's error description only; never echo the request URL (it contains the token).
         body = json.load(e) if e.headers.get_content_type() == "application/json" else {}
-        sys.exit(f"Telegram API error {e.code}: {body.get('description', 'unknown')}")
+        raise TelegramError(f"Telegram API error {e.code}: {body.get('description', 'unknown')}") from None
 
 
 def channel_id(token: str) -> None:
@@ -57,13 +61,13 @@ def channel_id(token: str) -> None:
         print(f"{cid}\t{title}")
 
 
-def multipart(fields: dict, file_field: str, path: Path) -> urllib.request.Request:
+def multipart(fields: dict, file_field: str, path: Path, content_type: str = "audio/mpeg"):
     boundary = uuid.uuid4().hex
     parts = []
     for k, v in fields.items():
         parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
     parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; '
-                  f'filename="{path.name}"\r\nContent-Type: audio/mpeg\r\n\r\n').encode())
+                  f'filename="{path.name}"\r\nContent-Type: {content_type}\r\n\r\n').encode())
     parts += [path.read_bytes(), f"\r\n--{boundary}--\r\n".encode()]
     return boundary, parts
 
@@ -84,7 +88,7 @@ def roundtrip(token: str, chat_id: str, path: Path) -> None:
     sys.exit(0 if same else 1)
 
 
-if __name__ == "__main__":
+def main() -> None:
     load_env()
     token = os.environ.get("TG_BOT_TOKEN") or sys.exit("TG_BOT_TOKEN is not set")
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -94,3 +98,10 @@ if __name__ == "__main__":
         roundtrip(token, os.environ.get("TG_CHANNEL_ID") or sys.exit("TG_CHANNEL_ID is not set"), Path(sys.argv[2]))
     else:
         sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except TelegramError as e:
+        sys.exit(str(e))
