@@ -13,6 +13,12 @@ from unittest import mock
 
 import ingest
 
+GOOD_URL = "https://open.spotify.com/playlist/1HNODBooDQImveVtlDdJL4"
+GOOD_URL2 = "https://open.spotify.com/playlist/" + "b" * 22
+GOOD_URL3 = "https://open.spotify.com/album/" + "c" * 22
+# valid prefix, bad tail: only an end-anchored full match rejects these
+END_ANCHOR_BAD = (GOOD_URL + "/", GOOD_URL + "x", GOOD_URL + "?a b", GOOD_URL + "?a;b", GOOD_URL + "?")
+
 SONG = {"name": "T", "artists": ["A"], "album_artist": "A", "album_name": "Al", "year": 2020,
         "song_id": "sp1", "track_number": 3, "disc_number": 1, "duration": 200}
 
@@ -445,7 +451,7 @@ class CloudflareTokenTest(unittest.TestCase):
         env["CLOUDFLARE_API_TOKEN"] = "broad-fake"
         out = io.StringIO()
         with mock.patch.dict(os.environ, env), mock.patch("tg_check.load_env"), \
-                mock.patch.object(sys, "argv", ["ingest.py", "https://example.invalid/playlist"]), \
+                mock.patch.object(sys, "argv", ["ingest.py", GOOD_URL]), \
                 contextlib.redirect_stdout(out):
             os.environ.pop("INGEST_CLOUDFLARE_API_TOKEN", None)
             self.assertEqual(ingest.main(), 1)
@@ -454,6 +460,107 @@ class CloudflareTokenTest(unittest.TestCase):
 
     def test_spotdl_never_inherits_either_cloudflare_token(self):
         self.assertLessEqual({"INGEST_CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_TOKEN"}, ingest.SPOTDL_HIDDEN_ENV)
+
+
+class SourcesTest(unittest.TestCase):
+    def test_parses_list_with_comments_and_blank_lines(self):
+        text = f"# c\n\n- {GOOD_URL}\n  - {GOOD_URL2}?si=abc123\n"
+        self.assertEqual(ingest.parse_sources(text), [GOOD_URL, GOOD_URL2 + "?si=abc123"])
+
+    def test_duplicates_collapse_keeping_order(self):
+        self.assertEqual(ingest.parse_sources(f"- {GOOD_URL}\n- {GOOD_URL2}\n- {GOOD_URL}\n"), [GOOD_URL, GOOD_URL2])
+
+    def test_invalid_entries_fail_with_line_number(self):
+        for bad in ("- http://open.spotify.com/playlist/" + "a" * 22,       # not https
+                    "- https://open.spotify.com.evil.test/playlist/" + "a" * 22,
+                    "- https://open.spotify.com/playlist/short",
+                    "- https://open.spotify.com/track/" + "a" * 22,
+                    f"- {GOOD_URL} # trailing comment",
+                    f"- {GOOD_URL} {GOOD_URL2}",
+                    f"{GOOD_URL}", "key: value", f"-{GOOD_URL}",
+                    *(f"- {u}" for u in END_ANCHOR_BAD)):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ingest.IngestError, "sources line 2"):
+                ingest.parse_sources(f"- {GOOD_URL}\n{bad}\n")
+
+    def test_empty_file_is_an_error(self):
+        for text in ("", "# only comments\n\n"):
+            with self.assertRaises(ingest.IngestError):
+                ingest.parse_sources(text)
+
+    def test_the_repo_sources_file_is_valid_and_starts_with_the_test_playlist(self):
+        urls = ingest.parse_sources((Path(__file__).resolve().parent.parent / "sources.yml").read_text("utf-8"))
+        self.assertEqual(urls[0], GOOD_URL)
+
+    def test_cli_url_uses_the_same_validation(self):
+        self.assertEqual(ingest.validate_playlist_url(GOOD_URL), GOOD_URL)
+        for bad in ("https://example.invalid/playlist", *END_ANCHOR_BAD):
+            with self.subTest(bad=bad), self.assertRaises(ingest.IngestError):
+                ingest.validate_playlist_url(bad)
+
+
+class RunPlaylistsTest(unittest.TestCase):
+    def test_one_failing_playlist_does_not_hide_the_others(self):
+        songs = {GOOD_URL: [song(1)], GOOD_URL2: [song(2)], GOOD_URL3: [song(3)]}
+
+        def fetch(url):
+            if url == GOOD_URL2:
+                raise ingest.IngestError("spotdl save failed")
+            return songs[url]
+
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(out):
+            f = Fakes(Path(d), fail_upload=[sid(3)])
+            res = ingest.run_playlists([GOOD_URL, GOOD_URL2, GOOD_URL3], fetch, f.deps(), set(), {}, Path(d), False)
+        self.assertEqual(f.uploaded, [sid(1)])
+        self.assertEqual(res[GOOD_URL]["new"], 1)
+        self.assertIsNone(res[GOOD_URL2])
+        self.assertEqual(res[GOOD_URL3]["failed"], 1)
+        lines = out.getvalue()
+        self.assertEqual(sum(1 for ln in lines.splitlines() if ln.startswith("playlist ")), 3)
+        self.assertIn(f"playlist {GOOD_URL2}: FAILED", lines)
+
+    def run_main(self, argv, fetch_fails=False):
+        env = {k: "x" for k in ingest.REQUIRED_ENV}
+        out = io.StringIO()
+
+        def fake_run_playlists(urls, *a):
+            return {u: (None if fetch_fails else {"new": 0, "exists": 1, "no_match": 0, "too_big": 0, "failed": 0})
+                    for u in urls}
+
+        with mock.patch.dict(os.environ, env), mock.patch("tg_check.load_env"), \
+                mock.patch.object(sys, "argv", ["ingest.py", *argv]), \
+                mock.patch.object(ingest, "d1_query", return_value=[]), \
+                mock.patch.object(ingest, "js_runtime_problem", return_value=None), \
+                mock.patch.object(ingest, "real_deps", return_value=None), \
+                mock.patch.dict(sys.modules, {"ytmusicapi": SimpleNamespace(YTMusic=lambda: None)}), \
+                mock.patch.object(ingest, "run_playlists", fake_run_playlists), \
+                contextlib.redirect_stdout(out):
+            return ingest.main(), out.getvalue()
+
+    def test_main_sources_file_exit_codes(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "sources.yml"
+            p.write_text(f"- {GOOD_URL}\n- {GOOD_URL2}\n", encoding="utf-8")
+            self.assertEqual(self.run_main(["--sources", str(p)])[0], 0)
+            self.assertEqual(self.run_main(["--sources", str(p)], fetch_fails=True)[0], 1)
+            p.write_bytes(b"\xef\xbb\xbf" + f"- {GOOD_URL}\n".encode())  # BOM must not break line 1
+            self.assertEqual(self.run_main(["--sources", str(p)])[0], 0)
+            p.write_text(f"- {GOOD_URL}\n- nonsense\n", encoding="utf-8")
+            code, out = self.run_main(["--sources", str(p)])
+            self.assertEqual(code, 1)
+            self.assertIn("sources line 2", out)
+            self.assertEqual(self.run_main(["--sources", str(Path(d) / "missing.yml")])[0], 1)
+
+    def test_main_explicit_url_still_works_and_is_validated(self):
+        self.assertEqual(self.run_main([GOOD_URL])[0], 0)
+        code, out = self.run_main(["https://example.invalid/x"])
+        self.assertEqual(code, 1)
+        self.assertIn("ERROR", out)
+
+    def test_main_requires_exactly_one_source(self):
+        for argv in ([], [GOOD_URL, "--sources", "x.yml"]):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                self.run_main(argv)
 
 
 if __name__ == "__main__":

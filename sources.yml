@@ -1,0 +1,10 @@
+# Public Spotify playlists (or albums) that the ingest syncs into the library.
+# Format: a flat list, one `- <url>` per line. Blank lines and whole-line `#` comments are allowed;
+# nothing else (no inline comments, no other YAML). Each URL must be
+# https://open.spotify.com/playlist/<22 chars> (or /album/<22 chars>), optionally with ?si=...
+# An invalid line fails the whole run. Private playlists and Liked Songs are not supported.
+# Run: python ingest/ingest.py --sources sources.yml
+# URLs are public data, never put secrets here.
+
+# test playlist (12 tracks)
+- https://open.spotify.com/playlist/1HNODBooDQImveVtlDdJL4
