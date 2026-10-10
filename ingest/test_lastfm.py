@@ -250,6 +250,67 @@ class ClientTests(unittest.TestCase):
             c.call("user.getWeeklyChartList", user=USER)
         self.assertEqual(c.calls, lf.MAX_RETRIES + 1)
 
+    def test_error_8_retries_then_succeeds(self):
+        c, clk = make(Fake([], errors=[(200, {"error": 8, "message": "Operation failed"})] * 2))
+        c.call("user.getWeeklyChartList", user=USER)
+        self.assertEqual(c.calls, 3)
+        self.assertEqual([s for s in clk.sleeps if s >= 5.0], [5.0, 10.0])  # the same backoff as error 29
+
+    def test_error_8_forever_raises_bounded_naming_the_method(self):
+        c, _ = make(Fake([], errors=[(200, {"error": 8, "message": f"Operation failed {KEY} {USER}"})] * 20))
+        with self.assertRaises(lf.LastfmError) as cm:
+            c.call("user.getWeeklyChartList", user=USER)
+        msg = str(cm.exception)
+        self.assertIn("error 8 in user.getWeeklyChartList", msg)
+        self.assertIn(f"after {lf.MAX_RETRIES} retries", msg)
+        self.assertEqual(c.calls, lf.MAX_RETRIES + 1)
+
+    def test_error_8_retries_count_in_the_budget(self):
+        c, _ = make(Fake([], errors=[(200, {"error": 8})] * 20), max_calls=2)
+        with self.assertRaisesRegex(lf.LastfmError, "call limit"):
+            c.call("user.getWeeklyChartList", user=USER)
+        self.assertEqual(c.calls, 2)
+        c, _ = make(Fake([], errors=[(200, {"error": 8})] * 20))
+        with c.call_budget(3), self.assertRaisesRegex(lf.LastfmError, "call limit"):
+            c.call("user.getWeeklyChartList", user=USER)
+        self.assertEqual(c.calls, 3)
+
+    def test_other_codes_are_still_not_retried_and_name_the_method(self):
+        for code in (6, 10, 17, 26, 99):
+            c, _ = make(Fake([], errors=[(200, {"error": code})]))
+            with self.assertRaisesRegex(lf.LastfmError, "in user.getWeeklyChartList"):
+                c.call("user.getWeeklyChartList", user=USER)
+            self.assertEqual(c.calls, 1)
+
+    def test_error_29_exhaustion_names_the_method(self):
+        c, _ = make(Fake([], errors=[(200, {"error": 29})] * 10))
+        with self.assertRaisesRegex(lf.LastfmError, "rate limit exceeded .* in user.getWeeklyChartList after 3 retries"):
+            c.call("user.getWeeklyChartList", user=USER)
+
+    def test_week_ordinal_without_dates(self):
+        w1, w2 = week_ending(NOW, 2), week_ending(NOW, 1)
+        errs = [(200, chart_list([w1, w2])), (200, artist_chart([]))] + [(200, {"error": 8})] * 4
+        c, _ = make(Fake([w1, w2], errors=errs))
+        with self.assertRaises(lf.LastfmError) as cm:
+            lf.top_artists(c, USER, 5, NOW)
+        msg = str(cm.exception)
+        self.assertIn("error 8 in user.getWeeklyArtistChart (week 2 of 2)", msg)
+        for ts in (*w1, *w2):
+            self.assertNotIn(str(ts), msg)
+        self.assertEqual(c.calls, 2 + lf.MAX_RETRIES + 1)  # list + week 1 + week 2 with its retries
+
+    def test_error_text_never_leaks_key_user_or_url(self):
+        for answer in ({"error": 8}, {"error": 99, "message": f"{KEY} {USER} {KEY.lower()} {USER.upper()}"},
+                       {"error": 6}):
+            c, _ = make(Fake([], errors=[(200, answer)] * 10))
+            with self.assertRaises(lf.LastfmError) as cm:
+                c.call("user.getWeeklyArtistChart", week=(3, 9), user=USER, **{"from": "1", "to": "2"})
+            msg = str(cm.exception)
+            for secret in (KEY, KEY.lower(), USER, USER.upper(), "api_key", "audioscrobbler", "https://"):
+                self.assertNotIn(secret, msg)
+            self.assertIn("(week 3 of 9)", msg)
+            self.assertLess(len(msg), 400)
+
     def test_http_5xx_and_network_errors_retry(self):
         c, _ = make(Fake([], errors=[(503, {}), lf.LastfmError("network error talking to Last.fm (TimeoutError)")]))
         c.call("user.getWeeklyChartList", user=USER)

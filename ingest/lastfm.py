@@ -51,7 +51,7 @@ READ_METHODS = frozenset({"user.getWeeklyChartList", "user.getWeeklyArtistChart"
                           "artist.getTopAlbums", "album.getInfo"})  # read-only allowlist
 HTTP_TIMEOUT = 15.0
 MIN_INTERVAL = 1.0  # seconds between two calls
-MAX_RETRIES = 3  # retries per call after error 29/11/16, HTTP 5xx or a network error
+MAX_RETRIES = 3  # retries per call after error 8/29/11/16, HTTP 5xx or a network error
 BACKOFF_BASE = 5.0  # seconds; waits BACKOFF_BASE * 2**attempt
 MAX_CALLS = 400  # hard budget of HTTP requests per client (a ranking needs about 1 + 53 per year)
 MAX_BODY = 2 * 1024 * 1024  # bytes read from one response; the rest is never read
@@ -74,7 +74,7 @@ ERROR_MESSAGES = {
     26: "API key suspended (error 26)",
     29: "rate limit exceeded (error 29)",
 }
-RETRYABLE_CODES = frozenset({11, 16, 29})  # service offline, temporary error, rate limit
+RETRYABLE_CODES = frozenset({8, 11, 16, 29})  # operation failed (backend), service offline, temporary error, rate limit
 
 # (url, timeout) -> (HTTP status, parsed JSON object or {}). Injected in tests; the url holds the key.
 Fetch = Callable[[str, float], tuple[int, dict]]
@@ -188,9 +188,13 @@ class LastfmClient:
             if wait > 0:
                 self._sleep(wait)
 
-    def call(self, method: str, **params: str) -> dict:
+    def call(self, method: str, *, week: tuple[int, int] | None = None, **params: str) -> dict:
+        """`week` = (ordinal, total) of a weekly chart call: shown in API error messages (never dates), not sent."""
         if method not in READ_METHODS:
             raise self._err(f"method {method!r} is not an allowed read-only method")
+        where = method
+        if week is not None:
+            where += f" (week {int(week[0])} of {int(week[1])})"  # ints only: nothing untrusted reaches the text
         query = {"method": method, **params, "api_key": self._key, "format": "json"}
         url = f"{API}?{urllib.parse.urlencode(query)}"
         for attempt in range(MAX_RETRIES + 1):
@@ -214,10 +218,10 @@ class LastfmClient:
                     raise self._err(f"malformed Last.fm error answer (HTTP {status})")
                 if code in RETRYABLE_CODES:
                     if last:
-                        raise self._err(ERROR_MESSAGES.get(code, f"Last.fm error {code}") + f" after {MAX_RETRIES} retries")
+                        raise self._err(f"{ERROR_MESSAGES.get(code, f'Last.fm error {code}')} in {where} after {MAX_RETRIES} retries")
                     self._wait(attempt, f"error {code}")
                     continue
-                raise self._err(ERROR_MESSAGES.get(code) or self._generic(code, body), code)
+                raise self._err(self._api_text(code, body, where, params.get("user", "")), code)
             if status >= 500 or status == 429:
                 if last:
                     raise self._err(f"Last.fm kept answering HTTP {status} after {MAX_RETRIES} retries")
@@ -235,10 +239,13 @@ class LastfmClient:
         self._out(f"Last.fm {why}, waiting {secs:g} s before retry {attempt + 1}/{MAX_RETRIES}")
         self._sleep(secs)
 
-    def _generic(self, code: int, body: dict) -> str:
+    def _api_text(self, code: int, body: dict, where: str, user: str = "") -> str:
+        """Message for an API error code; names the method (`where`), never the key, user name or URL."""
+        if code in ERROR_MESSAGES:
+            return f"{ERROR_MESSAGES[code]} in {where}"
         msg = body.get("message")
-        reason = clean_text(redact(msg, [self._key]), REASON_MAX) if isinstance(msg, str) else ""
-        return f"Last.fm error {code}" + (f": {reason}" if reason else "")
+        reason = clean_text(redact(msg, [self._key, user]), REASON_MAX) if isinstance(msg, str) else ""
+        return f"Last.fm error {code} in {where}" + (f": {reason}" if reason else "")
 
 
 # ---- response parsing ----
@@ -336,7 +343,8 @@ def top_artists(client, user: str, years: int = 5, now: datetime.datetime | None
     totals: dict[str, dict] = {}
     dropped = 0
     for n, (f, t) in enumerate(weeks, 1):
-        entries, d = parse_artist_chart(client.call("user.getWeeklyArtistChart", user=user, **{"from": str(f), "to": str(t)}))
+        entries, d = parse_artist_chart(client.call("user.getWeeklyArtistChart", week=(n, len(weeks)), user=user,
+                                                    **{"from": str(f), "to": str(t)}))
         dropped += d
         for e in entries:
             cur = totals.setdefault(_key(e), {"name": e["name"], "mbid": e["mbid"], "playcount": 0})
