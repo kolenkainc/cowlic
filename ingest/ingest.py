@@ -556,7 +556,8 @@ def tg_delete(message_id: int) -> None:
     tg_check._send(req)
 
 SPOTDL_HIDDEN_ENV = {"TG_BOT_TOKEN", "TG_CHANNEL_ID", "INGEST_CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_TOKEN",
-                     "CLOUDFLARE_ACCOUNT_ID", "D1_DATABASE_ID", "SPOTIFY_USER_REFRESH_TOKEN", "LASTFM_API_KEY"}
+                     "CLOUDFLARE_ACCOUNT_ID", "D1_DATABASE_ID", "SPOTIFY_USER_REFRESH_TOKEN", "LASTFM_API_KEY",
+                     "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET"}  # the last two go through argv
 TAIL_LINES = 15  # lines of spotdl output kept in an error, so a YouTube block stays diagnosable
 LINE_MAX = 400
 # spotdl hides the real yt-dlp error (logger.debug(exception)) below DEBUG, and always prints its "Some YouTube
@@ -576,8 +577,9 @@ def spotdl_run(args: list[str], cwd: Path) -> tuple[list[str], str]:
     # ever surfaced redacted.
     cid, secret = os.environ["SPOTIFY_CLIENT_ID"], os.environ["SPOTIFY_CLIENT_SECRET"]
     cmd = [*SPOTDL_CMD, args[0], *args[1:], "--client-id", cid, "--client-secret", secret]
-    # spotdl needs none of the Telegram / Cloudflare values, so keep them out of its environment.
-    env = {k: v for k, v in os.environ.items() if k not in SPOTDL_HIDDEN_ENV}
+    # Fail closed: nothing that load_env took from .env reaches the child (whatever the key is called); the outer
+    # environment passes. SPOTDL_HIDDEN_ENV is a second line of defence for the same names set by the caller.
+    env = {k: v for k, v in os.environ.items() if k not in tg_check.ENV_FROM_FILE and k not in SPOTDL_HIDDEN_ENV}
     env["COLUMNS"] = SPOTDL_CONSOLE_COLUMNS
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env)
     lines = clean_lines(r.stdout + "\n" + r.stderr, [cid, secret])

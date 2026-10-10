@@ -56,7 +56,9 @@ It prints `ok` or `MISSING` with a fix hint per item and exits 1 if anything is 
 Secrets live only in the machine's gitignored `.env`. `INGEST_CLOUDFLARE_API_TOKEN` is the narrow token (D1:Edit
 only) and is the only Cloudflare token ingest uses; ingest never reads the broad `CLOUDFLARE_API_TOKEN`.
 Nothing about ingest is stored in GitHub (the old `ingest` environment secrets are removed in #75). The repo is
-public: never paste values into issues, PRs or logs.
+public: never paste values into issues, PRs or logs. Every value that ingest loads from `.env` is hidden from the
+spotdl child process by construction (the child gets the outer environment only, whatever a key is called; a variable
+already set in the outer environment keeps its outer value and still passes).
 
 ## Run once by hand
 
