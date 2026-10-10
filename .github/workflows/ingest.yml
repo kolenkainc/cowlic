@@ -77,19 +77,19 @@ jobs:
             echo "Job status: $JOB_STATUS"
             echo
             if [ -f "$log" ]; then
-              if grep -Eiq 'Sign in to confirm|not a bot|HTTP Error 429|HTTP Error 403|Too Many Requests' "$log"; then
+              if grep -Eiq 'Sign in to confirm|not a bot|HTTP Error 429|HTTP Error 403' "$log"; then
                 echo "**YouTube appears to block this runner IP (plan B: self-hosted runner or local run)**"
                 echo
               fi
+              # Log text is untrusted: it goes into indented code blocks (4 spaces), which no line of the
+              # log can close, unlike a fence. The blank line before each block is required by markdown.
               echo "Added / skipped / failed:"
-              echo '````'
-              grep -E '^(done:|ERROR |WARN |ingested:|skipped )' "$log" || echo "no result lines"
-              echo '````'
+              echo
+              { grep -E '^(done:|ERROR |WARN |ingested:|skipped )' "$log" || echo "no result lines"; } | sed 's/^/    /'
               echo
               echo "Last 40 log lines (Spotify credentials redacted by ingest.py):"
-              echo '````'
-              tail -n 40 "$log"
-              echo '````'
+              echo
+              tail -n 40 "$log" | sed 's/^/    /'
             else
               echo "Ingest did not start (see the failed step)."
             fi

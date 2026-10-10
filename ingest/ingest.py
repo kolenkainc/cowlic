@@ -54,11 +54,35 @@ def dedupe(songs: list[dict]) -> list[dict]:
     return out
 
 
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_RE.sub("", text)
+
+
 def redact(text: str, secrets: list[str]) -> str:
-    for s in secrets:
-        if s:
-            text = text.replace(s, "***")
+    """Remove secrets from tool output. Matching runs on ANSI-stripped text, ignores case and tolerates
+    whitespace/line breaks between any two characters (rich hard-wraps long values when not on a TTY)."""
+    text = strip_ansi(text)
+    for s in sorted((x for x in secrets if x), key=len, reverse=True):
+        text = re.sub(r"\s*".join(re.escape(c) for c in s.strip()), "***", text, flags=re.IGNORECASE)
     return text
+
+
+def neutralize(text: str) -> str:
+    """Stop any line from being read as a GitHub Actions workflow command (`::cmd::` or legacy `##[cmd]`)."""
+    return "\n".join(f"[neutralised] {ln}" if ln.lstrip().startswith(("::", "##[")) else ln
+                     for ln in text.splitlines())
+
+
+def log(msg: str) -> None:
+    """The only way ingest prints: external text (titles, tool output) cannot issue workflow commands."""
+    print(neutralize(msg))
+
+
+def tail_of(text: str, secrets: list[str]) -> str:
+    return "\n".join(redact(text, secrets).strip().splitlines()[-TAIL_LINES:])
 
 def stable_id(*parts: str) -> str:
     """Stable 16-hex id from normalized parts; identical input always gives the same id."""
@@ -153,20 +177,24 @@ def tg_delete(message_id: int) -> None:
 
 SPOTDL_HIDDEN_ENV = {"TG_BOT_TOKEN", "TG_CHANNEL_ID", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID",
                      "D1_DATABASE_ID"}
-TAIL_LINES = 15  # lines of failing spotdl output kept in the error, so a YouTube block stays diagnosable
+TAIL_LINES = 15  # lines of spotdl output kept in an error, so a YouTube block stays diagnosable
+SPOTDL_CMD = [sys.executable, "-m", "spotdl"]  # tests replace this with a fake
 
 
-def spotdl_run(args: list[str], cwd: Path) -> None:
-    # spotdl 4.x has no env-var support for credentials, so they go through argv. Output is captured and
-    # printed (redacted) only on failure.
+def spotdl_run(args: list[str], cwd: Path) -> str:
+    """Runs spotdl; returns the redacted tail of its output (<= TAIL_LINES). spotdl 4.5.2 exits 0 even when a
+    song's download failed (e.g. a YouTube block), so callers include the tail when no file appeared."""
+    # spotdl 4.x has no env-var support for credentials, so they go through argv. Output is captured and only
+    # ever surfaced redacted.
     cid, secret = os.environ["SPOTIFY_CLIENT_ID"], os.environ["SPOTIFY_CLIENT_SECRET"]
-    cmd = [sys.executable, "-m", "spotdl", args[0], *args[1:], "--client-id", cid, "--client-secret", secret]
+    cmd = [*SPOTDL_CMD, args[0], *args[1:], "--client-id", cid, "--client-secret", secret]
     # spotdl needs none of the Telegram / Cloudflare values, so keep them out of its environment.
     env = {k: v for k, v in os.environ.items() if k not in SPOTDL_HIDDEN_ENV}
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env)
+    tail = tail_of(r.stdout + "\n" + r.stderr, [cid, secret])
     if r.returncode != 0:
-        tail = "\n".join(redact(r.stdout + r.stderr, [cid, secret]).strip().splitlines()[-TAIL_LINES:])
         raise IngestError(f"spotdl {args[0]} failed with exit code {r.returncode}: {tail}")
+    return tail
 
 
 def fetch_cover(url: str, dest: Path) -> Path:
@@ -220,13 +248,13 @@ def process_track(song: dict, deps: Deps, existing: set, covers: dict, work: Pat
                 cover = deps.upload_cover(song, tdir)
                 covers[al] = cover
             except (IngestError, OSError, KeyError, ValueError):
-                print(f"WARN cover failed for {sid}")
+                log(f"WARN cover failed for {sid}")
         deps.d1_batch(upsert_statements(song, size, msg["audio"]["file_id"], msg["message_id"], cover))
     except Exception:
         try:
             deps.delete_message(msg["message_id"])
         except (IngestError, OSError, KeyError, ValueError):
-            print(f"WARN could not delete orphan Telegram message {msg.get('message_id')}")
+            log(f"WARN could not delete orphan Telegram message {msg.get('message_id')}")
         raise
     existing.add(sid)
     return "new"
@@ -237,12 +265,13 @@ def real_deps(ytm) -> Deps:
         return find_match(ytm, song["name"], primary_artist(song), song.get("album_name"), int(song["duration"]))
 
     def download(song, m, tdir):
-        spotdl_run(["download", f"https://music.youtube.com/watch?v={m.video_id}|{song['url']}",
-                    "--output", str(tdir / "{track-id}.{output-ext}"), "--format", "mp3", "--bitrate", BITRATE],
-                   tdir.parent)
+        tail = spotdl_run(["download", f"https://music.youtube.com/watch?v={m.video_id}|{song['url']}",
+                           "--output", str(tdir / "{track-id}.{output-ext}"), "--format", "mp3", "--bitrate", BITRATE],
+                          tdir.parent)
         files = list(tdir.glob("*.mp3"))
         if len(files) != 1:
-            raise IngestError("expected exactly one mp3 after download")
+            raise IngestError("expected exactly one mp3 after download"
+                              + (f"; spotdl output (last lines):\n{tail}" if tail else ""))
         return files[0]
 
     def audio(song, path):
@@ -265,16 +294,16 @@ def run(songs: list[dict], deps: Deps, existing: set, covers: dict, work: Path, 
             status = process_track(song, deps, existing, covers, work, dry)
         except (IngestError, OSError, KeyError, ValueError, IndexError, TypeError) as e:
             detail = f": {e}" if isinstance(e, IngestError) else ""
-            print(f"ERROR {label}: {type(e).__name__}{detail}")
+            log(f"ERROR {label}: {type(e).__name__}{detail}")
             counts["failed"] += 1
             continue
         counts[status] += 1
         if status == "exists":
-            print(f"skipped (already present): {label}")
+            log(f"skipped (already present): {label}")
         elif status in ("no_match", "too_big"):
-            print(f"WARN {status.replace('_', ' ')}: {label}")
+            log(f"WARN {status.replace('_', ' ')}: {label}")
         elif status in ("new", "dry_run"):
-            print(f"{'ingested' if status == 'new' else 'dry-run would ingest'}: {label}")
+            log(f"{'ingested' if status == 'new' else 'dry-run would ingest'}: {label}")
     return counts
 
 
@@ -286,7 +315,7 @@ def main() -> int:
     tg_check.load_env()
     missing = [k for k in REQUIRED_ENV if not os.environ.get(k)]
     if missing:
-        print(f"ERROR missing env vars: {', '.join(missing)}")
+        log(f"ERROR missing env vars: {', '.join(missing)}")
         return 1
 
     from ytmusicapi import YTMusic
@@ -298,11 +327,11 @@ def main() -> int:
         try:
             spotdl_run(["save", args.playlist_url, "--save-file", str(save)], work)
         except IngestError as e:
-            print(f"ERROR spotdl save failed: {e}")
+            log(f"ERROR spotdl save failed: {e}")
             return 1
         counts = run(json.loads(save.read_text(encoding="utf-8")), real_deps(YTMusic()), existing, covers, work,
                      args.dry_run)
-    print(f"done: {counts['new']} new, {counts['exists']} already present, {counts['no_match']} no match, "
+    log(f"done: {counts['new']} new, {counts['exists']} already present, {counts['no_match']} no match, "
           f"{counts['too_big']} too big, {counts['failed']} failed")
     return 1 if counts["failed"] else 0
 
