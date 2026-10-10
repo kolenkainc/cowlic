@@ -263,6 +263,26 @@ class SpotdlOutputTest(FakeSpotdlCase):
         lines = ["[13:10:00] DEBUG MainThread - Searching for x base.py:178", "plain text"]
         self.assertEqual(ingest.cause_lines(lines), [])
 
+    def test_cause_lines_strip_signed_url_query_and_tokens(self):
+        line = (
+            "[13:10:00] DEBUG MainThread - ERROR: unable to download video data: "
+            "HTTPSConnectionPool(host='rr1---sn-xx.googlevideo.com', port=443): Max retries exceeded with url: "
+            "/videoplayback?expire=1760000000&ip=203.0.113.7&sig=AOq0QJ8wRAIgabc&pot=MnQ1abcdefghijklmnopqrstuvwxyz0123 "
+            "(Caused by NewConnectionError) base.py:408"
+        )
+        out = " ".join(ingest.cause_lines([line]))
+        for gone in ("203.0.113.7", "expire=", "sig=", "pot=", "MnQ1abcdefghijklmnopqrstuvwxyz0123"):
+            self.assertNotIn(gone, out)
+        self.assertIn("unable to download video data", out)
+        self.assertIn("/videoplayback?<stripped>", out)
+        self.assertIn("Max retries exceeded", out)
+
+    def test_scrub_cause_masks_long_token_but_keeps_short_words(self):
+        out = ingest.scrub_cause("ERROR: bad token QUJDREVGR0hJSktMTU5PUFFSU1RVVldY see https://music.youtube.com/watch?v=abc")
+        self.assertIn("<token>", out)
+        self.assertNotIn("QUJDREVGR0hJSktMTU5PUFFSU1RVVldY", out)
+        self.assertIn("music.youtube.com/watch?<stripped>", out)
+
     def test_long_lines_are_capped(self):
         self.assertEqual(len(ingest.tail_of("x" * 5000, [])), ingest.LINE_MAX)
 

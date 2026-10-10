@@ -90,6 +90,13 @@ DEBUG_RECORD = re.compile(r"^\[[^\]]+\]\s+DEBUG\s+\S+ - (?P<msg>.*?)(?:\s+\S+\.p
 EXC_SUMMARY = re.compile(r"^(?:[\w.]+\.)?\w*(?:Error|Exception): \S")  # last line of a printed Python traceback
 MAX_CAUSES = 3
 GENERIC_FAILURE = "YT-DLP download error"  # spotdl's own wrapper message; it names no cause
+URL_QUERY = re.compile(r"(?<=\S)[?#]\S+")  # query string or fragment of a URL: signed googlevideo links carry ip, sig, pot
+OPAQUE_TOKEN = re.compile(r"[A-Za-z0-9_+=-]{24,}")  # long base64/hex/url-safe run: a token, not readable text
+
+
+def scrub_cause(ln: str) -> str:
+    """A cause line is public log text: drop URL query strings and fragments and mask long opaque tokens."""
+    return OPAQUE_TOKEN.sub("<token>", URL_QUERY.sub("?<stripped>", ln))
 
 
 def clean_lines(text: str, secrets: list[str]) -> list[str]:
@@ -106,11 +113,12 @@ def clean_lines(text: str, secrets: list[str]) -> list[str]:
 def cause_lines(lines: list[str]) -> list[str]:
     """Lines that carry the real download error, searched in the WHOLE output (they can be far from its end):
     spotdl's DEBUG record of the yt-dlp exception (`ERROR: [youtube] ...`) and printed exception summaries,
-    without repeats; the last MAX_CAUSES are kept."""
+    scrubbed of query strings and opaque tokens, without repeats; the last MAX_CAUSES are kept."""
     found = []
     for ln in lines:
         m = DEBUG_RECORD.match(ln)
         if (m and (m["msg"].startswith("ERROR:") or EXC_SUMMARY.match(m["msg"]))) or EXC_SUMMARY.match(ln):
+            ln = scrub_cause(ln)
             if ln not in found and GENERIC_FAILURE not in ln:
                 found.append(ln)
     return found[-MAX_CAUSES:]
