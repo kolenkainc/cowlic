@@ -205,6 +205,42 @@ class Listener(unittest.TestCase):
         self.assertLess(time.monotonic() - t0, 4)  # CONN_TIMEOUT is 5 s: only the deadline can end it this soon
         self.assertIn("timed out", str(res["err"]))
 
+    def test_trickling_client_cannot_extend_the_deadline(self):
+        """One byte every 0.5 s restarts a per-recv socket timeout forever; the total-time cap must end it."""
+        port = free_port()
+        res = {}
+        stop = threading.Event()
+
+        def listener():
+            try:
+                su.wait_for_callback("S1", 2.0, port)
+            except su.UserAuthError as e:
+                res["err"] = e
+
+        def trickle():
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+                    s.sendall(b"G")
+                    for _ in range(40):
+                        if stop.wait(0.5):
+                            break
+                        s.sendall(b"E")
+            except OSError:
+                pass
+        t = threading.Thread(target=listener)
+        c = threading.Thread(target=trickle)
+        t0 = time.monotonic()
+        t.start()
+        time.sleep(0.2)
+        c.start()
+        t.join(8)
+        stop.set()
+        c.join(5)
+        self.assertFalse(t.is_alive())
+        self.assertLess(time.monotonic() - t0, 3.5)
+        self.assertIn("timed out", str(res["err"]))
+        self.assertFalse([x for x in threading.enumerate() if isinstance(x, threading.Timer)])
+
     def test_too_many_query_parameters_is_a_clean_error(self):
         q = "&".join(f"p{i}=1" for i in range(20)) + "&state=S1&code=abc"
         with self.assertRaisesRegex(su.UserAuthError, "too many"):

@@ -20,9 +20,11 @@ import json
 import os
 import re
 import secrets
+import socket
 import stat
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -117,7 +119,32 @@ def wait_for_callback(expected_state: str, timeout: float = LOGIN_TIMEOUT, port:
     result: dict = {}
 
     class Handler(BaseHTTPRequestHandler):
-        timeout = CONN_TIMEOUT  # StreamRequestHandler applies it as the socket timeout; refreshed per request below
+        timeout = CONN_TIMEOUT  # per-recv socket timeout and, below, the TOTAL time one connection may take;
+        # refreshed per request. The socket timeout alone restarts on every byte (a trickling client).
+        _cap = None
+
+        def setup(self):
+            super().setup()
+            self._cap = threading.Timer(self.timeout, self._cut)
+            self._cap.daemon = True
+            self._cap.start()
+
+        def _cut(self):  # total-time cap hit: shut the socket down so the blocked read ends
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        def handle_one_request(self):
+            try:
+                super().handle_one_request()
+            except OSError:  # the client went away or the cap cut the socket: end quietly, no traceback
+                self.close_connection = True
+
+        def finish(self):
+            if self._cap is not None:
+                self._cap.cancel()
+            super().finish()
 
         def do_GET(self):
             url = urllib.parse.urlsplit(self.path)
