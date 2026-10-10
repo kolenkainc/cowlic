@@ -162,6 +162,11 @@ assert "last-run: no temp or result file left" "$([ -z "$(ls -A "$S/cowlic" | gr
 new_case lr_partial; STUB_RC=1; STUB_RESULT="$(res_with partial)"; export STUB_RC STUB_RESULT; run
 assert "last-run: partial" "$([ "$(jget failure_class)" = partial ] && [ "$(jget exit_code)" = 1 ] && echo 0 || echo 1)"
 
+# atomic: the old file is replaced by a rename (new inode), never rewritten in place
+STUB_RC=0; STUB_RESULT="$RES_OK"; export STUB_RC STUB_RESULT
+new_case lr_atomic; mkdir -p "$S/cowlic"; echo '{"old": true}' > "$(LASTF)"; ino_before="$(stat -c %i "$(LASTF)")"; run
+assert "last-run: replaced by rename, not rewritten in place" "$([ "$(stat -c %i "$(LASTF)")" != "$ino_before" ] && valid_json && echo 0 || echo 1)"
+
 new_case lr_signin; STUB_RC=3; STUB_RESULT="$(res_with youtube-sign-in)"; export STUB_RC STUB_RESULT; run
 assert "last-run: youtube-sign-in keeps counts" "$([ "$(jget failure_class)" = youtube-sign-in ] && [ "$(jget exit_code)" = 3 ] && [ "$(jget result.counts.added)" = 2 ] && echo 0 || echo 1)"
 
