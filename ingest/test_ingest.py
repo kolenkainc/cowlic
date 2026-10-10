@@ -151,6 +151,16 @@ elif mode == "wrapped":
     print(f"client {cid[:7]}\n{cid[7:]} secret {secret[:9]}\n  {secret[9:]}")
 elif mode == "ansi":
     print(f"client {cid[:6]}\x1b[31m{cid[6:]}\x1b[0m secret \x1b[1m{secret[:4]}\x1b[0m{secret[4:]}")
+elif mode == "argv":
+    print(f"loglevel={a[a.index('--log-level') + 1]} columns={os.environ.get('COLUMNS')}")
+elif mode == "debug_cause":
+    # shape of spotdl's output for a failed download at --log-level DEBUG (padded to the console width)
+    pad = " " * 300
+    print("Processing query: https://music.youtube.com/watch?v=x|https://open.spotify.com/track/y")
+    print(f"[13:10:00] DEBUG    MainThread - Downloader settings: {{'client_secret': '{secret}'}}{pad} downloader.py:129")
+    print(f"[13:10:01] WARNING  MainThread - Some YouTube downloads require Deno. Run spotdl --download-deno{pad} deno.py:143")
+    print(f"[13:10:01] DEBUG    MainThread - ERROR: [youtube] x: Video unavailable. This video is private{pad} base.py:408")
+    print("AudioProviderError: YT-DLP download error - https://music.youtube.com/watch?v=x")
 elif mode == "command":
     print("harmless\n::add-mask::topsecret\n  ::warning::x\n##[add-mask]y")
 sys.exit(0)
@@ -205,6 +215,21 @@ class SpotdlOutputTest(FakeSpotdlCase):
                     self.assertNotIn(secret.lower(), flat)
                 self.assertNotIn("\x1b", out)
 
+    def test_download_runs_at_debug_level_with_a_wide_console(self):
+        out = download_log(self.work, "argv")
+        self.assertIn("loglevel=DEBUG columns=2000", out)
+
+    def test_real_yt_dlp_error_is_surfaced_without_noise(self):
+        out = download_log(self.work, "debug_cause")
+        self.assertIn("ERROR: [youtube] x: Video unavailable. This video is private base.py:408", out)
+        self.assertIn("AudioProviderError: YT-DLP download error", out)
+        self.assertNotIn("Downloader settings", out)
+        self.assertNotIn(SECRET, out)
+        self.assertNotIn("   ", out)  # padding collapsed
+
+    def test_long_lines_are_capped(self):
+        self.assertEqual(len(ingest.tail_of("x" * 5000, [])), ingest.LINE_MAX)
+
     def test_redact_plain(self):
         self.assertEqual(ingest.redact(f"a {SECRET} b", [SECRET, "", CID]), "a *** b")
 
@@ -222,6 +247,16 @@ class SpotdlOutputTest(FakeSpotdlCase):
         self.assertIn("add-mask", out.getvalue())
         for line in out.getvalue().splitlines():
             self.assertFalse(line.startswith("::"), line)
+
+
+def step_lines(name: str) -> list[str]:
+    """Lines of one workflow step (from its `- name:` line up to the next step), from the real workflow file."""
+    lines = WORKFLOW.read_text().splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.strip() == f"- name: {name}")
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    end = next((i for i in range(start + 1, len(lines))
+                if lines[i].strip() and len(lines[i]) - len(lines[i].lstrip()) <= indent), len(lines))
+    return lines[start:end]
 
 
 def summary_script() -> str:
@@ -269,6 +304,97 @@ class SummaryStepTest(unittest.TestCase):
             self.assertTrue(hits)
             for ln in hits:
                 self.assertTrue(ln.startswith("    "), ln)
+
+    BLOCK = "yt_dlp.utils.DownloadError: ERROR: [youtube] x: Sign in to confirm you're not a bot"
+    FAILED = "ERROR A - T: IngestError: expected exactly one mp3 after download; spotdl output (last lines):"
+    SPOTDL_DENO_WARNING = "Some YouTube downloads require Deno. Run spotdl --download-deno or install Deno"
+
+    def test_missing_runtime_is_reported_from_ingest_warning(self):
+        text = self.summary(f"WARN js runtime: deno not found on PATH; yt-dlp needs Deno\n{self.FAILED}\n")
+        self.assertIn("No usable JavaScript runtime", text)
+        self.assertNotIn("YouTube appears to block", text)
+        self.assertNotIn("another reason", text)
+
+    def test_missing_runtime_is_reported_from_yt_dlp_error(self):
+        for marker in ("n challenge solving failed: Some formats may be missing", "Signature solving failed",
+                       "No supported JavaScript runtime could be found"):
+            with self.subTest(marker):
+                text = self.summary(f"{self.FAILED}\nERROR: {marker}\n")
+                self.assertIn("No usable JavaScript runtime", text)
+
+    def test_block_and_runtime_messages_are_distinct(self):
+        block = self.summary(f"{self.FAILED}\n{self.BLOCK}\n")
+        self.assertIn("YouTube appears to block", block)
+        self.assertNotIn("No usable JavaScript runtime", block)
+        self.assertNotIn("another reason", block)
+
+    def test_other_download_error_has_its_own_message(self):
+        text = self.summary(f"{self.FAILED}\n[x] ERROR: [youtube] x: Video unavailable. This video is private\n")
+        self.assertIn("another reason", text)
+        self.assertNotIn("YouTube appears to block", text)
+        self.assertNotIn("No usable JavaScript runtime", text)
+
+    def test_spotdl_deno_warning_alone_is_not_a_missing_runtime(self):
+        # spotdl prints it for ANY failed download (the first dispatch failed with it for another cause)
+        text = self.summary(f"{self.FAILED}\n{self.SPOTDL_DENO_WARNING}\nAudioProviderError: YT-DLP download error\n")
+        self.assertNotIn("No usable JavaScript runtime", text)
+        self.assertIn("another reason", text)
+
+    def test_no_cause_message_without_download_failures(self):
+        text = self.summary("ingested: A - T\ndone: 1 new, 0 already present, 0 no match, 0 too big, 0 failed\n")
+        for needle in ("YouTube appears to block", "No usable JavaScript runtime", "another reason"):
+            self.assertNotIn(needle, text)
+
+
+def fake_deno(directory: Path, output: str) -> None:
+    exe = directory / "deno"
+    exe.write_text(f"#!/bin/sh\necho '{output}'\n")
+    exe.chmod(0o755)
+
+
+class JsRuntimeTest(unittest.TestCase):
+    def problem(self, output: str | None) -> str | None:
+        with tempfile.TemporaryDirectory() as d:
+            if output is not None:
+                fake_deno(Path(d), output)
+            with mock.patch.dict(os.environ, {"PATH": d}):
+                return ingest.js_runtime_problem()
+
+    def test_missing(self):
+        self.assertIn("not found", self.problem(None))
+
+    def test_too_old(self):
+        self.assertIn("older than 2.3.0", self.problem("deno 2.2.9 (stable, release, x86_64-unknown-linux-gnu)"))
+
+    def test_unreadable_version(self):
+        self.assertIn("cannot read", self.problem("garbage"))
+
+    def test_supported(self):
+        for v in ("2.3.0", "2.9.5", "10.0.1"):
+            self.assertIsNone(self.problem(f"deno {v} (stable, release, x86_64-unknown-linux-gnu)"), v)
+
+
+class InstallDenoStepTest(unittest.TestCase):
+    def setUp(self):
+        self.step = "\n".join(step_lines("Install Deno"))
+
+    def test_runs_before_ingest_and_has_no_secrets(self):
+        text = WORKFLOW.read_text()
+        self.assertLess(text.index("- name: Install Deno"), text.index("- name: Run ingest"))
+        self.assertNotIn("secrets.", self.step)
+        self.assertNotIn("TG_", self.step)
+
+    def test_release_is_pinned_and_checksum_verified(self):
+        self.assertRegex(self.step, r"DENO_VERSION=\d+\.\d+\.\d+\n")
+        self.assertRegex(self.step, r"DENO_SHA256=[0-9a-f]{64}\n")
+        self.assertIn("sha256sum --check --strict", self.step)
+        self.assertLess(self.step.index("sha256sum --check"), self.step.index("unzip"))
+        self.assertIn("set -euo pipefail", self.step)
+        self.assertNotIn("latest", self.step)
+
+    def test_pinned_version_meets_yt_dlp_minimum(self):
+        m = re.search(r"DENO_VERSION=(\d+)\.(\d+)\.(\d+)", self.step)
+        self.assertGreaterEqual(tuple(int(x) for x in m.groups()), ingest.MIN_DENO)
 
 
 if __name__ == "__main__":
