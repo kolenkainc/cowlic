@@ -298,7 +298,7 @@ ingest already uses) and YouTube Music searches.
 
 ```sh
 ingest/.venv/bin/python ingest/match_report.py <artist id or URL> [<artist id or URL> ...] \
-    [--artists-file artists.txt] [--max-tracks 150] [--min-interval 1.0] [--out match-report-NAME.csv]
+    [--artists-file artists.txt] [--max-tracks 150] [--min-interval 1.0] [--wrong N --checked M] [--out match-report-NAME.csv]
 ```
 
 - Pick 5-10 artists that look like your library: some with remasters and live albums, some with non-Latin names.
@@ -315,36 +315,51 @@ ingest/.venv/bin/python ingest/match_report.py <artist id or URL> [<artist id or
   Titles are untrusted text: control characters are stripped and a cell starting with `=`, `+`, `-` or `@` gets a
   leading apostrophe, so the file is safe to open in a spreadsheet.
 - Columns: `artist, artist_id, title, duration_s, matched_title, matched_duration_s, duration_delta_s, similarity,
-  status, reason`. Status: `matched`; `no_match` (the matched columns then show the closest result YouTube Music
-  returned and `reason` is `title` (no result with title similarity >= 0.85), `duration` (the title fit but the
-  duration was more than 3 s off) or `no_results`); `uncomparable` (no usable title or duration, not searched);
-  `error` (the search failed after retries).
-- The summary on stdout gives the counts, the match rate overall and per artist, and the 15 lowest-similarity
-  failures. Exit code 0 normally, 2 if an artist failed or the run stopped early (the CSV is still written), 1 for
-  invalid input or missing credentials.
+  status, reason, pattern, reviewed`. Status: `matched`; `no_match` (the matched columns then show the closest
+  result YouTube Music returned and `reason` is `title` (no result with title similarity >= 0.85), `duration` (the
+  title fit but the duration was more than 3 s off) or `no_results`); `uncomparable` (no usable title or duration,
+  not searched); `error` (the search failed after retries). `pattern` tags every `no_match` row (below);
+  `reviewed` is empty: you fill it with `ok` or `wrong` for the matched rows you check.
+- Failing patterns, one primary pattern per `no_match` row so the counts add up, first rule that fits wins, taken
+  from the Spotify title: `remaster` (remaster, deluxe, anniversary, expanded, reissue, bonus track), `live` (live,
+  acoustic, session, unplugged), `remix` (remix, rmx, edit, mix), `non-latin` (any letter outside the Latin script:
+  Cyrillic, CJK, Arabic, Greek ...), `featuring` (feat, ft), `short-generic` (at most 2 words, or at most 6
+  characters, or intro/outro/interlude/untitled/skit/prelude/reprise/theme), then by the search outcome:
+  `duration-only` (the title was found, the duration was off), `no-results`, `other`.
+- The summary on stdout gives the counts, the match rate overall and per artist, the share of search errors (with a
+  loud WARNING above 10%: the verdict may be misleading), the failing patterns with counts, most frequent first,
+  and the 15 lowest-similarity failures. Exit code 0 normally, 2 if an artist failed or the run stopped early (the
+  CSV is still written), 1 for invalid input or missing credentials. A YouTube sign-in challenge in a search stops
+  the run at once; it is not bypassed.
 
 ### How to read it
 
-Match rate = `matched / (matched + no_match)` on the sample (`uncomparable` and `error` are left out; look at them
-separately, many of either means the sample or the connection is bad):
+The gate is the one from assessment #92: **matched >= 80% AND wrong <= 2%**. Match rate = `matched / (matched +
+no_match)` on the sample (`uncomparable` and `error` are left out; look at them separately, many of either means
+the sample or the connection is bad). The script prints one of three verdicts:
 
-| Match rate | Decision |
+| Verdict | Meaning |
 |---|---|
-| >= 85% | Go: start the capped first run (#113). The remaining 15% are skipped as `no_match` and retried after the cooldown |
-| 60% to 85% | Tune the matcher first (see below), re-run the report on the same artists, compare |
-| < 60% | No-go: do not ingest artists with this matcher; report the dominant `reason` in the ticket |
+| `matched rate >= 80%: go IF the owner's spot-check of matched rows finds <= 2% wrong` | Half the gate. Do the spot-check below; only if it holds, start the capped first run (#113) |
+| `matched rate < 80%: no-go for now (tune the matcher; see the top failing patterns)` | Tune the matcher for the most frequent failing pattern, re-run the report on the same artists, compare |
+| `no verdict` | Nothing was compared (all `uncomparable` or `error`) |
 
-A sample under 30 compared tracks only gives a hint. Read the per-artist lines too: one artist at 20% in an
-otherwise good sample (say, a non-Latin name) is a finding even when the overall rate passes.
+The wrong-match rate cannot be computed automatically (the script cannot know that a matched video is the wrong
+recording). It comes from the owner: label a random sample of `matched` rows `ok` or `wrong` in the `reviewed`
+column (open the matched video on https://music.youtube.com; a live or cover version that slipped through is
+`wrong`; at least 50 rows is a sensible sample), wrong rate = wrong / checked, must be <= 2%. You can pass the counts
+back (`--wrong N --checked M` on a re-run; it only prints the rate against the limit, it does not change the
+verdict line). A sample under 30 compared tracks only gives a hint (the summary says so). Read the per-artist lines
+too: one artist at 20% in an otherwise good sample (say, a non-Latin name) is a finding even when the overall rate
+passes.
 
 What the owner does (ticket #112): run the report on the chosen artists, open the CSV, filter `status = no_match`
 and sort by `similarity` ascending (the stdout list is the same view). For a handful of rows check on
 https://music.youtube.com whether a correct video exists. `reason = duration` with a right-looking video means the
 tolerance is too tight or the Spotify release is a different edit; `reason = title` with a right-looking video means
 the title normalisation misses something (remaster or live suffixes, transliteration); `no_results` means search,
-not scoring, is the problem. Also spot check some `matched` rows for wrong picks (a live or cover version that
-slipped through): a high rate with wrong matches is worse than a lower one. Then write the rate, the decision and
-the dominant reasons in #112. Do not commit the CSV.
+not scoring, is the problem. Do the `matched` spot-check above. Then write the match rate, the wrong rate, the
+decision and the top failing patterns in #112. Do not commit the CSV.
 
 ## Exit codes
 

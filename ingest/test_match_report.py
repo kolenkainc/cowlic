@@ -86,13 +86,36 @@ class Counts(unittest.TestCase):
         self.assertAlmostEqual(mr.rate({"matched": 3, "no_match": 1, "uncomparable": 9, "error": 9}), 0.75)
         self.assertIsNone(mr.rate({"matched": 0, "no_match": 0, "uncomparable": 2, "error": 0}))
 
-    def test_verdict_thresholds(self):
-        self.assertTrue(mr.verdict(0.85, 100).startswith("GO"))
-        self.assertTrue(mr.verdict(0.8499, 100).startswith("TUNE"))
-        self.assertTrue(mr.verdict(0.60, 100).startswith("TUNE"))
-        self.assertTrue(mr.verdict(0.5999, 100).startswith("NO-GO"))
-        self.assertIn("indicative", mr.verdict(0.9, 10))
-        self.assertTrue(mr.verdict(None, 0).startswith("NO VERDICT"))
+    def test_verdict_is_the_92_gate(self):
+        go = "matched rate >= 80%: go IF the owner's spot-check of matched rows finds <= 2% wrong"
+        no = "matched rate < 80%: no-go for now (tune the matcher; see the top failing patterns)"
+        self.assertEqual(mr.verdict(0.80), go)
+        self.assertEqual(mr.verdict(0.82), go)
+        self.assertEqual(mr.verdict(0.7999), no)
+        self.assertEqual(mr.verdict(0.0), no)
+        self.assertTrue(mr.verdict(None).startswith("no verdict"))
+
+    def test_small_sample_and_error_warnings(self):
+        rows = [mr.Row("A", A1, f"t{i}", 1.0, "matched") for i in range(10)]
+        text = "\n".join(mr.summary_lines(rows, [], None, None))
+        self.assertIn("only a hint", text)
+        self.assertNotIn("WARNING", text)
+        rows += [mr.Row("A", A1, "e", 1.0, "error") for _ in range(2)]  # 2 of 12 = 16.7%
+        text = "\n".join(mr.summary_lines(rows, [], None, None))
+        self.assertIn("WARNING: verdict may be misleading: 17% of searches failed", text)
+        self.assertIn("search errors: 2 of 12", text)
+        ok = rows[:10] + [mr.Row("A", A1, "e", 1.0, "error")] * 1  # 1 of 11 = 9.1%
+        self.assertNotIn("WARNING", "\n".join(mr.summary_lines(ok, [], None, None)))
+
+    def test_spot_check(self):
+        self.assertIsNone(mr.parse_spot_check(None, None))
+        self.assertEqual(mr.parse_spot_check(1, 50), (1, 50))
+        for bad in ((1, None), (None, 5), (6, 5), (-1, 5), (0, 0)):
+            with self.assertRaises(mr.ReportError, msg=bad):
+                mr.parse_spot_check(*bad)
+        rows = [mr.Row("A", A1, "t", 1.0, "matched")]
+        self.assertIn("within", "\n".join(mr.summary_lines(rows, [], None, None, (1, 50))))
+        self.assertIn("EXCEEDED", "\n".join(mr.summary_lines(rows, [], None, None, (2, 50))))
 
     def test_duplicates_are_collapsed_before_the_search(self):
         ytm = FakeYtm({"song 1": [result("Song 1", 200)]})
@@ -162,6 +185,19 @@ class Errors(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         self.assertTrue(all(r.status == "error" for r in rows))
         self.assertIn("3 searches failed", stop)
+
+    def test_sign_in_error_stops_immediately(self):
+        cat = {A1: [song(i) for i in range(1, 10)]}
+        err = RuntimeError("Sign in to confirm you're not a bot")
+        rows, _, stop, _ = do_run(cat, FakeYtm(error=err))
+        self.assertEqual(len(rows), 1)
+        self.assertIn("sign in", stop)
+
+    def test_uncomparable_rows_do_not_reset_the_error_streak(self):
+        songs = [song(1), song(2, dur=0), song(3), song(4, dur=0), song(5), song(6)]
+        rows, _, stop, _ = do_run({A1: songs}, FakeYtm(error=ValueError("x")))
+        self.assertIsNotNone(stop)
+        self.assertEqual(sum(r.status == "error" for r in rows), 3)
 
     def test_success_resets_the_error_streak(self):
         calls = {"n": 0}
@@ -249,6 +285,66 @@ class Csv(unittest.TestCase):
         self.assertIn("match-report*.csv", (root / ".gitignore").read_text().splitlines())
 
 
+class Patterns(unittest.TestCase):
+    def test_rules_and_priority(self):
+        cases = [
+            ("Heroes (2017 Remaster)", "title", "remaster"),
+            ("Album Name - Deluxe Edition Bonus Track", "title", "remaster"),
+            ("25th Anniversary Mix", "title", "remaster"),  # remaster outranks remix
+            ("Wish You Were Here - Live at Wembley", "duration", "live"),
+            ("Something Acoustic Version", "title", "live"),
+            ("Radio Session", "title", "live"),
+            ("Some Long Song Title (Club Remix)", "title", "remix"),
+            ("Some Long Song Title - Radio Edit", "title", "remix"),
+            ("Драма", "title", "non-latin"),
+            ("Очень длинное название песни", "duration", "non-latin"),
+            ("夜に駆ける", "title", "non-latin"),
+            ("Café Tacvba Song Of Love", "title", "other"),  # accented Latin is Latin
+            ("A Longer Song Name (feat. Someone)", "title", "featuring"),
+            ("A Longer Song Name ft. Someone", "title", "featuring"),
+            ("Intro", "no_results", "short-generic"),
+            ("Untitled", "title", "short-generic"),
+            ("Hotel California", "duration", "short-generic"),  # <= 2 words
+            ("Go", "title", "short-generic"),
+            ("Walking On Broken Glass", "duration", "duration-only"),
+            ("Walking On Broken Glass", "no_results", "no-results"),
+            ("Walking On Broken Glass", "title", "other"),
+            ("", "title", "other"),
+        ]
+        for title, reason, want in cases:
+            self.assertEqual(mr.failure_pattern(title, reason), want, (title, reason))
+        self.assertTrue(set(c[2] for c in cases) <= set(mr.PATTERNS))
+
+    def test_rows_are_tagged_and_counted_most_frequent_first(self):
+        ytm = FakeYtm({"драма": [result("Другая песня", 200)], "remaster": [result("Remaster Title X", 250)]})
+        cat = {A1: [song(1, name="Драма"), song(2, name="Драма Два"),
+                    song(3, name="Walking On Broken Glass (Remastered)"),
+                    song(4, name="Walking On Broken Glass", dur=100.0),
+                    song(5, name="Matched Song Title Here")]}
+        ytm.table["matched song"] = [result("Matched Song Title Here", 200)]
+        rows, outcomes, _, _ = do_run(cat, ytm)
+        by = {r.title: r for r in rows}
+        self.assertEqual(by["Драма"].pattern, "non-latin")
+        self.assertEqual(by["Walking On Broken Glass (Remastered)"].pattern, "remaster")
+        self.assertEqual(by["Walking On Broken Glass"].pattern, "no-results")
+        self.assertEqual(by["Matched Song Title Here"].pattern, "")  # only failures are tagged
+        counts = mr.pattern_counts(rows)
+        self.assertEqual(counts[0], ("non-latin", 2))
+        self.assertEqual(sum(n for _, n in counts), sum(1 for r in rows if r.status == "no_match"))
+        text = "\n".join(mr.summary_lines(rows, outcomes, None, None))
+        self.assertIn("top failing patterns", text)
+        self.assertLess(text.index("non-latin"), text.index("remaster\n") if "remaster\n" in text else 10 ** 9)
+
+    def test_pattern_column_in_csv(self):
+        self.assertIn("pattern", mr.COLUMNS)
+        self.assertIn("reviewed", mr.COLUMNS)
+        r = mr.Row("A", A1, "Драма", 1.0, "no_match", pattern="non-latin")
+        cells = r.cells()
+        self.assertEqual(len(cells), len(mr.COLUMNS))
+        self.assertEqual(cells[mr.COLUMNS.index("pattern")], "non-latin")
+        self.assertEqual(cells[mr.COLUMNS.index("reviewed")], "")
+
+
 class Ordering(unittest.TestCase):
     def test_output_is_identical_across_runs_and_follows_artist_order(self):
         cat = {A2: [song(i, artist="Two") for i in range(1, 8)], A1: [song(i + 50) for i in range(1, 8)]}
@@ -276,7 +372,7 @@ class Summary(unittest.TestCase):
         text = "\n".join(mr.summary_lines(rows, outcomes, stop, Path("match-report-z.csv")))
         self.assertIn("matched: 2  no_match: 2", text)
         self.assertIn("50.0%", text)
-        self.assertIn("NO-GO", text)
+        self.assertIn("no-go for now", text)
         self.assertIn(f"Art ({A1})", text)
         self.assertIn(f"Two ({A2})", text)
         self.assertIn("rate 100.0%", text)
