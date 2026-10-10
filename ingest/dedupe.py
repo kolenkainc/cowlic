@@ -24,7 +24,8 @@ the identity of a recording is a heuristic key:
 * Which one is kept: the earliest release date (a reduced-precision date, year or year-month, sorts after the
   full dates of that period); on a tie album over single over compilation over unknown; then input order.
 * Records that cannot be compared are always kept and counted as `uncomparable`: no usable duration (missing,
-  zero, negative, NaN, bool, not a number), no title, or no artist.
+  zero, negative, NaN, bool, not a number), no title, or no artist, or a title / artist name longer than
+  MAX_TEXT_LEN characters (no regex runs on it, so one corrupt record cannot stall a run).
 * Output order is the input order of the kept records. Complexity O(n log n).
 """
 import bisect
@@ -37,7 +38,8 @@ from typing import Callable, Iterable
 
 from match import DURATION_TOLERANCE_S, normalize
 
-_EPS = 1e-9  # float noise on the +-3.0 s boundary (durations are ms / 1000)
+MAX_TEXT_LEN = 300# titles / artist names longer than this are uncomparable: bounds the regex work per record
+_EPS = 1e-9 # float noise on the +-3.0 s boundary (durations are ms / 1000)
 _TYPE_RANK = {"album": 0, "single": 1, "compilation": 2}
 
 _GROUP = re.compile(r"\s*[(\[]([^()\[\]]*)[)\]]")
@@ -80,6 +82,8 @@ def _classify(text: str) -> str | None:
 
 def title_key(title: str) -> tuple[str, bool, bool]:
     """(key text, is_live, is_explicit) for a displayed title. The key text has the removable tags dropped."""
+    if len(title) > MAX_TEXT_LEN:  # no regex runs on it; an empty key makes the record uncomparable (kept)
+        return "", False, False
     text = unicodedata.normalize("NFKC", title).lower()
     live = explicit = False
 
@@ -112,7 +116,8 @@ def _primary_artist(rec: dict) -> str:
     artists = rec.get("artists")
     first = artists[0] if isinstance(artists, list) and artists and isinstance(artists[0], str) else None
     alb = rec.get("album_artist")
-    return normalize(first or (alb if isinstance(alb, str) else "") or "")
+    name = first or (alb if isinstance(alb, str) else "") or ""
+    return normalize(name) if len(name) <= MAX_TEXT_LEN else ""  # over-long: uncomparable
 
 
 def _date_key(rec: dict) -> tuple[int, int, int]:
@@ -172,6 +177,11 @@ def collapse(records: Iterable[dict], merge_variants: bool = False, tolerance: f
                         uncomparable=uncomparable, pairs=pairs)
 
 
+def _safe(value: str) -> str:
+    """An id for a log line: control characters (newlines included) replaced, length bounded."""
+    return "".join(c if c.isprintable() else "?" for c in value[:64])
+
+
 def summary(result: DedupeResult) -> str:
     return f"listed {result.listed}, unique {result.unique}, dropped {result.dropped}"
 
@@ -182,4 +192,4 @@ def report(result: DedupeResult, out: Callable[[str], None] = lambda s: print(s,
     out(summary(result))
     if show_pairs:
         for dropped, kept in result.pairs:
-            out(f"dropped {dropped} -> kept {kept}")
+            out(f"dropped {_safe(dropped)} -> kept {_safe(kept)}")

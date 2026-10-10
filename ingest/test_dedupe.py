@@ -2,6 +2,7 @@
 import contextlib
 import copy
 import io
+import multiprocessing
 import random
 import time
 import unittest
@@ -273,7 +274,76 @@ class Properties(unittest.TestCase):
             collapse([rec("a"), "nope"])
 
 
+def _child(conn, fn, args):
+    conn.send(fn(*args))
+
+
+def within(seconds, fn, *args):
+    """Runs fn(*args) in a forked child and kills it after `seconds`: a regex blocking in C cannot be interrupted
+    by a signal handler, so a slow (quadratic) implementation fails the test instead of hanging the suite."""
+    ctx = multiprocessing.get_context("fork")
+    recv, send = ctx.Pipe(duplex=False)
+    p = ctx.Process(target=_child, args=(send, fn, args))
+    p.start()
+    if not recv.poll(seconds):
+        p.kill()
+        p.join()
+        raise AssertionError(f"exceeded the {seconds} s budget")
+    out = recv.recv()
+    p.join()
+    return out
+
+
+class LongText(unittest.TestCase):
+    SHAPES = {
+        "spaces": " " * 100_000 + "x",
+        "dash_spaces": "-" + " " * 100_000,
+        "paren_spaces": "(" + " " * 100_000,
+        "dashes": " - " * 50_000,
+        "a_dashes": "a - " * 30_000,
+        "brackets": "(a " * 40_000,
+    }
+
+    def test_pathological_titles_return_fast_and_are_uncomparable(self):
+        for shape, title in self.SHAPES.items():
+            with self.subTest(shape=shape):
+                res = within(1, collapse, [rec("a", title), rec("b", title, date="2020-01-01")])
+                self.assertEqual(ids(res), ["a", "b"])
+                self.assertEqual((res.uncomparable, res.dropped), (2, 0))
+                self.assertEqual(within(1, title_key, title), ("", False, False))
+
+    def test_long_artist_is_uncomparable(self):
+        r = [rec("a", artist=" " * 100_000 + "x"), rec("b", artist=" " * 100_000 + "x", date="2020-01-01")]
+        res = within(1, collapse, r)
+        self.assertEqual((ids(res), res.uncomparable), (["a", "b"], 2))
+
+    def test_bound_is_inclusive(self):
+        at, over = "a" * dedupe.MAX_TEXT_LEN, "a" * (dedupe.MAX_TEXT_LEN + 1)
+        res = collapse([rec("a", at), rec("b", at, date="2020-01-01")])
+        self.assertEqual((ids(res), res.uncomparable), (["a"], 0))
+        res = collapse([rec("a", over), rec("b", over, date="2020-01-01")])
+        self.assertEqual((ids(res), res.uncomparable), (["a", "b"], 2))
+
+    def test_worst_case_at_the_bound_is_fast(self):
+        n = dedupe.MAX_TEXT_LEN
+        for title in (" " * n, "(" + " " * (n - 1), " - " * (n // 3), "a - " * (n // 4)):
+            within(1, title_key, title)
+
+    def test_many_titles_at_the_bound_stay_fast(self):
+        r = [rec(f"id{i}", " - " * 100 + str(i), dur=100 + i % 200) for i in range(10000)]
+        within(5, collapse, r)
+
+
 class Report(unittest.TestCase):
+    def test_pair_ids_are_sanitised(self):
+        res = collapse([rec("a\nFAKE line\x1b[0m"), rec("b\r\nx", date="2020-01-01")], collect_pairs=True)
+        lines = []
+        dedupe.report(res, out=lines.append, show_pairs=True)
+        self.assertEqual(len(lines), 2)
+        for ln in lines:
+            self.assertTrue(ln.isprintable(), ln)
+        self.assertEqual(lines[1], "dropped b??x -> kept a?FAKE line?[0m")
+
     def test_summary_and_counts_only_by_default(self):
         res = collapse([rec("a", "Secret Title"), rec("b", "Secret Title", date="2020-01-01"), rec("c", "Other")],
                        collect_pairs=True)
