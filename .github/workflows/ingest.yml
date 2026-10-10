@@ -13,6 +13,7 @@ on:
 permissions:
   contents: read
 
+# At most one run is pending behind a running one; a third dispatch cancels the pending second one.
 concurrency:
   group: ingest
   cancel-in-progress: false
@@ -21,6 +22,9 @@ jobs:
   ingest:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    # All ingest values (including ids) are secrets of the "ingest" environment, so they are masked in logs.
+    # The environment itself (restricted to master) is created by the owner.
+    environment: ingest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -40,7 +44,9 @@ jobs:
         env:
           PLAYLIST_URL: ${{ inputs.playlist_url }}
         run: |
-          if ! printf '%s' "$PLAYLIST_URL" | grep -Eq '^https://open\.spotify\.com/playlist/[A-Za-z0-9]+(\?[A-Za-z0-9=&_.-]*)?$'; then
+          # [[ =~ ]] matches the whole string (no line-by-line matching), so embedded newlines are rejected.
+          re='^https://open\.spotify\.com/playlist/[A-Za-z0-9]{1,64}(\?[A-Za-z0-9=&_.-]{0,200})?$'
+          if ! [[ "$PLAYLIST_URL" =~ $re ]]; then
             echo "playlist_url must look like https://open.spotify.com/playlist/<id>" >&2
             exit 1
           fi
@@ -49,26 +55,41 @@ jobs:
         env:
           PLAYLIST_URL: ${{ inputs.playlist_url }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHANNEL_ID: ${{ secrets.TG_CHANNEL_ID }}
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-          D1_DATABASE_ID: ${{ vars.D1_DATABASE_ID }}
-          TG_CHANNEL_ID: ${{ vars.TG_CHANNEL_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
         run: |
           set -o pipefail
           python ingest/ingest.py "$PLAYLIST_URL" 2>&1 | tee "$RUNNER_TEMP/ingest.log"
 
       - name: Summary
         if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
         run: |
+          log="$RUNNER_TEMP/ingest.log"
           {
             echo "## Ingest result"
             echo
-            if [ -f "$RUNNER_TEMP/ingest.log" ]; then
-              echo '```'
-              grep -E '^(done:|ERROR |WARN |ingested:)' "$RUNNER_TEMP/ingest.log" || echo "no result lines (see the step log)"
-              echo '```'
+            echo "Job status: $JOB_STATUS"
+            echo
+            if [ -f "$log" ]; then
+              if grep -Eiq 'Sign in to confirm|not a bot|HTTP Error 429|HTTP Error 403|Too Many Requests' "$log"; then
+                echo "**YouTube appears to block this runner IP (plan B: self-hosted runner or local run)**"
+                echo
+              fi
+              echo "Added / skipped / failed:"
+              echo '````'
+              grep -E '^(done:|ERROR |WARN |ingested:|skipped )' "$log" || echo "no result lines"
+              echo '````'
+              echo
+              echo "Last 40 log lines (Spotify credentials redacted by ingest.py):"
+              echo '````'
+              tail -n 40 "$log"
+              echo '````'
             else
               echo "Ingest did not start (see the failed step)."
             fi
