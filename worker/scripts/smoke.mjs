@@ -62,6 +62,25 @@ try {
   x = await j("search3&query=%25");
   check("search3 escapes LIKE wildcard", !x.searchResult3?.song?.length);
 
+  // Endpoints Symfonium calls during sync: valid empty / no-op responses.
+  for (const name of [
+    "getPlaylists", "getGenres", "getStarred2", "getScanStatus", "startScan", "getNowPlaying",
+    "getRandomSongs&size=5", "getSongsByGenre&genre=x", "getArtistInfo2&id=ar1", "getAlbumInfo2&id=al1",
+    "getTopSongs&artist=x", "getSimilarSongs2&id=t1", "getBookmarks", "getPlayQueue",
+    "star&id=t1", "unstar&id=t1", "scrobble&id=t1", "setRating&id=t1&rating=3",
+  ]) {
+    x = await j(name);
+    check(`${name.split("&")[0]} returns ok`, x.status === "ok", x.error?.message ?? "");
+  }
+  x = await j("getIndexes");
+  check("getIndexes", x.indexes?.index?.[0]?.artist?.[0]?.id === "ar1");
+  x = await j("getPlaylists");
+  check("getPlaylists has empty playlist list", Array.isArray(x.playlists?.playlist));
+  x = await j("getUser&username=" + vars.SUBSONIC_USER);
+  check("getUser", x.user?.username === vars.SUBSONIC_USER && x.user.streamRole === true);
+  x = await j("getPlaylist&id=nope");
+  check("getPlaylist unknown -> error 70", x.error?.code === 70);
+
   r = await worker.fetch(`/rest/getArtists?${auth.replace("&f=json", "")}`);
   const xml = await r.text();
   check("XML response by default", r.headers.get("content-type")?.startsWith("text/xml") && xml.includes('<artist id="ar1"'), xml.slice(0, 80));

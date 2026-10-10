@@ -1,6 +1,7 @@
 import { authenticate, type AuthEnv } from "./auth";
 import { coverFileId, getAlbum, getAlbumList2, getArtist, getArtists, getSong, search3 } from "./library";
 import { fail, ok } from "./subsonic";
+import { stubResponse } from "./stubs";
 import { proxyTelegramFile, type TgEnv } from "./telegram";
 
 interface Env extends AuthEnv, TgEnv {
@@ -22,49 +23,66 @@ interface TrackRow {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    const m = url.pathname.match(/^\/rest\/([A-Za-z0-9]+)(?:\.view)?$/);
-    if (!m) return new Response("Not found", { status: 404 });
-
-    // Subsonic clients may send credentials in a POST form body as well as in the query string.
-    const params = new URLSearchParams(url.search);
-    if (request.method === "POST") {
-      new URLSearchParams(await request.clone().text()).forEach((v, k) => params.set(k, v));
+    const endpoint = url.pathname.match(/^\/rest\/([A-Za-z0-9]+)(?:\.view)?$/)?.[1] ?? "-";
+    let res: Response;
+    try {
+      res = await handle(request, env);
+    } catch (e) {
+      // Error type only: messages may embed query values.
+      console.error(JSON.stringify({ method: request.method, path: url.pathname, endpoint, error: e instanceof Error ? e.name : "unknown" }));
+      throw e;
     }
-
-    if (!(await authenticate(params, env))) return fail(params, 40, "Wrong username or password");
-
-    switch (m[1]) {
-      case "ping":
-        return ok(params);
-      case "getLicense":
-        return ok(params, { license: { valid: true } });
-      case "getOpenSubsonicExtensions":
-        return ok(params, { openSubsonicExtensions: [] });
-      case "getMusicFolders":
-        return ok(params, { musicFolders: { musicFolder: [{ id: 1, name: "Music" }] } });
-      case "getArtists":
-        return getArtists(env.DB, params);
-      case "getArtist":
-        return getArtist(env.DB, params);
-      case "getAlbum":
-        return getAlbum(env.DB, params);
-      case "getSong":
-        return getSong(env.DB, params);
-      case "getAlbumList2":
-        return getAlbumList2(env.DB, params);
-      case "search3":
-        return search3(env.DB, params);
-      case "getCoverArt":
-        return cover(request, params, env);
-      case "stream":
-      case "download":
-        return stream(request, params, env);
-      default:
-        // Remaining endpoints are added in step 2/3 of the POC plan.
-        return fail(params, 0, `Not implemented: ${m[1]}`);
-    }
+    // Never log the query string, credentials or ids.
+    console.log(JSON.stringify({ method: request.method, path: url.pathname, endpoint, status: res.status }));
+    return res;
   },
 };
+
+async function handle(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const m = url.pathname.match(/^\/rest\/([A-Za-z0-9]+)(?:\.view)?$/);
+  if (!m) return new Response("Not found", { status: 404 });
+
+  // Subsonic clients may send credentials in a POST form body as well as in the query string.
+  const params = new URLSearchParams(url.search);
+  if (request.method === "POST") {
+    new URLSearchParams(await request.clone().text()).forEach((v, k) => params.set(k, v));
+  }
+
+  if (!(await authenticate(params, env))) return fail(params, 40, "Wrong username or password");
+
+  switch (m[1]) {
+    case "ping":
+      return ok(params);
+    case "getLicense":
+      return ok(params, { license: { valid: true } });
+    case "getOpenSubsonicExtensions":
+      return ok(params, { openSubsonicExtensions: [] });
+    case "getMusicFolders":
+      return ok(params, { musicFolders: { musicFolder: [{ id: 1, name: "Music" }] } });
+    case "getArtists":
+      return getArtists(env.DB, params);
+    case "getIndexes":
+      return getArtists(env.DB, params, "indexes");
+    case "getArtist":
+      return getArtist(env.DB, params);
+    case "getAlbum":
+      return getAlbum(env.DB, params);
+    case "getSong":
+      return getSong(env.DB, params);
+    case "getAlbumList2":
+      return getAlbumList2(env.DB, params);
+    case "search3":
+      return search3(env.DB, params);
+    case "getCoverArt":
+      return cover(request, params, env);
+    case "stream":
+    case "download":
+      return stream(request, params, env);
+    default:
+      return stubResponse(m[1], params) ?? fail(params, 0, `Not implemented: ${m[1]}`);
+  }
+}
 
 async function stream(request: Request, params: URLSearchParams, env: Env): Promise<Response> {
   const id = params.get("id");

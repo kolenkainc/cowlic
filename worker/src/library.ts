@@ -94,7 +94,8 @@ async function getAlbumRows(db: D1Database, artistId: string): Promise<AlbumRow[
   return r.results;
 }
 
-export async function getArtists(db: D1Database, p: URLSearchParams): Promise<Response> {
+// getArtists (ID3) and getIndexes (folder view) share the same grouped-by-letter shape.
+export async function getArtists(db: D1Database, p: URLSearchParams, key: "artists" | "indexes" = "artists"): Promise<Response> {
   const r = await db
     .prepare(
       `SELECT ar.id, ar.name, COUNT(al.id) AS album_count
@@ -112,7 +113,8 @@ export async function getArtists(db: D1Database, p: URLSearchParams): Promise<Re
     groups.set(letter, list);
   }
   const index = [...groups].map(([name, artist]) => ({ name, artist }));
-  return ok(p, { artists: { ignoredArticles: "", index } });
+  const extra = key === "indexes" ? { lastModified: 0 } : {};
+  return ok(p, { [key]: { ignoredArticles: "", ...extra, index } });
 }
 
 export async function getArtist(db: D1Database, p: URLSearchParams): Promise<Response> {
