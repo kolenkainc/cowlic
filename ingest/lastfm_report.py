@@ -63,7 +63,7 @@ LOWEST_TITLE_ONLY = 15
 CSV_MAX_BYTES = 5 * 1024 * 1024
 CSV_MAX_ROWS = 2000
 COLUMNS = ["artist_rank", "artist", "title", "lastfm_duration_s", "mode", "matched_title", "matched_artists",
-           "matched_duration_s", "duration_delta_s", "similarity", "status", "reason", "pattern", "reviewed"]
+           "matched_duration_s", "duration_delta_s", "similarity", "status", "reason", "pattern", "reviewed", "run_stopped"]
 
 
 def ranking_call_bound(years: int) -> int:
@@ -89,12 +89,13 @@ class Row:
     reason: str = ""
     pattern: str = ""  # failing pattern, only for no_match rows (match_report.failure_pattern)
     reviewed: str = ""  # the owner's label: ok / wrong (never written by the report itself)
+    stopped: str = ""  # why the live run ended early (same on every row), so --summarize can refuse a go
 
     def cells(self) -> list[str]:
         return [str(self.rank), csv_cell(self.artist), csv_cell(self.title), _num(self.duration, 0), self.mode,
                 csv_cell(self.matched_title), csv_cell(self.matched_artists), _num(self.matched_duration),
                 _num(self.delta), _num(self.similarity, 3), self.status, csv_cell(self.reason), self.pattern,
-                csv_cell(self.reviewed)]
+                csv_cell(self.reviewed), csv_cell(self.stopped)]
 
 
 def _closest_by_title(title: str, results: list[dict]) -> dict | None:
@@ -273,7 +274,7 @@ def read_rows(path: str) -> list[Row]:
         dur = _opt_float(c[3])
         rows.append(Row(rank, clean_text(c[1]), clean_text(c[2]), None if dur is None else int(dur), c[4], c[10],
                         clean_text(c[5]), clean_text(c[6]), _opt_float(c[7]), _opt_float(c[8]), _opt_float(c[9]),
-                        clean_text(c[11]), c[12][:40], c[13].strip().casefold()[:20]))
+                        clean_text(c[11]), clean_text(c[12])[:40], clean_text(c[13]).casefold()[:20], clean_text(c[14])))
     return rows
 
 
@@ -308,23 +309,47 @@ def wrong_rate(s: dict) -> float | None:
     return s["wrong"] / checked if checked else None
 
 
-def verdict(rows: list[Row]) -> str:
-    """The #92 gate. Go needs the matched rate >= 80% AND every mode that has matched rows labelled with a wrong
-    rate <= 2% (the title-only mode is judged on its own rate), plus the overall wrong rate <= 2%."""
+def no_verdict_reasons(rows: list[Row], stop: str | None = None) -> list[str]:
+    """Why the gate means nothing on these rows (empty: it can be judged). The sample must be big enough, the
+    searches must mostly have worked, the run must have ended normally, and every mode with matched rows needs
+    min(MIN_SAMPLE, its matched rows) labelled rows."""
+    total = counts_of(rows)
+    compared = total["matched"] + total["no_match"]
+    searched = compared + total["error"]
+    reasons = []
+    if compared < mr.MIN_SAMPLE:
+        reasons.append(f"only {compared} compared tracks (need {mr.MIN_SAMPLE})")
+    if searched and total["error"] / searched > mr.ERROR_SHARE_WARN:
+        reasons.append(f"{total['error'] / searched:.0%} of the searches failed (limit {mr.ERROR_SHARE_WARN:.0%})")
+    stop = stop or next((r.stopped for r in rows if r.stopped), "")
+    if stop:
+        reasons.append(f"the run stopped early ({clean_text(stop)})")
+    for m in MODES:
+        s = wrong_stats(rows, m)
+        need = min(mr.MIN_SAMPLE, s["matched"])
+        if s["matched"] and s["ok"] + s["wrong"] < need:
+            reasons.append(f"mode {m}: {s['ok'] + s['wrong']} of {need} needed matched rows labelled ok/wrong")
+    return reasons
+
+
+def verdict(rows: list[Row], stop: str | None = None) -> str:
+    """The #92 gate. A go needs: matched rate >= 80% AND a wrong rate <= 2% overall and in every mode that has
+    matched rows (the title-only mode is judged on its own), on a sample the gate can be judged on
+    (no_verdict_reasons). When it cannot be judged the line says `no verdict: ...` and never the word go."""
     r = rate(counts_of(rows))
     if r is None:
-        return "no verdict (nothing was compared)"
+        return "no verdict: nothing was compared"
+    reasons = no_verdict_reasons(rows, stop)
+    if reasons:
+        return (f"no verdict: {'; '.join(reasons)} (matched rate so far {_pct(r)}; label matched rows ok/wrong in "
+                "`reviewed`, then --summarize the CSV)")
     if r < mr.GO_RATE:
         return "matched rate < 80%: no-go for now (tune the matcher; see the failing patterns and the per-mode rates)"
-    missing = [m for m in MODES if (s := wrong_stats(rows, m))["matched"] and not s["ok"] + s["wrong"]]
-    if missing:
-        return (f"matched rate >= 80%, but no wrong-rate label for mode {', '.join(missing)}: not a go yet "
-                "(label matched rows ok/wrong in `reviewed`, then --summarize the CSV)")
     bad = [name for name, s in [("overall", wrong_stats(rows))] + [(m, wrong_stats(rows, m)) for m in MODES]
            if (wrong_rate(s) or 0.0) > mr.MAX_WRONG_RATE]
     if bad:
         return f"matched rate >= 80% but the wrong rate is above 2% ({', '.join(bad)}): no-go for now"
-    return "matched rate >= 80% and every labelled wrong rate <= 2%: go (judge how large the labelled samples are)"
+    return "matched rate >= 80% and every wrong rate <= 2%: go"
 
 
 def lowest_title_only(rows: list[Row], n: int = LOWEST_TITLE_ONLY) -> list[Row]:
@@ -334,7 +359,24 @@ def lowest_title_only(rows: list[Row], n: int = LOWEST_TITLE_ONLY) -> list[Row]:
                                      r.title.casefold()))[:n]
 
 
-def result_lines(rows: list[Row]) -> list[str]:
+def head_lines(rows: list[Row], stop: str | None = None) -> list[str]:
+    """The lines the owner copies into #154: the verdict first, then the warnings that qualify it."""
+    total = counts_of(rows)
+    searched = total["matched"] + total["no_match"] + total["error"]
+    lines = [f"verdict: {verdict(rows, stop)}"]
+    if searched and total["error"] / searched > mr.ERROR_SHARE_WARN:
+        lines.append(f"WARNING: verdict may be misleading: {total['error'] / searched:.0%} of searches failed")
+    stop = stop or next((r.stopped for r in rows if r.stopped), "")
+    if stop:
+        lines.append(f"STOPPED EARLY: {clean_text(stop)}; the numbers cover only what ran")
+    return lines
+
+
+def result_lines(rows: list[Row], stop: str | None = None) -> list[str]:
+    return head_lines(rows, stop) + body_lines(rows)
+
+
+def body_lines(rows: list[Row]) -> list[str]:
     total = counts_of(rows)
     comparable = total["matched"] + total["no_match"]
     searched = comparable + total["error"]
@@ -359,11 +401,8 @@ def result_lines(rows: list[Row]) -> list[str]:
                      + f"  [{s['matched']} matched rows, {s['unlabelled']} unlabelled"
                      + (f", {s['other']} with an unrecognised label (use ok or wrong)" if s["other"] else "") + "]"
                      + ("  only a hint: fewer than 30 labelled" if 0 < checked < mr.MIN_SAMPLE else ""))
-    lines.append(f"verdict: {verdict(rows)}")
     if comparable < mr.MIN_SAMPLE:
         lines.append(f"note: fewer than {mr.MIN_SAMPLE} compared tracks; the numbers are only a hint")
-    if searched and total["error"] / searched > mr.ERROR_SHARE_WARN:
-        lines.append(f"WARNING: verdict may be misleading: {total['error'] / searched:.0%} of searches failed")
     pats = mr.pattern_counts(rows)
     if pats:
         lines.append("top failing patterns (no_match rows, one primary pattern each):")
@@ -386,7 +425,7 @@ def summary_lines(rows: list[Row], outcomes: list[ArtistOutcome], stop: str | No
     listed, unique = sum(o.listed for o in outcomes), sum(o.unique for o in outcomes)
     nodur = sum(o.unique_no_duration for o in outcomes)
     s_nodur = sum(1 for r in rows if r.duration is None)
-    lines = ["", "== Last.fm match-rate report ==",
+    lines = head_lines(rows, stop) + ["", "== Last.fm match-rate report ==",
              f"artists ranked: {info.ranked}  sampled (evenly spaced over the ranking): {len(outcomes)}",
              f"tracks listed: {listed}  unique after collapsing duplicate recordings: {unique}",
              f"Last.fm duration: {unique - nodur} with, {nodur} without ({_pct(nodur / unique if unique else None)} "
@@ -394,9 +433,7 @@ def summary_lines(rows: list[Row], outcomes: list[ArtistOutcome], stop: str | No
              f"Last.fm calls: {info.last_calls} (budget {info.last_budget})  YouTube searches: {info.searches} "
              f"(budget {info.search_budget})",
              info.stored_note]
-    lines += result_lines(rows)
-    if stop:
-        lines.append(f"STOPPED EARLY: {stop}; the numbers cover only what ran")
+    lines += body_lines(rows)
     lines.append("per artist:")
     for oc in outcomes:
         label = f"rank {oc.rank} {clean_text(oc.name)}"
@@ -432,14 +469,14 @@ def default_out() -> str:
     return mr.default_out().replace("match-report-", "match-report-lastfm-", 1)
 
 
-def stored_check(secrets: list[str], reader: Callable[[], list[tuple]] = read_stored_rows) -> tuple[list[tuple] | None, str]:
+def stored_check(secrets: list[str], reader: Callable[[], list[tuple]] | None = None) -> tuple[list[tuple] | None, str]:
     """(rows, note). One read-only parameterless SELECT through the ingest D1 helper. Without the D1 variables or on
     any D1 failure the check is skipped with a clear line; it never fails the report."""
     need = ("CLOUDFLARE_ACCOUNT_ID", "D1_DATABASE_ID", "INGEST_CLOUDFLARE_API_TOKEN")
     if not all(os.environ.get(k) for k in need):
         return None, f"stored check: skipped (needs {', '.join(need)} in .env)"
     try:
-        rows = reader()
+        rows = (reader or read_stored_rows)()  # looked up at call time
     except Exception as e:  # skipped with a reason, never a crash; the message is redacted
         return None, f"stored check: skipped (D1 read failed: {type(e).__name__}: {clean_text(redact(str(e), secrets))[:120]})"
     return rows, f"stored check: read {len(rows)} stored rows from D1 (read-only SELECT)"
@@ -469,7 +506,7 @@ def main(argv: list[str] | None = None) -> int:
         except ReportError as e:
             print(f"ERROR {e}", file=sys.stderr)
             return 1
-        print("\n".join(["", "== Last.fm match-rate report (from CSV) =="] + result_lines(rows)))
+        print("\n".join(head_lines(rows) + ["", "== Last.fm match-rate report (from CSV) =="] + body_lines(rows)))
         return 0
     secrets: list[str] = []
     rows: list[Row] = []
@@ -502,11 +539,13 @@ def main(argv: list[str] | None = None) -> int:
         def enumerate_songs(a: dict) -> list[dict]:
             return lastfm_tracks.artist_tracks(client, a["name"], a.get("mbid"), ALBUMS_PER_ARTIST, CALL_BUDGET_PER_ARTIST,
                                                out=lambda s: None).records
+        stop = "interrupted before the run finished"  # replaced when run() returns; an interrupt keeps it
         try:
-            outcomes, stop = run(pick_artists(ranking, args.sample_artists), enumerate_songs, ps, args.max_tracks, rows,
-                                 secrets, stored_rows, deadline=start + args.max_minutes * 60)
+            outcomes, stop = run(pick_artists(ranking, args.sample_artists), enumerate_songs, ps, args.max_tracks, rows, secrets, stored_rows, deadline=start + args.max_minutes * 60)
         finally:
             info.last_calls, info.searches = client.calls, ps.searches
+            for r in rows:  # the stop reason travels with the CSV, so --summarize cannot print a go for a partial run
+                r.stopped = stop or ""
             mr.write_csv(out_path, rows, COLUMNS)  # also after an interrupt: what was learned is kept
     except (ReportError, lastfm.LastfmError, tg_check.EnvSyntaxError, OSError) as e:
         print(f"ERROR {redact(str(e), secrets)}", file=sys.stderr)

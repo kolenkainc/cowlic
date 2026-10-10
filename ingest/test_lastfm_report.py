@@ -289,18 +289,107 @@ class WrongRate(NoNetwork):
         self.assertIn("no-go", lr.verdict(rows))
 
     def test_go_needs_the_rate_and_labels_in_every_mode(self):
-        self.assertTrue(lr.verdict(self.rows(100, 1, 50, 0, no_match=10)).startswith("matched rate >= 80% and every"))
+        self.assertTrue(lr.verdict(self.rows(100, 1, 50, 0, no_match=10)).endswith(": go"))
         v = lr.verdict(self.rows(100, 0, 0, 0, t_none=5, no_match=10))
-        self.assertIn("no wrong-rate label for mode title-only", v)
-        self.assertIn("not a go yet", v)
-        self.assertIn("no-go", lr.verdict(self.rows(7, 0, 0, 0, no_match=3)))  # 70% matched
+        self.assertTrue(v.startswith("no verdict:"))
+        self.assertIn("mode title-only: 0 of 5 needed matched rows labelled", v)
+        self.assertIn("no-go", lr.verdict(self.rows(23, 0, 0, 0, no_match=7)))  # 76.7% matched, big enough
         self.assertTrue(lr.verdict([]).startswith("no verdict"))
 
     def test_boundaries(self):
-        self.assertIn("no-go", lr.verdict(self.rows(7, 0, 0, 0, no_match=3)))
-        self.assertTrue(lr.verdict(self.rows(8, 0, 0, 0, no_match=2)).startswith("matched rate >= 80% and"))  # exactly 80%
-        self.assertIn("within", "\n".join(lr.result_lines(self.rows(49, 1, 0, 0))))  # exactly 2%
+        self.assertIn("no-go", lr.verdict(self.rows(23, 0, 0, 0, no_match=7)))
+        self.assertTrue(lr.verdict(self.rows(24, 0, 0, 0, no_match=6)).endswith(": go"))  # exactly 80%
+        self.assertTrue(lr.verdict(self.rows(49, 1, 0, 0)).endswith(": go"))  # exactly 2% wrong
+        self.assertIn("within", "\n".join(lr.result_lines(self.rows(49, 1, 0, 0))))
+        self.assertIn("no-go", lr.verdict(self.rows(48, 2, 0, 0)))
         self.assertIn("EXCEEDED", "\n".join(lr.result_lines(self.rows(48, 2, 0, 0))))
+
+
+class NoVerdict(NoNetwork):
+    """The gate is never called a go on a sample it cannot judge (reviewer finding on #180)."""
+
+    def ok_rows(self, n, mode="duration", label="ok"):
+        d = 200 if mode == "duration" else None
+        return [lr.Row(1, "A", f"{mode}{i}", d, mode, "matched", reviewed=label) for i in range(n)]
+
+    def assertNoGo(self, rows, *needles, stop=None):
+        v = lr.verdict(rows, stop)
+        self.assertTrue(v.startswith("no verdict:"), v)
+        self.assertNotRegex(v.replace("no-go", ""), r"\bgo\b")
+        for n in needles:
+            self.assertIn(n, v)
+        self.assertEqual(lr.head_lines(rows, stop)[0], f"verdict: {v}")  # the first line the owner copies
+        return v
+
+    def test_99_errors_and_one_ok(self):
+        rows = self.ok_rows(1) + [lr.Row(1, "A", f"e{i}", 200, "duration", "error") for i in range(99)]
+        self.assertNoGo(rows, "only 1 compared tracks", "99% of the searches failed")
+
+    def test_one_labelled_row(self):
+        self.assertNoGo(self.ok_rows(1), "only 1 compared tracks")
+
+    def test_compared_threshold(self):
+        self.assertNoGo(self.ok_rows(29), "only 29 compared tracks (need 30)")
+        self.assertTrue(lr.verdict(self.ok_rows(30)).endswith(": go"))
+
+    def test_error_share_threshold(self):
+        err = lambda n: [lr.Row(1, "A", f"e{i}", 200, "duration", "error") for i in range(n)]
+        self.assertTrue(lr.verdict(self.ok_rows(90) + err(10)).endswith(": go"))  # exactly 10%
+        self.assertNoGo(self.ok_rows(90) + err(11), "searches failed")
+
+    def test_labels_needed_per_mode_are_min_30_and_matched(self):
+        rows = self.ok_rows(40) + self.ok_rows(29, "title-only") + self.ok_rows(11, "title-only", "")
+        self.assertNoGo(rows, "mode title-only: 29 of 30 needed")
+        self.assertTrue(lr.verdict(self.ok_rows(40) + self.ok_rows(30, "title-only") + self.ok_rows(10, "title-only", "")
+                                   ).endswith(": go"))
+        self.assertTrue(lr.verdict(self.ok_rows(30) + self.ok_rows(5, "title-only")).endswith(": go"))  # small mode, all labelled
+        self.assertNoGo(self.ok_rows(30) + self.ok_rows(5, "title-only", "") , "mode title-only: 0 of 5")
+
+    def test_live_stop_and_stop_from_the_csv(self):
+        rows = self.ok_rows(60)
+        self.assertNoGo(rows, "the run stopped early (YouTube asks to sign in", stop="YouTube asks to sign in (bot check)")
+        text = "\n".join(lr.result_lines(rows, "YouTube asks to sign in"))
+        self.assertIn("STOPPED EARLY", text)
+        for r in rows:
+            r.stopped = "search budget reached"
+        self.assertNoGo(rows, "search budget reached")
+        path = Path(tempfile.mkdtemp()) / "match-report-lastfm-stop.csv"
+        self.addCleanup(lambda: (path.unlink(), path.parent.rmdir()))
+        mr.write_csv(path, rows, lr.COLUMNS)
+        back = lr.read_rows(str(path))
+        self.assertNoGo(back, "search budget reached")
+        so = io.StringIO()
+        with contextlib.redirect_stdout(so):
+            self.assertEqual(lr.main(["--summarize", str(path)]), 0)
+        self.assertTrue(so.getvalue().startswith("verdict: no verdict:"))
+
+    def test_nothing_compared(self):
+        self.assertTrue(lr.verdict([lr.Row(1, "A", "t", 1, "duration", "stored")]).startswith("no verdict"))
+
+    def test_summary_puts_the_verdict_first(self):
+        rows = self.ok_rows(2)
+        lines = lr.summary_lines(rows, [], None, None, lr.RunInfo())
+        self.assertTrue(lines[0].startswith("verdict: no verdict:"))
+        self.assertLess(lines.index("== Last.fm match-rate report =="), len(lines))
+        self.assertEqual(sum(1 for line in lines if line.startswith("verdict:")), 1)
+
+    def test_summarize_cleans_terminal_cells(self):
+        row = lr.Row(1, "A\x1b[31m", "t\x1b]0;x\x07", 1, "duration", "no_match", "m\x1b[2J", "a\x1b", None, None, 0.1,
+                     "r\x1b", "pat\x1b[1mtern", "")
+        path = Path(tempfile.mkdtemp()) / "match-report-lastfm-esc.csv"
+        self.addCleanup(lambda: (path.unlink(), path.parent.rmdir()))
+        mr.write_csv(path, [row], lr.COLUMNS)
+        text = path.read_text(encoding="utf-8-sig")
+        # a hand-edited file: put raw ESC bytes into every echoed cell
+        table = list(csv.reader(text.splitlines()))
+        table[1] = [c + "\x1b[31m" if i in (1, 2, 5, 6, 11, 12, 13, 14) else c for i, c in enumerate(table[1])]
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            csv.writer(f).writerows(table)
+        so = io.StringIO()
+        with contextlib.redirect_stdout(so):
+            self.assertEqual(lr.main(["--summarize", str(path)]), 0)
+        self.assertNotIn("\x1b", so.getvalue())
+        self.assertNotIn("\x07", so.getvalue())
 
     def test_labels_are_normalised_and_unknown_ones_counted(self):
         rows = [lr.Row(1, "A", "t", 1, "duration", "matched", reviewed="ok"),
@@ -326,7 +415,7 @@ class WrongRate(NoNetwork):
 class Main(Tmp):
     """main() with Last.fm, YouTube and the key faked: the key must stay out of every stream and file."""
 
-    def go(self, argv, env=None, top=None, tracks=None, ytm=None, ranking_error=None):
+    def go(self, argv, env=None, top=None, tracks=None, ytm=None, ranking_error=None, stored_reader=None):
         out = self.tmp() / "match-report-lastfm-main.csv"
         env = {"LASTFM_API_KEY": KEY} if env is None else env
         client = SimpleNamespace(calls=7)
@@ -345,9 +434,53 @@ class Main(Tmp):
                                   lambda c, name, mbid, *a, **k: SimpleNamespace(records=(tracks or {}).get(name, []))), \
                 mock.patch.dict(sys.modules, {"ytmusicapi": fake_mod}), \
                 mock.patch.object(lr.mr, "PacedSearch", lambda y, t, i, m: real_ps(y, t, i, m, sleep=lambda x: None)), \
+                mock.patch.object(lr, "read_stored_rows", stored_reader or self.fail), \
                 contextlib.redirect_stdout(so), contextlib.redirect_stderr(se):
             code = lr.main(["--lastfm-user", "some_user", "--out", str(out)] + argv)
         return code, so.getvalue(), se.getvalue(), out
+
+    D1_ENV = {"LASTFM_API_KEY": KEY, "CLOUDFLARE_ACCOUNT_ID": "a", "D1_DATABASE_ID": "b", "INGEST_CLOUDFLARE_API_TOKEN": "c"}
+
+    def test_check_stored_flags_stored_tracks_without_searching_them(self):
+        ytm = FakeYtm({"fresh": [result("Fresh", 200, artist="Band 1")]})
+        tracks = {"Band 1": [rec("Band 1", "Have It", 200), rec("Band 1", "Fresh", 200)]}
+        code, so, se, out = self.go(["--sample-artists", "1", "--max-tracks", "5", "--check-stored"], env=self.D1_ENV,
+                                    tracks=tracks, ytm=ytm, stored_reader=lambda: [("Have It", "Band 1", 200)])
+        self.assertEqual(code, 0)
+        self.assertIn("stored check: read 1 stored rows from D1 (read-only SELECT)", so)
+        self.assertIn("stored: 1", so)
+        self.assertFalse([q for q in ytm.queries if "have" in q.lower()])
+        statuses = {r.title: r.status for r in lr.read_rows(str(out))}
+        self.assertEqual(statuses, {"Have It": "stored", "Fresh": "matched"})
+
+    def test_check_stored_skipped_when_d1_is_not_configured_or_fails(self):
+        tracks = {"Band 1": [rec("Band 1", "Song", 200)]}
+        code, so, se, out = self.go(["--sample-artists", "1", "--check-stored"], tracks=tracks)  # no D1 variables
+        self.assertEqual(code, 0)
+        self.assertIn("stored check: skipped (needs CLOUDFLARE_ACCOUNT_ID", so)
+        self.assertEqual(len(lr.read_rows(str(out))), 1)  # the report went on
+
+        def boom():
+            raise IngestError(f"D1 API error 403 {KEY}")
+        code, so, se, out = self.go(["--sample-artists", "1", "--check-stored"], env=self.D1_ENV, tracks=tracks,
+                                    stored_reader=boom)
+        self.assertEqual(code, 0)
+        self.assertIn("stored check: skipped (D1 read failed: IngestError", so)
+        self.assertNotIn(KEY, so + se)
+
+    def test_stored_check_is_off_unless_asked(self):
+        code, so, *_ = self.go(["--sample-artists", "1"], env=self.D1_ENV, tracks={"Band 1": [rec("Band 1", "S", 200)]})
+        self.assertEqual(code, 0)  # stored_reader=self.fail would raise if it were read
+        self.assertIn("not requested", so)
+
+    def test_sign_in_stop_is_in_the_csv_and_the_first_line_is_the_verdict(self):
+        tracks = {"Band 1": [rec("Band 1", f"Song {i}", 200) for i in range(5)]}
+        code, so, se, out = self.go(["--sample-artists", "1"], tracks=tracks,
+                                    ytm=FakeYtm(error=YouTubeSignInRequired("Sign in to confirm")))
+        self.assertEqual(code, 2)
+        self.assertTrue(so.startswith("verdict: no verdict:"))
+        self.assertIn("STOPPED EARLY", so)
+        self.assertTrue(all("not bypassed" in r.stopped for r in lr.read_rows(str(out))))
 
     def test_happy_path_prints_a_summary_and_writes_the_csv(self):
         ytm = FakeYtm({"song": [result("Song", 200, artist="Band 1")]})

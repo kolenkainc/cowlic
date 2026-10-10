@@ -687,19 +687,22 @@ What a run does, in order:
    check is opt-in and read-only by construction). Without them, or when D1 fails, the report prints one
    `stored check: skipped (...)` line and goes on; it never fails because of it.
 
-Hard caps (all of them stop the run, write the CSV and exit 2): `--max-tracks` tracks, so at most 4 x that many
-YouTube searches; `--max-minutes` wall time (default 45, at most 240; checked between tracks and artists, so the
-ranking itself, about 5 minutes, always completes unless the call budget stops it); a Last.fm budget (ranking bound plus
-30 calls per sampled artist, shown in the summary); at least 1 s between two searches (`--min-interval`, never
-faster); a stop after 3 failed searches in a row or 3 failed artists in a row. A YouTube sign-in challenge stops the
-run at once and is not bypassed (no cookies, proxies, PO-token tricks or client rotation, decision #62). With the
+Hard caps: `--max-tracks` tracks, so at most 4 x that many YouTube searches (the search budget, a time cap and the
+failure stops below end the run early: the CSV is still written and the exit code is 2); `--max-minutes` wall time
+(default 45, at most 240; checked between tracks and artists, so the ranking itself, about 5 minutes, always completes
+unless the call budget stops it); a Last.fm budget (ranking bound plus 30 calls per sampled artist, shown in the
+summary): if the ranking hits it the run ends with exit 1 and NO CSV (nothing was matched yet), while the 30-call
+budget of one artist only makes that artist fail (counted as a failed artist, the others go on); at least 1 s between
+two searches (`--min-interval`, never faster); a stop after 3 failed searches in a row or 3 failed artists in a row.
+A YouTube sign-in challenge stops the run at once and is not bypassed (no cookies, proxies, PO-token tricks or client rotation, decision #62). With the
 defaults a run takes roughly 15-25 minutes. Do not run it in a loop.
 
 Output: `match-report-lastfm-<UTC time>.csv` in the current directory (the name must match `match-report*.csv`, which is
 gitignored; an existing file is never overwritten; UTF-8 with BOM, mode 0600). Titles are untrusted text: control
 characters are stripped and a cell starting with `=`, `+`, `-` or `@` gets a leading apostrophe. Do not commit it.
 Columns: `artist_rank, artist, title, lastfm_duration_s, mode, matched_title, matched_artists, matched_duration_s,
-duration_delta_s, similarity, status, reason, pattern, reviewed`.
+duration_delta_s, similarity, status, reason, pattern, reviewed, run_stopped`. `run_stopped` is empty for a run that
+finished and holds the stop reason (same on every row) otherwise, so `--summarize` knows the run was partial.
 
 - `mode` is `duration` or `title-only` (the mode the track was tried in). `status` is `matched`, `no_match` (the
   matched columns then show the closest YouTube result), `stored` or `error`. `reason` for a `no_match` row: `title`
@@ -712,11 +715,18 @@ duration_delta_s, similarity, status, reason, pattern, reviewed`.
   60-600 s, and none of the variant words (live, remix, edit, acoustic, cover, ...) that the requested title lacks.
   The duration mode keeps title >= 0.85 and +-3 s.
 
-The summary on stdout gives: artists ranked and sampled; tracks listed and unique; the share WITH and WITHOUT a
+The first line of the output is the verdict (the line you copy into #154), followed by its warnings. It is a go only
+on a sample the gate can be judged on. Otherwise it reads `no verdict: <reasons>` (and never says go) when any of
+these holds: fewer than 30 compared tracks (`matched + no_match`); more than 10% of the searches failed; the run
+stopped early (sign-in challenge, search or time budget, 3 failures in a row, interrupted; `--summarize` reads this from
+the CSV); or a mode with matched rows has fewer than min(30, its matched rows) rows labelled `ok`/`wrong`. When none of
+them holds: matched < 80% is `no-go`, a wrong rate above 2% overall or in a mode is `no-go`, else `go`.
+
+The rest of the summary on stdout gives: artists ranked and sampled; tracks listed and unique; the share WITH and WITHOUT a
 Last.fm duration (how often Last.fm gives none, overall and in the sample); Last.fm calls and YouTube searches
 against their budgets; the stored check line; matched / no_match / stored / error overall and per mode, so the
 title-only matches are never mixed into the duration ones; the match rate overall and per mode
-(`matched / (matched + no_match)`); the wrong rate overall and per mode; the verdict; the failing patterns; the 15
+(`matched / (matched + no_match)`); the wrong rate overall and per mode; the failing patterns; the 15
 title-only matches with the lowest title similarity; the 15 lowest-similarity failures; and a per-artist table.
 Exit code 0 normally, 2 if the run stopped early or an artist failed (the CSV is still written), 1 for invalid input
 or a missing or malformed key.
@@ -730,9 +740,9 @@ How to label and read it:
    not `matched` are ignored.
 2. Run `--summarize` on the labelled file (offline, needs no key). It prints the same figures with the wrong rates:
    `wrong / (ok + wrong)` overall, for `duration` and for `title-only`. The title-only mode is judged on its own
-   wrong rate: it has to be <= 2% by itself even when the overall rate is fine. A mode with matched rows but no labels
-   keeps the verdict at "not a go yet". A sample under 30 compared tracks, or under 30 labelled rows in a mode, is only
-   a hint, and the summary says so. Rate below 80% with a good wrong rate means tuning the matcher by the most
+   wrong rate: it has to be <= 2% by itself even when the overall rate is fine. A mode with matched rows and too
+   few labels (under min(30, its matched rows)), a sample under 30 compared tracks, a partial run or many failed
+   searches give `no verdict: ...` (see above), not a go. Rate below 80% with a good wrong rate means tuning the matcher by the most
    frequent failing pattern; a high wrong rate in the title-only mode means raising its thresholds or turning it off.
 3. Write the numbers and the decision in #154. Check also: how many tracks Last.fm gives no duration for (a high share
    means most matches are title-only), and the per-artist lines (one artist at 20% in an otherwise good sample is a
