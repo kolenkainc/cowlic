@@ -1,3 +1,9 @@
+<p align="center">
+  <img src="docs/assets/logo/cowlic-logo-512.png" alt="cowlic logo" width="128">
+  <br>
+  cowlic
+</p>
+
 # cowlic
 
 Self-hosted, serverless аналог Spotify для прослушивания музыки с телефона в машине.
