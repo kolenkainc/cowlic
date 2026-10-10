@@ -322,6 +322,18 @@
         { "datasource": { "type": "loki", "uid": "${DS_LOKI}" }, "expr": "{job=\"cowlic-ingest\", host=~\"$host\"}", "queryType": "range", "refId": "A" }
       ],
       "options": { "showTime": true, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
+    },
+    {
+      "id": 14,
+      "type": "logs",
+      "title": "Last.fm report (live, logs only)",
+      "description": "Output of scripts/run-lastfm-report.sh, shipped while it runs. Separate job label, no metrics.",
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 48 },
+      "targets": [
+        { "datasource": { "type": "loki", "uid": "${DS_LOKI}" }, "expr": "{job=\"cowlic-report\", host=~\"$host\"}", "queryType": "range", "refId": "A" }
+      ],
+      "options": { "showTime": true, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
     }
   ],
   "refresh": "",

@@ -49,6 +49,9 @@ MAX_BODY_BYTES = 1024 * 1024
 LEVEL_RE = re.compile(r"^(?:\S+ run-ingest-local: )?(ERROR|WARN|WARNING)\b")
 ISO_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 MAX_COUNT = 10**9
+JOB_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")  # --job: a Loki label value, allowlisted
+MAX_BATCH_BYTES = 256 * 1024  # logs-only follow mode: bytes of log read per push
+EXTRA_SECRET_ENV = "COWLIC_EXTRA_SECRET"  # one more value to redact (e.g. a user name); env, never argv
 
 
 class ShipError(Exception):
@@ -261,7 +264,7 @@ def host_label() -> str:
 
 
 def build_payload(lines: list[str], summary: str | None, summary_level: str, t0_ns: int, now_ns: int,
-                  host: str) -> dict:
+                  host: str, job: str = "cowlic-ingest") -> dict:
     """Loki push body. Timestamps are strings (a number gives 400), strictly increasing: t0 + index."""
     by_level: dict[str, list] = {}
     for i, ln in enumerate(lines):
@@ -269,7 +272,7 @@ def build_payload(lines: list[str], summary: str | None, summary_level: str, t0_
     if summary is not None:
         ts = max(now_ns, t0_ns + len(lines))
         by_level.setdefault(summary_level, []).append([str(ts), summary])
-    streams = [{"stream": {"job": "cowlic-ingest", "host": host, "level": lvl}, "values": vals}
+    streams = [{"stream": {"job": job, "host": host, "level": lvl}, "values": vals}
                for lvl, vals in sorted(by_level.items())]
     return {"streams": streams}
 
@@ -380,26 +383,188 @@ def ship_metrics(env, token: str, run, host: str, opener=None) -> str | None:
     return post(url, body, auth, opener, content_type="text/plain")
 
 
+def _job(v: str) -> str:
+    if not JOB_RE.fullmatch(v):
+        raise argparse.ArgumentTypeError("invalid job label")
+    return v
+
+
+def read_offset(path: str, default: int) -> int:
+    """The saved offset of the follow mode; `default` when the file does not exist yet. ShipError when it is
+    not a plain integer (never guessed)."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(32).strip()
+    except FileNotFoundError:
+        return default
+    except OSError:
+        raise ShipError("offset file unreadable") from None
+    if not raw.isdigit() or len(raw) > 18:
+        raise ShipError("offset file has an unexpected value")
+    return int(raw)
+
+
+def write_offset(path: str, offset: int) -> None:
+    """Atomic (temp file in the same directory + rename), mode 0600."""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(f"{offset}\n")
+    os.replace(tmp, path)
+
+
+def read_chunk(log_path: str, offset: int, final: bool) -> tuple[str, int]:
+    """Follow mode: at most MAX_BATCH_BYTES of the log from `offset`, cut after the last complete line (the
+    unfinished last line waits for the next push unless `final`). Returns (text, new offset). A single line longer
+    than the batch is shipped cut at the batch size and the rest of that line is skipped (never split over two
+    pushes; if its end is not written yet it waits, unless `final`). ShipError when the file is shorter than the offset or the offset is not at a
+    line start (rotated or truncated: nothing is guessed)."""
+    fd = os.open(log_path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as f:
+        size = os.fstat(fd).st_size
+        if offset < 0 or size < offset:
+            raise ShipError("log shorter than the saved offset (rotated?)")
+        if offset > 0:
+            f.seek(offset - 1)
+            if f.read(1) != b"\n":
+                raise ShipError("saved offset is not at a line start")
+        f.seek(offset)
+        data = f.read(MAX_BATCH_BYTES)
+        reached_end = len(data) == size - offset
+        if final and reached_end:
+            return data.decode("utf-8", errors="replace"), offset + len(data)
+        cut = data.rfind(b"\n") + 1
+        if cut:
+            data = data[:cut]
+        elif reached_end:
+            data = b""  # one unfinished line: wait for its end
+        else:
+            # A single line longer than the batch: ship its first MAX_BATCH_BYTES (sanitize_lines cuts it further
+            # and marks it) and skip to the byte after its newline, so a line is never split over two pushes and
+            # the offset stays at a line start. Without a newline yet (still being written): wait, unless final.
+            pos = offset + len(data)
+            nl = -1
+            while nl < 0:
+                f.seek(pos)
+                more = f.read(65536)
+                if not more:
+                    break
+                i = more.find(b"\n")
+                if i >= 0:
+                    nl = pos + i
+                pos += len(more)
+            if nl >= 0:
+                return data.decode("utf-8", errors="replace"), nl + 1
+            if final:
+                return data.decode("utf-8", errors="replace"), pos
+            data = b""
+    return data.decode("utf-8", errors="replace"), offset + len(data)
+
+
+def ship_logs_only(log_path: str, offset: int, offset_file: str | None, job: str, final: bool, env=os.environ,
+                   opener=None, redact=None, extra_secrets=()) -> None:
+    """Logs only, under label `job`: no run_summary, no metrics, no last-run.json. With offset_file the push
+    carries the new bytes since the saved offset (bounded batch) and the offset moves on only after the batch was
+    accepted or rejected for its content (HTTP 400/413); any other failure leaves it, so the next call retries."""
+    url, user, token = read_config(env)
+    if redact is None:
+        from ingest import redact  # fail closed: without ingest's redaction nothing is sent
+    auth = "Basic " + base64.b64encode(f"{user}:{token}".encode()).decode()
+    secrets = [token, auth.split(" ", 1)[1], *[s for s in extra_secrets if s]]
+    try:
+        start = read_offset(offset_file, offset) if offset_file else offset
+    except ShipError as e:  # a corrupt offset file must not block shipping for the rest of the run
+        say(f"{e}, reset to the start offset")
+        start = offset
+    try:
+        text, new_offset = read_chunk(log_path, start, final)
+    except (OSError, ShipError) as e:
+        say(f"no log lines ({e if isinstance(e, ShipError) else type(e).__name__})")
+        return
+    lines = sanitize_lines(text, secrets, redact)
+    if not lines:
+        if offset_file and new_offset != start:
+            write_offset(offset_file, new_offset)
+        say("nothing to ship")
+        return
+    host = host_label()
+    body = json.dumps(build_payload(lines, None, "info", time.time_ns() - len(lines), time.time_ns(), host, job),
+                      separators=(",", ":")).encode()
+    if any(s.encode() in body for s in secrets):  # last guard on the exact bytes sent
+        raise ShipError("secret found in payload, not sent")
+    result = post(url, body, auth, opener)
+    if offset_file and (result.startswith("ok") or result in ("failed (HTTP 400)", "failed (HTTP 413)")):
+        write_offset(offset_file, new_offset)
+    say(f"loki push {result}")
+
+
+def filter_stream(inp, out, secrets: list[str], redact) -> None:
+    """stdin -> stdout, line by line, through clean_text (redaction, unsafe characters dropped). A line that
+    cannot be cleaned is replaced by a fixed marker, never passed on."""
+    for raw in inp:
+        text = raw.decode("utf-8", errors="replace")
+        try:
+            cleaned = clean_text(text, secrets, redact)
+        except Exception:  # noqa: BLE001 - fail closed per line
+            cleaned = "[line withheld: redaction failed]\n"
+        if text.endswith("\n") and not cleaned.endswith("\n"):
+            cleaned += "\n"
+        out.write(cleaned.encode("utf-8"))
+        out.flush()
+
+
 def main(argv: list[str]) -> int:
     try:
         ap = argparse.ArgumentParser()
-        ap.add_argument("--log", required=True)
-        ap.add_argument("--offset", type=int, required=True)
-        ap.add_argument("--last-run", required=True)
+        ap.add_argument("--log")
+        ap.add_argument("--offset", type=int)
+        ap.add_argument("--last-run")
         ap.add_argument("--started-at", default=None, help="the run's start (ISO UTC); a last-run.json of another run is ignored")
+        ap.add_argument("--job", type=_job, default="cowlic-ingest", help="Loki job label (default cowlic-ingest)")
+        ap.add_argument("--logs-only", action="store_true", help="log lines only: no run_summary, no metrics, no last-run.json")
+        ap.add_argument("--offset-file", default=None, help="logs-only: keep the shipped offset here (follow mode)")
+        ap.add_argument("--final", action="store_true", help="logs-only: also ship an unfinished last line")
+        ap.add_argument("--filter", action="store_true", help="filter mode: redact stdin line by line to stdout")
         args = ap.parse_args(argv)
+        if args.filter:
+            return run_filter()
+        if args.log is None or args.offset is None or not (args.logs_only or args.last_run):
+            raise SystemExit(2)
         try:
             import tg_check
             tg_check.load_env()
         except Exception as e:  # noqa: BLE001 - e.g. EnvSyntaxError; class only, the message could name a key
             say(f"env not loaded ({type(e).__name__})")
-        ship(args.log, args.offset, args.last_run, started_at=args.started_at)
+        if args.logs_only:
+            if args.job == "cowlic-ingest":  # that label belongs to the nightly run's panels
+                raise ShipError("--logs-only needs a --job other than cowlic-ingest")
+            ship_logs_only(args.log, args.offset, args.offset_file, args.job, args.final,
+                           extra_secrets=[os.environ.get(EXTRA_SECRET_ENV, "")])
+        else:
+            ship(args.log, args.offset, args.last_run, started_at=args.started_at)
     except ShipError as e:
         say(str(e))
     except SystemExit:
         say("bad arguments")
     except BaseException as e:  # noqa: BLE001 - never fail the run
         say(f"failed ({type(e).__name__})")
+    return 0
+
+
+def run_filter() -> int:
+    """Exit code 0 normally; 1 when the redaction cannot be set up (nothing is passed on then)."""
+    try:
+        import tg_check
+        tg_check.load_env()
+    except Exception as e:  # noqa: BLE001 - class only
+        print(f"grafana: env not loaded ({type(e).__name__})", file=sys.stderr)
+    try:
+        from ingest import redact
+    except Exception as e:  # noqa: BLE001
+        print(f"grafana: redaction unavailable ({type(e).__name__})", file=sys.stderr)
+        return 1
+    secrets = [os.environ.get(k, "") for k in (EXTRA_SECRET_ENV, "INGEST_GRAFANA_TOKEN", "LASTFM_API_KEY")]
+    filter_stream(sys.stdin.buffer, sys.stdout.buffer, [s for s in secrets if s], redact)
     return 0
 
 

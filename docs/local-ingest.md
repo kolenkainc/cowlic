@@ -268,6 +268,51 @@ Find the logs in Grafana (Explore, Loki data source of your stack):
 Set the time range to the last 24 hours or more (one run a day). Free tier retention is about 14 days. Whether
 the first live push works is verified by the owner in #108.
 
+### Watch the Last.fm report live (`scripts/run-lastfm-report.sh`)
+
+The match-rate report (`ingest/lastfm_report.py`, see below) bypasses the nightly wrapper. To watch it in Grafana
+while it runs, start it through the report wrapper; every argument goes to the report unchanged:
+
+```bash
+scripts/run-lastfm-report.sh --lastfm-user <your-name> --years 5 --artists 100
+```
+
+Why a second wrapper and a few flags on the shipper (`--job`, `--logs-only`, `--offset-file`, `--final`,
+`--filter`), not only a flag: the report needs its own lock, log, background loop and signal handling, which do not
+belong in the nightly wrapper, whose path stays byte-identical. The shipper stays the one place for validation,
+redaction, cleaning and the final guard.
+
+- Output (stdout and stderr) goes through the shipper's `--filter` (same redaction and cleaning as a push) into
+  `${XDG_STATE_HOME:-~/.local/state}/cowlic/lastfm-report.log` (mode 0600) and to
+  the terminal. Every run starts a FRESH log: a non-empty log of an earlier run moves to `.1` (older ones shift;
+  `COWLIC_LOG_KEEP` files kept, default 5), so a run killed mid-line never leaves the next one an offset in the middle of
+  a line. The report's exit code is the wrapper's; 128+N if interrupted by signal N.
+- Every `COWLIC_REPORT_SHIP_INTERVAL` seconds (default 20) the new complete lines (at most 256 KiB per push, offset
+  kept in `.lastfm-report.offset`; a line longer than a batch is shipped cut at the batch size and its rest is
+  skipped, never split over two pushes; a corrupt offset file is reset with a status line) are pushed with the label `job="cowlic-report"`, and once more at the end. The
+  same failure isolation as the nightly: 30 s hard limit per push, no retry loop (a failed batch is simply sent
+  again with the next one), an unreachable Grafana or a bad token never changes the exit code. Only the final push
+  prints one status line.
+- Logs only: no metrics and no `last-run.json`, so the nightly panels (`Last run`, metrics, `run_summary`) keep
+  meaning the 21:10 run only.
+- Safety: the user name is taken from `--lastfm-user` and handed to the filter and the shipper through the
+  environment (`COWLIC_EXTRA_SECRET`, never argv); it is removed from the local log and from every shipped line.
+  Residual risk, accepted: the filter works line by line, so a user name wrapped over a newline is not matched (the
+  report prints no user name). A very short user name makes the final guard refuse every body (nothing is shipped;
+  the loop prints one warning on the terminal), and the redaction mangles the log wherever those letters occur.
+  The arguments are never echoed, logged or shipped. `LASTFM_API_KEY` is redacted as well (the shipper loads `.env`
+  itself; the shell never reads it). The lines carry artist and track names, i.e. your own listening data, sent to
+  your own Grafana Cloud, as the nightly log already does.
+- Stopping: the report and the background loop run in their own process groups and are stopped by a trap when the
+  wrapper ends or gets SIGINT, SIGTERM or SIGHUP. After a `kill -9` of the wrapper no trap can run: the report keeps
+  running (stop it yourself), but the live loop checks that the wrapper is alive before every one-second sleep step and
+  before every push, and ends by itself about a second later (no further pushes, no race with the next run on the
+  offset file). A second report while one runs exits with 75. The shipper refuses `--logs-only` with the nightly job
+  label `cowlic-ingest`.
+
+Explore (Loki data source): `{job="cowlic-report"}`; the dashboard has a `Last.fm report (live, logs only)` panel
+for it. Set the time range to the last 15 minutes while it runs.
+
 ### Run metrics (optional)
 
 Added in #105, decided in #106. Right after the log push the same step sends ONE line of Influx line protocol
