@@ -84,6 +84,18 @@ const songJson = (s: SongRow) => ({
 const int = (v: string | null, def: number, max: number) =>
   Math.min(Math.max(Number.parseInt(v ?? "", 10) || def, 0), max);
 
+const MAX_PAGE = 500; // largest page size honoured (size / *Count)
+const MAX_OFFSET = 1_000_000; // offsets must not be clamped to the page size, or clients cannot page past it
+
+// The aggregate / join work (song counts, artist names) is done only for the rows of one page: the page is
+// picked first from a narrow subquery (id only, index-friendly), then joined. Reads stay proportional to the
+// page and the scan, not to the whole library. `order` is always an allowlisted fragment, never user input.
+const albumPage = (innerWhere: string, order: string) => `${ALBUM_SELECT}
+  WHERE al.id IN (
+    SELECT al.id FROM albums al JOIN artists ar ON ar.id = al.artist_id ${innerWhere}
+    ORDER BY ${order} LIMIT ? OFFSET ?)
+  GROUP BY al.id ORDER BY ${order}`;
+
 const likePattern = (q: string) => `%${q.replace(/[\\%_]/g, "\\$&")}%`;
 
 async function getAlbumRows(db: D1Database, artistId: string): Promise<AlbumRow[]> {
@@ -146,19 +158,19 @@ export async function getSong(db: D1Database, p: URLSearchParams): Promise<Respo
 }
 
 const ALBUM_ORDER: Record<string, string> = {
-  alphabeticalByName: "al.name COLLATE NOCASE",
-  alphabeticalByArtist: "ar.name COLLATE NOCASE, al.name COLLATE NOCASE",
+  alphabeticalByName: "al.name COLLATE NOCASE, al.rowid",
+  alphabeticalByArtist: "ar.name COLLATE NOCASE, al.name COLLATE NOCASE, al.rowid",
   newest: "al.rowid DESC",
   recent: "al.rowid DESC",
   random: "RANDOM()",
-  byYear: "al.year, al.name COLLATE NOCASE",
+  byYear: "al.year, al.name COLLATE NOCASE, al.rowid",
 };
 
 export async function getAlbumList2(db: D1Database, p: URLSearchParams): Promise<Response> {
   const order = ALBUM_ORDER[p.get("type") ?? ""] ?? ALBUM_ORDER.alphabeticalByName; // allowlist, never interpolated from input
   const r = await db
-    .prepare(`${ALBUM_SELECT} GROUP BY al.id ORDER BY ${order} LIMIT ? OFFSET ?`)
-    .bind(int(p.get("size"), 10, 500), int(p.get("offset"), 0, 1_000_000))
+    .prepare(albumPage("", order))
+    .bind(int(p.get("size"), 10, MAX_PAGE), int(p.get("offset"), 0, MAX_OFFSET))
     .all<AlbumRow>();
   return ok(p, { albumList2: { album: r.results.map(albumJson) } });
 }
@@ -167,23 +179,32 @@ export async function search3(db: D1Database, p: URLSearchParams): Promise<Respo
   // Clients sync the whole library with an empty/"" query, so empty means "match all".
   const q = (p.get("query") ?? "").replace(/^"|"$/g, "");
   const like = likePattern(q);
-  const lim = (k: string, def: number) => int(p.get(k), def, 500);
+  const lim = (k: string, def: number) => int(p.get(k), def, MAX_PAGE);
+  const off = (k: string) => int(p.get(k), 0, MAX_OFFSET);
 
+  // Artists stay a plain grouped query: there are few of them (hundreds) and this shape is cheap with or without
+  // the albums(artist_id) index.
   const artists = await db
     .prepare(
       `SELECT ar.id, ar.name, COUNT(al.id) AS album_count FROM artists ar
        LEFT JOIN albums al ON al.artist_id = ar.id WHERE ar.name LIKE ? ESCAPE '\\'
        GROUP BY ar.id ORDER BY ar.name COLLATE NOCASE LIMIT ? OFFSET ?`,
     )
-    .bind(like, lim("artistCount", 20), lim("artistOffset", 0))
+    .bind(like, lim("artistCount", 20), off("artistOffset"))
     .all<{ id: string; name: string; album_count: number }>();
   const albums = await db
-    .prepare(`${ALBUM_SELECT} WHERE al.name LIKE ? ESCAPE '\\' GROUP BY al.id ORDER BY al.name COLLATE NOCASE LIMIT ? OFFSET ?`)
-    .bind(like, lim("albumCount", 20), lim("albumOffset", 0))
+    .prepare(albumPage("WHERE al.name LIKE ? ESCAPE '\\'", "al.name COLLATE NOCASE, al.rowid"))
+    .bind(like, lim("albumCount", 20), off("albumOffset"))
     .all<AlbumRow>();
   const songs = await db
-    .prepare(`${SONG_SELECT} WHERE t.title LIKE ? ESCAPE '\\' ORDER BY t.title COLLATE NOCASE LIMIT ? OFFSET ?`)
-    .bind(like, lim("songCount", 20), lim("songOffset", 0))
+    .prepare(
+      `${SONG_SELECT}
+       WHERE t.id IN (
+         SELECT i.id FROM tracks i WHERE i.title LIKE ? ESCAPE '\\'
+         ORDER BY i.title COLLATE NOCASE, i.rowid LIMIT ? OFFSET ?)
+       ORDER BY t.title COLLATE NOCASE, t.rowid`,
+    )
+    .bind(like, lim("songCount", 20), off("songOffset"))
     .all<SongRow>();
 
   return ok(p, {
