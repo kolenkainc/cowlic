@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Distribute secrets from the local .env to GitHub (secrets/variables) and Worker secrets.
+# Distribute secrets from the local .env to GitHub environment secrets and Worker secrets.
+# Ingest values go to the GitHub environment "ingest" (gh secret set --env), see scripts/secrets.manifest.
 # Usage: scripts/sync-secrets.sh [--dry-run] [--only KEY]
 # Values are never printed: they travel only through stdin of gh / wrangler.
 # Env overrides (used by tests): ENV_FILE, MANIFEST.
@@ -66,7 +67,8 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < "$ENV_FILE"
 
 # Parse and validate the whole manifest before touching anything.
-keys=(); targets=(); remotes=()
+declare -A DESTS=()   # needs bash >= 4 (also used for ENVV below)
+keys=(); targets=(); remotes=(); ghenvs=()
 lineno=0
 while IFS= read -r line || [ -n "$line" ]; do
   lineno=$((lineno + 1))
@@ -74,17 +76,25 @@ while IFS= read -r line || [ -n "$line" ]; do
   [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
   read -r key spec extra <<< "$line"
   [ -z "${extra:-}" ] || die "manifest line $lineno: too many fields"
-  [ -n "${spec:-}" ] || die "manifest line $lineno: expected '<ENV_KEY> <target>[:<REMOTE_NAME>]'"
+  [ -n "${spec:-}" ] || die "manifest line $lineno: expected '<ENV_KEY> <target>[@<GH_ENVIRONMENT>][:<REMOTE_NAME>]'"
   [[ "$key" =~ $NAME_RE ]] || die "manifest line $lineno: invalid key name"
   target="${spec%%:*}"
+  ghenv=""
+  if [[ "$target" == *@* ]]; then ghenv="${target#*@}"; target="${target%%@*}"; fi
   remote="$key"
   if [[ "$spec" == *:* ]]; then remote="${spec#*:}"; fi
   [[ "$remote" =~ $NAME_RE ]] || die "manifest line $lineno: invalid remote name"
   case "$target" in
-    gh-secret|gh-variable|worker-secret) ;;
+    gh-env-secret)
+      [[ "$ghenv" =~ $NAME_RE ]] || die "manifest line $lineno: gh-env-secret needs an environment name, e.g. gh-env-secret@ingest" ;;
+    worker-secret)
+      [ -z "$ghenv" ] || die "manifest line $lineno: '@environment' is only valid for gh-env-secret" ;;
     *) die "manifest line $lineno: unknown target '$target'" ;;
   esac
-  keys+=("$key"); targets+=("$target"); remotes+=("$remote")
+  dest="$target@$ghenv:$remote"
+  [ -z "${DESTS[$dest]:-}" ] || die "manifest line $lineno: duplicate destination $dest (first defined on line ${DESTS[$dest]})"
+  DESTS["$dest"]="$lineno"
+  keys+=("$key"); targets+=("$target"); remotes+=("$remote"); ghenvs+=("$ghenv")
 done < "$MANIFEST"
 
 selected=()
@@ -106,7 +116,7 @@ done
 missing=0
 for i in "${selected[@]}"; do
   if [ -n "${ENVV[${keys[$i]}]:-}" ]; then state=present; else state=missing; missing=$((missing + 1)); fi
-  if [ "$dry_run" -eq 1 ]; then printf '%-30s %-14s -> %-30s %s\n' "${keys[$i]}" "${targets[$i]}" "${remotes[$i]}" "$state"; fi
+  if [ "$dry_run" -eq 1 ]; then printf '%-30s %-26s -> %-30s %s\n' "${keys[$i]}" "${targets[$i]}${ghenvs[$i]:+@${ghenvs[$i]}}" "${remotes[$i]}" "$state"; fi
   if [ "$dry_run" -eq 0 ] && [ "$state" = missing ]; then printf 'error: %s is missing or empty in %s\n' "${keys[$i]}" "$ENV_FILE" >&2; fi
 done
 [ "$missing" -eq 0 ] || die "$missing key(s) missing or empty in the env file; nothing was synced"
@@ -115,23 +125,42 @@ done
 # Preflight before any write: tools and files the selected entries need.
 need_gh=0; need_worker=0
 for i in "${selected[@]}"; do
-  case "${targets[$i]}" in gh-*) need_gh=1 ;; worker-secret) need_worker=1 ;; esac
+  case "${targets[$i]}" in gh-env-secret) need_gh=1 ;; worker-secret) need_worker=1 ;; esac
 done
 if [ "$need_gh" -eq 1 ]; then command -v gh > /dev/null || die "gh not found on PATH; nothing was synced"; fi
 if [ "$need_worker" -eq 1 ]; then
   command -v npx > /dev/null || die "npx not found on PATH; nothing was synced"
   [ -r "$ROOT/worker/wrangler.local.toml" ] || die "worker/wrangler.local.toml is missing (gitignored, holds the real D1 id); nothing was synced"
 fi
+# Every GitHub environment found in the selected entries is probed here, for all entries, before the
+# first write (independent of manifest order). The probe is the endpoint `gh secret set --env` itself
+# needs (the environment's public key), so it checks the permission the writes need. {owner}/{repo}
+# are resolved by gh from the clone (we cd to the repo root). gh's first stderr line is shown (it
+# carries the HTTP status, never a secret value).
+declare -A seen_env=()
+for i in "${selected[@]}"; do
+  e="${ghenvs[$i]}"
+  [ -n "$e" ] && [ -z "${seen_env[$e]:-}" ] || continue
+  seen_env["$e"]=1
+  perr="$(gh api "repos/{owner}/{repo}/environments/$e/secrets/public-key" 2>&1 > /dev/null < /dev/null)" && continue
+  first="$(printf '%s\n' "$perr" | head -n 1 | tr -d '\000-\037' | cut -c1-200)"
+  case "$perr" in
+    *"HTTP 401"*) why="not authenticated or bad token (401): run gh auth login / check GH_TOKEN" ;;
+    *"HTTP 404"*) why="environment not found, or the token cannot see the repository (404): create the environment (restricted to master) in the repo settings" ;;
+    *"HTTP 403"*) why="forbidden (403): the token lacks permission to write environment secrets" ;;
+    *) why="request failed (network or other error)" ;;
+  esac
+  die "GitHub environment '$e' preflight failed: $why. gh said: ${first:-<no output>}. Nothing was synced"
+done
 
 synced=()
 total="${#selected[@]}"
 for i in "${selected[@]}"; do
-  key="${keys[$i]}"; remote="${remotes[$i]}"; target="${targets[$i]}"
-  printf 'sync %s -> %s %s\n' "$key" "$target" "$remote"
+  key="${keys[$i]}"; remote="${remotes[$i]}"; target="${targets[$i]}"; ghenv="${ghenvs[$i]}"
+  printf 'sync %s -> %s %s\n' "$key" "$target${ghenv:+@$ghenv}" "$remote"
   rc=0
   case "$target" in
-    gh-secret)     printf '%s' "${ENVV[$key]}" | gh secret set "$remote" || rc=$? ;;
-    gh-variable)   printf '%s' "${ENVV[$key]}" | gh variable set "$remote" || rc=$? ;;
+    gh-env-secret) printf '%s' "${ENVV[$key]}" | gh secret set "$remote" --env "$ghenv" || rc=$? ;;
     worker-secret) printf '%s' "${ENVV[$key]}" | (cd "$ROOT/worker" && npx --no-install wrangler secret put "$remote" -c wrangler.local.toml) || rc=$? ;;
   esac
   if [ "$rc" -ne 0 ]; then
