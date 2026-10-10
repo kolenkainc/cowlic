@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -82,7 +83,15 @@ def log(msg: str) -> None:
 
 
 def tail_of(text: str, secrets: list[str]) -> str:
-    return "\n".join(redact(text, secrets).strip().splitlines()[-TAIL_LINES:])
+    """Last TAIL_LINES meaningful lines of tool output: redacted first, then whitespace-collapsed (rich pads
+    lines to the console width), debug-noise lines dropped and each line capped at LINE_MAX characters."""
+    lines = []
+    for ln in redact(text, secrets).splitlines():
+        ln = " ".join(ln.split())
+        if ln and not any(n in ln for n in SPOTDL_DEBUG_NOISE):
+            lines.append(ln[:LINE_MAX])
+    return "\n".join(lines[-TAIL_LINES:])
+
 
 def stable_id(*parts: str) -> str:
     """Stable 16-hex id from normalized parts; identical input always gives the same id."""
@@ -178,6 +187,14 @@ def tg_delete(message_id: int) -> None:
 SPOTDL_HIDDEN_ENV = {"TG_BOT_TOKEN", "TG_CHANNEL_ID", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID",
                      "D1_DATABASE_ID"}
 TAIL_LINES = 15  # lines of spotdl output kept in an error, so a YouTube block stays diagnosable
+LINE_MAX = 400
+# spotdl hides the real yt-dlp error (logger.debug(exception)) below DEBUG, and always prints its "Some YouTube
+# downloads require Deno" warning for ANY failed download, so downloads run at DEBUG with a wide console (rich
+# wraps at COLUMNS) to capture the cause. DEBUG also dumps the whole settings dict, which is dropped here.
+SPOTDL_DOWNLOAD_ARGS = ["--log-level", "DEBUG"]
+SPOTDL_CONSOLE_COLUMNS = "2000"
+SPOTDL_DEBUG_NOISE = ("Downloader settings:",)
+MIN_DENO = (2, 3, 0)  # yt-dlp 2026.8.19: DenoJsRuntime.MIN_SUPPORTED_VERSION
 SPOTDL_CMD = [sys.executable, "-m", "spotdl"]  # tests replace this with a fake
 
 
@@ -190,11 +207,31 @@ def spotdl_run(args: list[str], cwd: Path) -> str:
     cmd = [*SPOTDL_CMD, args[0], *args[1:], "--client-id", cid, "--client-secret", secret]
     # spotdl needs none of the Telegram / Cloudflare values, so keep them out of its environment.
     env = {k: v for k, v in os.environ.items() if k not in SPOTDL_HIDDEN_ENV}
+    env["COLUMNS"] = SPOTDL_CONSOLE_COLUMNS
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env)
     tail = tail_of(r.stdout + "\n" + r.stderr, [cid, secret])
     if r.returncode != 0:
         raise IngestError(f"spotdl {args[0]} failed with exit code {r.returncode}: {tail}")
     return tail
+
+
+def js_runtime_problem() -> str | None:
+    """Why yt-dlp cannot use Deno (its default JavaScript runtime for YouTube), or None when it looks usable.
+    spotdl's own warning cannot be used for this: it is printed for every failed download."""
+    exe = shutil.which("deno")
+    if not exe:
+        return "deno not found on PATH"
+    try:
+        r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return "deno --version failed"
+    m = re.match(r"deno (\d+)\.(\d+)\.(\d+)", r.stdout)
+    if not m:
+        return "cannot read the deno version"
+    version = tuple(int(x) for x in m.groups())
+    if version < MIN_DENO:
+        return f"deno {'.'.join(map(str, version))} is older than {'.'.join(map(str, MIN_DENO))}"
+    return None
 
 
 def fetch_cover(url: str, dest: Path) -> Path:
@@ -266,7 +303,8 @@ def real_deps(ytm) -> Deps:
 
     def download(song, m, tdir):
         tail = spotdl_run(["download", f"https://music.youtube.com/watch?v={m.video_id}|{song['url']}",
-                           "--output", str(tdir / "{track-id}.{output-ext}"), "--format", "mp3", "--bitrate", BITRATE],
+                           "--output", str(tdir / "{track-id}.{output-ext}"), "--format", "mp3", "--bitrate", BITRATE,
+                            *SPOTDL_DOWNLOAD_ARGS],
                           tdir.parent)
         files = list(tdir.glob("*.mp3"))
         if len(files) != 1:
@@ -317,6 +355,10 @@ def main() -> int:
     if missing:
         log(f"ERROR missing env vars: {', '.join(missing)}")
         return 1
+
+    problem = js_runtime_problem()
+    if problem:
+        log(f"WARN js runtime: {problem}; yt-dlp needs Deno >= {'.'.join(map(str, MIN_DENO))} for YouTube")
 
     from ytmusicapi import YTMusic
     existing = {r["spotify_id"] for r in d1_query("SELECT spotify_id FROM tracks")}
