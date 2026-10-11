@@ -8,3 +8,4 @@ wrangler.local.toml
 .claude/worktrees/
 ingest-state.json
 match-report*.csv
+wrangler.ci.toml
