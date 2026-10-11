@@ -1,0 +1,104 @@
+# Worker CI. Contract: docs/worker-cicd.md (section 12.1, rules in 3 and 5.1 rule 5a, pins in 6).
+# Status check name: "Worker CI / ci" (stable on purpose: the owner's master ruleset requires it).
+# No secrets and no `environment:` anywhere in this file. No pull_request_target (section 3 rule 3).
+name: Worker CI
+
+on:
+  pull_request:
+    # labeled/unlabeled: the destructive-migration gate below reads the PR labels
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - "worker/**"
+      - ".github/workflows/worker-ci.yml"
+  push:
+    branches: [master]
+    paths:
+      - "worker/**"
+      - ".github/workflows/worker-ci.yml"
+
+permissions:
+  contents: read
+
+# Section 3 rule 5: superseded PR runs are cancelled (cancelling CI is fine; deploys are never cancelled).
+concurrency:
+  group: worker-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+        working-directory: worker
+    steps:
+      # Pins: section 6 audit table (full commit SHAs). fetch-depth 0 is required: with depth 1 there is
+      # no origin/master and no base commit, so the lint would exit 2 (section 12.1).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          package-manager-cache: false # no cache at all (section 6)
+
+      # Plain npm ci: this job has no secrets, and the smoke test needs the workerd install script (section 4.2 item 6).
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      # BASE = the commit to compare migrations against. Untrusted values come in through env: only (section 3 rule 7).
+      # pull_request: current origin/master. push: the previous head of master. Fails closed if it cannot be read.
+      - name: Resolve base commit
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base=$(git rev-parse --verify --quiet "refs/remotes/origin/master^{commit}") || { echo "cannot read origin/master"; exit 1; }
+          else
+            case "$BEFORE_SHA" in
+              *[!0-9a-f]* | "") echo "invalid before sha"; exit 1 ;;
+            esac
+            [ "${#BEFORE_SHA}" -eq 40 ] || { echo "invalid before sha"; exit 1; }
+            base=$(git rev-parse --verify --quiet "${BEFORE_SHA}^{commit}") || { echo "cannot read the previous commit"; exit 1; }
+          fi
+          echo "BASE_SHA=$base" >> "$GITHUB_ENV"
+
+      # Section 5.1 rule 5a. Applied migrations are immutable: a file that exists in the base and is modified,
+      # renamed or deleted fails the job. Exit behaviour: diff output present -> exit 1; no output -> pass;
+      # git failure (e.g. unreadable base) -> exit 1 as well (fail closed). Fix mistakes with a NEW migration.
+      - name: Migrations are immutable
+        run: |
+          changed=$(git diff --relative --name-status --diff-filter=MRD "$BASE_SHA"...HEAD -- migrations/)
+          if [ -n "$changed" ]; then
+            echo "Existing migration files must not be modified, renamed or deleted (add a new migration):"
+            echo "$changed"
+            exit 1
+          fi
+          echo "no applied migration changed"
+
+      # Lint the migrations ADDED since the base, passed explicitly. The PR label destructive-migration-approved
+      # (boolean computed here, never spliced into the script) turns destructive findings into notices.
+      - name: Lint new migrations
+        env:
+          APPROVED: ${{ contains(github.event.pull_request.labels.*.name, 'destructive-migration-approved') }}
+        run: |
+          mapfile -d '' -t added < <(git diff --relative --name-only -z --diff-filter=A "$BASE_SHA"...HEAD -- 'migrations/*.sql')
+          if [ "${#added[@]}" -eq 0 ]; then
+            echo "no new migrations to lint"
+            exit 0
+          fi
+          args=()
+          if [ "$APPROVED" = "true" ]; then args+=(--approved); fi
+          node scripts/lint-migrations.mjs "${args[@]}" "${added[@]}"
+
+      # Expected: 35 PASS, 6 SKIPPED (stream checks need real Telegram), no secrets used.
+      - name: Smoke test
+        run: npm run smoke:ci
