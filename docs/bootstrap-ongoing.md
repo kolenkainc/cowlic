@@ -332,6 +332,32 @@ something bootstrap does silently.
   codes"; the use of 2 for "no ranking" is [P]]. The wrapper adds 75 (locked) and 78 (prerequisite or
   config problem before anything ran, including missing or invalid caps) [V, #169 and the nightly wrapper].
 
+### 2.9 As implemented in `ingest/bootstrap.py` (#168)
+
+Where the code settled a point this page left open (the code and `ingest/test_bootstrap.py` are the reference):
+
+- `run --reset-state` moves BOTH `bootstrap-progress.json` and `bootstrap-state.json` aside (numbered `.bak`, `.bak.1`,
+  ... never overwritten) and starts empty; the ranking and the nightly `ingest-state.json` are not touched. It happens
+  after the lock, the 21:10 guard, the config, ranking and environment checks, so a refused start moves nothing.
+- `status` also accepts `--config FILE` (only `exclude` is read, so excluded artists are left out of N); without it,
+  or without the default config file, nothing is excluded. A bad config prints `config unusable: ...`, exit 0.
+- `plan` runs the same strict state check as `run` (exit 2), takes no lock and is not guarded by the 21:10 rule; `run`
+  and `rank` (with or without `--refresh`) take the lock themselves unless the real environment has `COWLIC_LOCK_HELD=1`
+  (exactly `1`; read before any `.env` load).
+- The shared parser validates the whole config file: `enabled: false` or a missing `user` is refused as a bad config
+  (exit 2) even for `run`, `plan` and `status`, which do not use those keys; a file with playlists or a
+  `followed_artists:` section is refused too.
+- `tracks_added` of an artist accumulates over sessions; `tracks_seen` is the largest number of tracks handled in one
+  pass. The progress file is written after each artist (not each track), so a process killed inside an artist loses
+  the `tracks_added` count of that artist (the tracks are in D1 and are skipped next time; `M` of `status` can undercount).
+- `--result-json` holds `stop_reason` (`done | cap | time | sign-in`, `null` when nothing ran), `exit_code`, `counts`
+  (added, skipped, no_match, too_big, failed, matched_title_only, cooldown, not_attempted) and `artists` (planned,
+  completed, cut, failed, not_started, parked, unusable). It is written only once the session got past the lock, the guard
+  and the checks (no file for exit 2, 75 or 78).
+- The engine's per-track log lines (`ingested: <artist> - <title>`) are those of `run()` and are not changed or filtered;
+  `bootstrap.log` is never shipped. What bootstrap itself writes (status, summaries, progress, result) holds no names
+  and no titles.
+
 ## 3. What is shared and what is separate
 
 | Thing | Bootstrap | Nightly 21:10 |
