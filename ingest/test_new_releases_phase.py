@@ -586,5 +586,36 @@ class Config(unittest.TestCase):
         self.assertNotIn("lookback", src[start:src.index("# ---- structured result")])
 
 
+class StaleMessages(NoNetwork):
+    """The two config-error hints of the Last.fm source no longer advise `enabled: false` as the way out: the nightly
+    wrapper refuses the lastfm_artists key (exit 78) whatever `enabled` says; the ranking run is the bootstrap command."""
+
+    def check(self, line):
+        self.assertIn("remove or comment out the lastfm_artists section", line)
+        self.assertIn("for a manual ingest.py run `enabled: false` also works", line)
+        self.assertIn("bootstrap command, docs/bootstrap-ongoing.md", line)
+        self.assertNotIn("or set `enabled: false` in the lastfm_artists section", line)
+        self.assertIn(f"exit code {ingest.EXIT_CONFIG}", line)
+
+    def test_prepare_lastfm_hint(self):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=False), contextlib.redirect_stdout(out):
+            os.environ.pop("LASTFM_API_KEY", None)
+            client, code = ingest.prepare_lastfm(ingest.LastfmConfig(user="some_user"), Path("sources.yml"))
+        self.assertEqual((client, code), (None, ingest.EXIT_CONFIG))
+        self.check(out.getvalue())
+
+    def test_ranking_refused_hint(self):
+        err = lastfm.LastfmError("User not found")
+        err.code = 6  # a refusal only the owner can fix
+        out = io.StringIO()
+        lr = ingest.LastfmRun()
+        with mock.patch.object(lastfm, "top_artists", side_effect=err), contextlib.redirect_stdout(out):
+            ingest.run_lastfm_phase(lr, ingest.LastfmConfig(user="some_user"), None, None, set(), {}, Path("."), False,
+                                    ingest.RunLimits(), ingest.RunState())
+        self.assertTrue(lr.config_error)
+        self.check(out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1856,8 +1856,9 @@ def prepare_lastfm(cfg: LastfmConfig, sources: Path | None):
         return lastfm.LastfmClient(key, max_calls=budget, out=log), 0
     except lastfm.LastfmError as e:
         log(f"ERROR lastfm_artists is enabled in {sources} but cannot run: {e}; set LASTFM_API_KEY in .env "
-            f"(docs/local-ingest.md) and check `user`, or set `enabled: false` in the lastfm_artists section; "
-            f"exit code {EXIT_CONFIG}")
+            f"(docs/local-ingest.md) and check `user`, or remove or comment out the lastfm_artists section "
+            f"(for a manual ingest.py run `enabled: false` also works; the nightly wrapper refuses the section, the "
+            f"ranking run goes through the bootstrap command, docs/bootstrap-ongoing.md); exit code {EXIT_CONFIG}")
         return None, EXIT_CONFIG
 
 
@@ -1913,7 +1914,9 @@ def run_lastfm_phase(lr: LastfmRun, cfg: LastfmConfig, client, deps: Deps, exist
         if lastfm_config_problem(e):
             lr.config_error = True
             log(f"ERROR cannot read the Last.fm ranking: {text}; check LASTFM_API_KEY, the user name and that the "
-                f"profile is public, or set `enabled: false` in the lastfm_artists section; exit code {EXIT_CONFIG}")
+                f"profile is public, or remove or comment out the lastfm_artists section (for a manual ingest.py run "
+                f"`enabled: false` also works; the ranking run goes through the bootstrap command, "
+                f"docs/bootstrap-ongoing.md); exit code {EXIT_CONFIG}")
         else:
             log(f"ERROR cannot read the Last.fm ranking: {text}; the playlists are not affected; the next run tries again")
         return
