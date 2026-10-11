@@ -1,15 +1,18 @@
 # Worker CI. Contract: docs/worker-cicd.md (section 12.1, rules in 3 and 5.1 rule 5a, pins in 6).
-# Status check name: "Worker CI / ci" (stable on purpose: the owner's master ruleset requires it).
+# Status check name: "Worker CI / ci" (stable on purpose: the owner's master ruleset requires the context "ci").
+# pull_request has NO paths filter: the required check `ci` must be reported on every PR, or a PR that touches
+# nothing under worker/ could never merge. The expensive steps are skipped by step-level `if:` (not a job-level
+# `if:`: a skipped job reports "skipped", a job with skipped steps reports success) when neither worker/ nor this
+# workflow changed. push to master stays path-filtered: nothing needs a run for a docs-only push, and the ruleset
+# only needs the check on pull requests.
 # No secrets and no `environment:` anywhere in this file. No pull_request_target (section 3 rule 3).
 name: Worker CI
 
 on:
   pull_request:
-    # labeled/unlabeled: the destructive-migration gate below reads the PR labels
+    # labeled/unlabeled: the destructive-migration gate below reads the PR labels, so a label change must re-run
+    # the check. Cost: one short run per label change on every PR (seconds when worker/ is untouched).
     types: [opened, synchronize, reopened, labeled, unlabeled]
-    paths:
-      - "worker/**"
-      - ".github/workflows/worker-ci.yml"
   push:
     branches: [master]
     paths:
@@ -41,41 +44,74 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      # BASE = the commit to compare against. Untrusted values come in through env: only (section 3 rule 7).
+      # pull_request: current origin/master. push: the previous head of master. If it cannot be resolved,
+      # BASE_SHA stays empty: the detect step then treats worker/ as changed (run everything) and the steps
+      # that need a base fail (fail closed, never "unchanged").
+      - name: Resolve base commit
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          base=""
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base=$(git rev-parse --verify --quiet "refs/remotes/origin/master^{commit}") || base=""
+          else
+            case "$BEFORE_SHA" in
+              *[!0-9a-f]* | "") base="" ;;
+              *) if [ "${#BEFORE_SHA}" -eq 40 ]; then base=$(git rev-parse --verify --quiet "${BEFORE_SHA}^{commit}") || base=""; fi ;;
+            esac
+          fi
+          if [ -z "$base" ]; then
+            echo "::warning::cannot resolve the base commit: the worker steps will run and fail closed"
+          fi
+          echo "BASE_SHA=$base" >> "$GITHUB_ENV"
+
+      # worker_changed = any file under worker/ or this workflow differs from the base. Fail closed: no base or a
+      # git failure means true. The pathspecs are :(top)-anchored because the job runs in worker/.
+      - name: Detect worker changes
+        id: changes
+        run: |
+          if [ -z "$BASE_SHA" ]; then
+            echo "no base: treating worker as changed"
+            echo "worker_changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git diff --name-only "$BASE_SHA"...HEAD -- ':(top)worker' ':(top).github/workflows/worker-ci.yml' > "$RUNNER_TEMP/changed.txt"; then
+            echo "git diff failed: treating worker as changed"
+            echo "worker_changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -s "$RUNNER_TEMP/changed.txt" ]; then
+            echo "worker changed"
+            echo "worker_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "nothing under worker/ changed: worker steps skipped"
+            echo "worker_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.changes.outputs.worker_changed == 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           package-manager-cache: false # no cache at all (section 6)
 
       # Plain npm ci: this job has no secrets, and the smoke test needs the workerd install script (section 4.2 item 6).
       - name: Install dependencies
+        if: steps.changes.outputs.worker_changed == 'true'
         run: npm ci
 
       - name: Typecheck
+        if: steps.changes.outputs.worker_changed == 'true'
         run: npx tsc --noEmit
-
-      # BASE = the commit to compare migrations against. Untrusted values come in through env: only (section 3 rule 7).
-      # pull_request: current origin/master. push: the previous head of master. Fails closed if it cannot be read.
-      - name: Resolve base commit
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BEFORE_SHA: ${{ github.event.before }}
-        run: |
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            base=$(git rev-parse --verify --quiet "refs/remotes/origin/master^{commit}") || { echo "cannot read origin/master"; exit 1; }
-          else
-            case "$BEFORE_SHA" in
-              *[!0-9a-f]* | "") echo "invalid before sha"; exit 1 ;;
-            esac
-            [ "${#BEFORE_SHA}" -eq 40 ] || { echo "invalid before sha"; exit 1; }
-            base=$(git rev-parse --verify --quiet "${BEFORE_SHA}^{commit}") || { echo "cannot read the previous commit"; exit 1; }
-          fi
-          echo "BASE_SHA=$base" >> "$GITHUB_ENV"
 
       # Section 5.1 rule 5a. Applied migrations are immutable: a file that exists in the base and is modified,
       # renamed or deleted fails the job. Exit behaviour: diff output present -> exit 1; no output -> pass;
       # git failure (e.g. unreadable base) -> exit 1 as well (fail closed). Fix mistakes with a NEW migration.
       - name: Migrations are immutable
+        if: steps.changes.outputs.worker_changed == 'true'
         run: |
+          [ -n "$BASE_SHA" ] || { echo "no base commit"; exit 1; }
           changed=$(git diff --relative --name-status --diff-filter=MRD "$BASE_SHA"...HEAD -- migrations/)
           if [ -n "$changed" ]; then
             echo "Existing migration files must not be modified, renamed or deleted (add a new migration):"
@@ -87,9 +123,11 @@ jobs:
       # Lint the migrations ADDED since the base, passed explicitly. The PR label destructive-migration-approved
       # (boolean computed here, never spliced into the script) turns destructive findings into notices.
       - name: Lint new migrations
+        if: steps.changes.outputs.worker_changed == 'true'
         env:
           APPROVED: ${{ contains(github.event.pull_request.labels.*.name, 'destructive-migration-approved') }}
         run: |
+          [ -n "$BASE_SHA" ] || { echo "no base commit"; exit 1; }
           mapfile -d '' -t added < <(git diff --relative --name-only -z --diff-filter=A "$BASE_SHA"...HEAD -- 'migrations/*.sql')
           if [ "${#added[@]}" -eq 0 ]; then
             echo "no new migrations to lint"
@@ -101,4 +139,5 @@ jobs:
 
       # Expected: 35 PASS, 6 SKIPPED (stream checks need real Telegram), no secrets used.
       - name: Smoke test
+        if: steps.changes.outputs.worker_changed == 'true'
         run: npm run smoke:ci
