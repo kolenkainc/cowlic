@@ -324,13 +324,42 @@ something bootstrap does silently.
   playlists are not counted.
 - `run --result-json FILE` writes counts only: added, skipped, no_match, too_big, failed, matched_title_only,
   `stop reason` (`done | cap | time | sign-in`, the engine's vocabulary [V, local-ingest.md "Why a run stopped"]).
-- Log: no secret, no Last.fm user name, counts per artist, never track titles [V, #168]. The engine already logs
-  artist names (`artist <name>: ...`) in the nightly style [V, `run_lastfm` on master]; names of artists are accepted in the log,
-  titles are not. [R] whether the owner wants artist names out of the bootstrap log too: not asked yet.
+- Log: what bootstrap itself writes (status, session summaries, progress file, result JSON) holds no secret, no Last.fm
+  user name, no artist names and no track titles. The shared engine does write names and titles into the log and the
+  terminal: `artist <name>: ...`, `ingested: <artist> - <title>`, `dry-run would ingest: <artist> - <title>`,
+  `ERROR <artist> - <title>` [V, `run_lastfm` and `run` on master]. `bootstrap.log` is local, 0600 and never shipped (the
+  wrapper's `ship_grafana --filter` only redacts secrets). A title filter would be a separate ticket (see 2.9). [R] whether
+  the owner wants artist names out of the bootstrap log too: not asked yet.
 - Exit codes: `bootstrap.py` 0 ok (a cap or time stop is NOT a failure), 1 some track or artist failed, 2 bad usage,
   missing caps, no ranking, bad config, 3 sign-in stop [V for 0/1/2/3 as ingest's codes, local-ingest.md "Exit
   codes"; the use of 2 for "no ranking" is [P]]. The wrapper adds 75 (locked) and 78 (prerequisite or
   config problem before anything ran, including missing or invalid caps) [V, #169 and the nightly wrapper].
+
+### 2.9 As implemented in `ingest/bootstrap.py` (#168)
+
+Where the code settled a point this page left open (the code and `ingest/test_bootstrap.py` are the reference):
+
+- `run --reset-state` moves BOTH `bootstrap-progress.json` and `bootstrap-state.json` aside (numbered `.bak`, `.bak.1`,
+  ... never overwritten) and starts empty; the ranking and the nightly `ingest-state.json` are not touched. It happens
+  after the lock, the 21:10 guard, the config, ranking and environment checks, so a refused start moves nothing.
+- `status` also accepts `--config FILE` (only `exclude` is read, so excluded artists are left out of N); without it,
+  or without the default config file, nothing is excluded. A bad config prints `config unusable: ...`, exit 0.
+- `plan` runs the same strict state check as `run` (exit 2), takes no lock and is not guarded by the 21:10 rule; `run`
+  and `rank` (with or without `--refresh`) take the lock themselves unless the real environment has `COWLIC_LOCK_HELD=1`
+  (exactly `1`; read before any `.env` load).
+- The shared parser validates the whole config file: `enabled: false` or a missing `user` is refused as a bad config
+  (exit 2) even for `run`, `plan` and `status`, which do not use those keys; a file with playlists or a
+  `followed_artists:` section is refused too.
+- `tracks_added` of an artist accumulates over sessions; `tracks_seen` is the largest number of tracks handled in one
+  pass. The progress file is written after each artist (not each track), so a process killed inside an artist loses
+  the `tracks_added` count of that artist (the tracks are in D1 and are skipped next time; `M` of `status` can undercount).
+- `--result-json` holds `stop_reason` (`done | cap | time | sign-in`, `null` when the session failed before it ran; `done` on the nothing-to-do path), `exit_code`, `counts`
+  (added, skipped, no_match, too_big, failed, matched_title_only, cooldown, not_attempted) and `artists` (planned,
+  completed, cut, failed, not_started, parked, unusable). It is written only once the session got past the lock, the guard
+  and the checks (no file for exit 2, 75 or 78).
+- The engine's per-track log lines (`ingested: <artist> - <title>`) are those of `run()` and are not changed or filtered;
+  `bootstrap.log` is never shipped. What bootstrap itself writes (status, summaries, progress, result) holds no names
+  and no titles.
 
 ## 3. What is shared and what is separate
 
