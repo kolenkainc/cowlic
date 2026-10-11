@@ -513,11 +513,57 @@ class CooldownTest(Base):
         self.assertEqual(self.state()["albums"], {})
         self.assertEqual(self.d1.cover(a), "photo-1")
 
-    def test_failures_are_not_cooled(self):
+    def test_a_failed_album_rests_for_the_short_horizon_and_then_returns(self):
         (a,) = self.seed(1)
         self.fb.upload_error = ingest.IngestError("cover is not image/jpeg")
         self.assertEqual(self.covers(), 1)
-        self.assertFalse((self.dir / bc.STATE_FILE).exists())
+        self.assertEqual(self.state()["albums"][a], {"result": "failed", "on": "2026-10-11"})
+        self.fb.found.clear()
+        self.today = FixedToday("2026-10-13")  # day 2 of 3
+        self.assertEqual(self.covers(), 0)
+        self.assertEqual(self.fb.found, [])
+        self.today = FixedToday("2026-10-14")  # day 3: back
+        self.covers()
+        self.assertEqual(len(self.fb.found), 1)
+        self.today = FixedToday("2026-10-14")
+        self.fb.found.clear()
+        self.covers("--retry-failed-days", "0")  # 0 = always retry
+        self.assertEqual(len(self.fb.found), 1)
+
+    def test_a_second_session_moves_past_three_failed_albums(self):
+        ids = self.seed(6)
+        bad = set(ids[:3])
+        self.fb.upload = lambda song, tdir: (_ for _ in ()).throw(ingest.IngestError("x")) if self.nm_in_flight in {self.nm(b) for b in bad} else "ok"
+        self.fb.on_find = lambda t: setattr(self, "nm_in_flight", t.album)
+        self.assertEqual(self.covers(), 1)
+        self.assertIn("stop reason: failed", self.out)
+        self.assertTrue(all(self.d1.cover(a) is None for a in ids))
+        self.fb.found.clear()
+        self.assertEqual(self.covers(), 0)  # the three that failed rest: the session reaches the rest
+        self.assertEqual([t.album for t in self.fb.found], [self.nm(a) for a in ids[3:]])
+        self.assertTrue(all(self.d1.cover(a) for a in ids[3:]))
+        self.assertIn("cooldown 3", self.out)
+        self.today = FixedToday("2026-10-14")  # the failed ones come back after their 3 days
+        self.fb.found.clear()
+        self.covers()
+        self.assertEqual(len(self.fb.found), 3)
+
+    def test_an_unexpected_exception_is_one_failed_album_and_only_its_class_is_logged(self):
+        class WeirdClientError(Exception):
+            pass
+        a, b = self.seed(2)
+        self.fb.matches[self.nm(a)] = WeirdClientError("canary Zorblax Frobnitz")
+        result = self.root / "r.json"
+        self.assertEqual(self.covers("--result-json", str(result)), 1)
+        self.assertIn("WeirdClientError", self.out)
+        self.assertNotIn("canary", self.out + self.err + result.read_text() + (self.dir / bc.STATE_FILE).read_text())
+        self.assertEqual((self.d1.cover(a), self.d1.cover(b)), (None, "photo-1"))
+        self.assertEqual(json.loads(result.read_text())["counts"]["failed"], 1)
+
+    def test_the_sign_in_stop_still_wins_over_the_catch_all(self):
+        (a,) = self.seed(1)
+        self.fb.matches[self.nm(a)] = ingest.YouTubeSignInRequired("x")
+        self.assertEqual(self.covers(), 3)
 
     def test_the_file_is_private_atomic_and_holds_ids_and_words_only(self):
         a, b = self.seed(2)
@@ -549,7 +595,7 @@ class CooldownTest(Base):
         good = ingest.album_id("a", "b")
         for body in ("not json", "[]", '{"version": 1}', '{"version": 2, "albums": {}}',
                      '{"version": 1, "albums": {}, "x": 1}', '{"version": 1, "albums": {"zz": {"result": "no_match", "on": "2026-10-11"}}}',
-                     json.dumps({"version": 1, "albums": {good: {"result": "failed", "on": "2026-10-11"}}}),
+                     json.dumps({"version": 1, "albums": {good: {"result": "exploded", "on": "2026-10-11"}}}),
                      json.dumps({"version": 1, "albums": {good: {"result": "no_match", "on": "2026-13-01"}}}),
                      json.dumps({"version": 1, "albums": {good: {"result": "no_match", "on": "2026-10-11", "x": 1}}}),
                      '{"version": 1, "albums": {}, "n": NaN}'):
@@ -767,15 +813,28 @@ class CountTest(Base):
         self.assertEqual(self.covers(), 2)  # a session needs Telegram
         self.assertIn("missing env vars: TG_BOT_TOKEN, TG_CHANNEL_ID", self.err)
 
-    def test_a_d1_error_other_than_a_missing_column_is_a_failure(self):
+    def test_the_http_400_shape_of_a_missing_column_is_not_a_failure(self):
+        """On the current production schema D1 may answer the artist query with a bare HTTP error: the albums line is
+        still printed and the count exits 0."""
         real = self.d1.query
 
         def q(sql, params=None):
             if sql == bc.ARTISTS_COUNT_SQL:
-                raise ingest.IngestError("D1 API error 500")
+                raise ingest.IngestError("D1 API error 400")
             return real(sql, params)
         self.d1.query = q
-        self.assertEqual(self.main("covers", "--count"), 1)
+        self.d1.db.execute("ALTER TABLE artists ADD COLUMN image_file_id TEXT")  # the column check says present, the count fails
+        self.seed(2)
+        self.assertEqual(self.main("covers", "--count"), 0)
+        self.assertIn("albums without a cover: 2", self.out)
+        self.assertIn("artists without an image: not counted yet", self.out)
+
+    def test_the_column_is_checked_without_a_query_that_can_fail(self):
+        self.seed(1)
+        self.main("covers", "--count")
+        sqls = [q[0] for q in self.d1.queries]
+        self.assertIn(bc.ARTISTS_COLUMN_SQL, sqls)
+        self.assertNotIn(bc.ARTISTS_COUNT_SQL, sqls)  # no count query while the column is missing
 
     def test_no_env_syntax_error_and_missing_d1_variables_are_exit_2(self):
         os.environ.pop("D1_DATABASE_ID")

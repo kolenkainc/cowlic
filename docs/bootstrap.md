@@ -389,7 +389,8 @@ each one:
 3. fetches the thumbnail through the hardened route of #248 (https, host allowlist, no redirects, `image/jpeg`, JPEG magic
    bytes, 10 MB and a total time limit) and sends it as a Telegram photo (the same `sendPhoto` path of ingest);
 4. writes `UPDATE albums SET cover_file_id = ? WHERE id = ? AND cover_file_id IS NULL` (parameterized). A cover another
-   process stored meanwhile is never replaced (counted `already`; the cost is one orphan photo in the channel).
+   process stored meanwhile is never replaced (counted `already`). An orphan Telegram photo is left when that happens and also
+   when the upload worked but the D1 `UPDATE` then failed (the album counts `failed`; the next try uploads another photo).
 
 Nothing is downloaded as audio and no track row is touched.
 
@@ -415,7 +416,10 @@ Not run by the author (section 0). Order: `--count` first, then a small session,
   not); albums resting in the cooldown are skipped and not counted. `--max-minutes` is wall clock: no new album starts
   after it, one album in progress finishes (up to 3 paced searches plus retries; leave a margin of a few minutes).
 - **`--retry-days D`** (0..3650, default 30; also accepted by `--count`): how long an album without a match (`no_match`) or
-  with a mismatch rests before it is tried again. `0` retries everything every session.
+  with a mismatch rests before it is tried again. `0` retries them every session.
+- **`--retry-failed-days D`** (0..3650, default 3; also accepted by `--count`): the same for an album whose attempt FAILED
+  (thumbnail 404, not a JPEG, too large, Telegram or D1 refusing, any unexpected error). Without it an album that fails the
+  same way every time would stay first in line and three of them would end every session. `0` retries them every session.
 - **The 21:10 guard** is the one of `run`: the wrapper (and `bootstrap.py` itself) refuse to start when `now + --max-minutes
   + 10 min + 60 s` reaches the next 21:10 local time (exit 78, one line, nothing touched). `--count` is exempt.
 - **Pacing and retries.** At least 1.5 s plus 0..1 s of jitter between two YouTube Music calls; a transient error (HTTP
@@ -430,8 +434,8 @@ Not run by the author (section 0). Order: `--count` first, then a small session,
 The work list comes from D1 every time, so a stopped or killed session resumes by itself: albums that got a cover are no
 longer selected. `cover-backfill.json` in the state directory (0600, atomic writes, directory 0700) remembers only the
 hopeless ones: `{"version": 1, "albums": {<album id>: {"result": "no_match" | "mismatch", "on": "YYYY-MM-DD"}}}` (ids are
-hashes, no names). A later success removes the entry. Failures (a Telegram, D1 or fetch error) are NOT cooled: they are
-retried in the next session and cost an attempt each time. A file that is not valid (unknown field, bad date, wrong
+hashes, no names; `result` may also be `failed`). A later success removes the entry. A failed album rests for
+`--retry-failed-days`, so a session moves past it; a short outage can therefore rest up to three albums for three days. A file that is not valid (unknown field, bad date, wrong
 version, not a regular file) is refused with exit 2 and nothing runs; to start empty, move it aside by hand (there is no
 `--reset-state` for `covers`).
 
@@ -452,6 +456,11 @@ unusable cooldown file, 3 sign-in stop, 75 locked, 78 guard or wrapper usage.
   loosen it blindly (a wrong cover stays for good: the first stored cover is never replaced).
 - A match can fail when YouTube Music lists the album under another title; such albums rest in the cooldown and stay without a
   cover. Whether to add another source (Cover Art Archive, design doc section 8 item 5) is decided from the first counts.
+- Only the stored track with the smallest id represents an album. If it is a live or bonus track the guard refuses the
+  match, and the whole album rests for `--retry-days` (30 days) although another of its tracks would have matched. Known
+  limit, not worked around.
+- The artist guard is one-way for scripts: a stored Cyrillic artist name against a Latin YouTube Music spelling is refused
+  (a safe false reject, the same code as #248); the Latin-stored, Cyrillic-listed direction is accepted.
 - Search call limits of YouTube Music are undocumented [R]; the pacing above is a conservative guess, not a measured limit.
 - Not run by the author: every command of this section. The tests (`ingest/test_bootstrap_covers.py`,
   `scripts/test-run-bootstrap-local.sh`) use fakes and an in-memory SQLite copy of the real schema; no D1, Telegram,

@@ -38,7 +38,8 @@ STATE_MAX_BYTES = 8 * 1024 * 1024
 STATE_MAX_ENTRIES = 200_000
 RETRY_DAYS_RANGE = (0, 3650)
 DEFAULT_RETRY_DAYS = 30  # same horizon as the engine's no_match cooldown: a missing match rarely appears within weeks
-COOLDOWN_RESULTS = ("no_match", "mismatch")
+COOLDOWN_RESULTS = ("no_match", "mismatch", "failed")
+DEFAULT_FAILED_DAYS = 3  # a failure (thumbnail 404, non-JPEG, Telegram refusing the image, ...) rests shorter than a mismatch
 PACE_SECONDS = 1.5  # at least this long between two YouTube Music calls ...
 PACE_JITTER_SECONDS = 1.0  # ... plus a random 0..1 s
 MAX_CONSECUTIVE_FAILURES = 3  # a D1, Telegram or network outage must not burn the whole cap
@@ -51,6 +52,7 @@ ALBUMS_SQL = ("SELECT al.id AS album_id, al.name AS album, ar.name AS artist, t.
               "FROM albums al JOIN artists ar ON ar.id = al.artist_id "
               "JOIN tracks t ON t.id = (SELECT MIN(t2.id) FROM tracks t2 WHERE t2.album_id = al.id) "
               "WHERE al.cover_file_id IS NULL ORDER BY al.id")
+ARTISTS_COLUMN_SQL = "SELECT 1 AS present FROM pragma_table_info('artists') WHERE name = 'image_file_id'"
 ARTISTS_COUNT_SQL = "SELECT COUNT(*) AS n FROM artists WHERE image_file_id IS NULL"
 UPDATE_SQL = "UPDATE albums SET cover_file_id = ? WHERE id = ? AND cover_file_id IS NULL"
 
@@ -140,12 +142,14 @@ class CoverState:
         state.albums = {k: dict(e) for k, e in albums.items()}
         return state
 
-    def cooled(self, album_id: str, today: datetime.date, retry_days: int) -> bool:
-        """True while the album must not be retried: its entry is younger than `retry_days` (0 disables the cooldown)."""
+    def cooled(self, album_id: str, today: datetime.date, retry_days: int, failed_days: int = DEFAULT_FAILED_DAYS) -> bool:
+        """True while the album must not be retried: its entry is younger than `retry_days` (`failed_days` for a failed
+        attempt); 0 disables that cooldown."""
         e = self.albums.get(album_id)
-        if e is None or retry_days <= 0:
+        days = failed_days if e is not None and e["result"] == "failed" else retry_days
+        if e is None or days <= 0:
             return False
-        return today < datetime.date.fromisoformat(e["on"]) + datetime.timedelta(days=retry_days)
+        return today < datetime.date.fromisoformat(e["on"]) + datetime.timedelta(days=days)
 
     def record(self, album_id: str, result: str, today: datetime.date) -> None:
         self.albums[album_id] = {"result": result, "on": today.isoformat()}
@@ -280,7 +284,7 @@ def attempt(todo: Todo, backends: CoverBackends) -> str:
         return "already" if changes == 0 else "covered"
     except ingest.YouTubeSignInRequired:
         raise
-    except (ingest.IngestError, OSError, KeyError, ValueError, TypeError) as e:
+    except Exception as e:  # noqa: BLE001 - the sign-in stop was re-raised above; any other error is this album's failure
         ingest.log(f"WARN covers: attempt failed ({type(e).__name__})")
         return "failed"
 
@@ -290,6 +294,8 @@ def cooldown_result(outcome: str) -> str | None:
         return "no_match"
     if outcome in ("album_mismatch", "artist_mismatch", "no_cover_in_match"):
         return "mismatch"
+    if outcome == "failed":
+        return "failed"
     return None
 
 
@@ -308,26 +314,27 @@ class CoverRun:
 
 
 def run_backfill(todo: list[Todo], backends: CoverBackends, state: CoverState, limits: "ingest.RunLimits",
-                 today: Callable[[], datetime.date], retry_days: int) -> CoverRun:
+                 today: Callable[[], datetime.date], retry_days: int,
+                 failed_days: int = DEFAULT_FAILED_DAYS) -> CoverRun:
     """Works `todo` in order until a cap, the time limit, a sign-in challenge or too many failures in a row. --max-new
     counts albums ATTEMPTED (every attempt costs search calls); cooldown albums are skipped and not counted."""
     run = CoverRun()
     consecutive = 0
     for i, t in enumerate(todo):
-        if state.cooled(t.album_id, today(), retry_days):
+        if state.cooled(t.album_id, today(), retry_days, failed_days):
             run.cooldown += 1
             continue
         reason = limits.exhausted()
         if reason:
             run.stop_reason = reason
-            run.not_attempted = sum(not state.cooled(x.album_id, today(), retry_days) for x in todo[i:])
+            run.not_attempted = sum(not state.cooled(x.album_id, today(), retry_days, failed_days) for x in todo[i:])
             break
         limits.attempted += 1
         try:
             outcome = attempt(t, backends)
         except ingest.YouTubeSignInRequired:
             run.interrupted, run.stop_reason = True, "sign-in"
-            run.not_attempted = sum(not state.cooled(x.album_id, today(), retry_days) for x in todo[i:])
+            run.not_attempted = sum(not state.cooled(x.album_id, today(), retry_days, failed_days) for x in todo[i:])
             break
         run.counts[outcome] += 1
         ingest.log(f"covers: album {limits.attempted}: {outcome}")
@@ -349,7 +356,7 @@ def run_backfill(todo: list[Todo], backends: CoverBackends, state: CoverState, l
                 run.unsaved = False
         if consecutive >= MAX_CONSECUTIVE_FAILURES:
             run.stop_reason = "failed"
-            run.not_attempted = sum(not state.cooled(x.album_id, today(), retry_days) for x in todo[i + 1:])
+            run.not_attempted = sum(not state.cooled(x.album_id, today(), retry_days, failed_days) for x in todo[i + 1:])
             break
     return run
 
@@ -357,22 +364,25 @@ def run_backfill(todo: list[Todo], backends: CoverBackends, state: CoverState, l
 # ---- the dry count ----
 
 def count_lines(query: Callable[[str, list | None], list], state: CoverState, today: datetime.date,
-                retry_days: int) -> list[str]:
+                retry_days: int, failed_days: int = DEFAULT_FAILED_DAYS) -> list[str]:
     """`covers --count`: D1 reads only (the same album list as the run, one count of artists). No YouTube, no Telegram,
     no write, no file. Lines hold counts only. The artist half reports `not counted` while the column does not exist."""
     todo, skipped = read_todo(query)
-    cooled = sum(state.cooled(t.album_id, today, retry_days) for t in todo)
+    cooled = sum(state.cooled(t.album_id, today, retry_days, failed_days) for t in todo)
     lines = [f"covers: albums without a cover: {len(todo) + skipped['unknown'] + skipped['bad']} "
              f"(to try: {len(todo) - cooled}, in cooldown: {cooled}, unknown album: {skipped['unknown']}, "
-             f"unreadable rows: {skipped['bad']}; retry cooldown {retry_days} days)"]
+             f"unreadable rows: {skipped['bad']}; retry cooldown {retry_days} days, failed {failed_days} days)"]
+    # The column is checked first with a query that cannot fail on a missing column; any D1 error in this optional half
+    # (D1 answers a SQL error with HTTP 400, which d1_batch reports without the SQL message) leaves the albums line printed.
     try:
-        rows = query(ARTISTS_COUNT_SQL, None)
-        n = rows[0]["n"]
-        if isinstance(n, bool) or not isinstance(n, int):
-            raise ingest.IngestError("unexpected artist count")
-        lines.append(f"covers: artists without an image: {n} (in cooldown: 0)")
-    except ingest.IngestError as e:
-        if "no such column" not in str(e):
-            raise
-        lines.append("covers: artists without an image: not counted yet (the artists.image_file_id column does not exist)")
+        if not query(ARTISTS_COLUMN_SQL, None):
+            lines.append("covers: artists without an image: not counted yet (the artists.image_file_id column does not exist)")
+        else:
+            n = query(ARTISTS_COUNT_SQL, None)[0]["n"]
+            if isinstance(n, bool) or not isinstance(n, int):
+                raise ingest.IngestError("unexpected artist count")
+            lines.append(f"covers: artists without an image: {n} (in cooldown: 0)")
+    except (ingest.IngestError, IndexError, KeyError, TypeError) as e:
+        ingest.log(f"WARN covers: the artist count failed ({type(e).__name__})")
+        lines.append("covers: artists without an image: not counted yet (the artist query failed)")
     return lines
