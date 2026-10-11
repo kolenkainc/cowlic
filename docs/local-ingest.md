@@ -762,6 +762,14 @@ finished and holds the stop reason (same on every row) otherwise, so `--summariz
   similarity >= 0.6 against any returned artist name (the 0.6 is loose; judge it on the numbers), candidate length
   60-600 s, and none of the variant words (live, remix, edit, acoustic, cover, ...) that the requested title lacks.
   The duration mode keeps title >= 0.85 and +-3 s.
+- Relaxed title pass (#194), both modes: only when the strict pass finds nothing in the same search results (no extra
+  search call), `find_match` compares the titles again after dropping version noise that does not change the recording
+  (` - Remastered YYYY`, `(Remastered YYYY)`, `(YYYY)`, `(Album Version)`, `(Single Version)`, `[Explicit]`), reading `&`
+  as `and`, ignoring apostrophes and Latin diacritics, and a plural `s` on the last word of a title of 2+ words. The
+  variant markers (live and its venue, acoustic, remix, instrumental, karaoke, cover, sped up, slowed, 8D, reverb, radio
+  edit, extended, demo, ...) of the two titles must be the same, however spelled or ordered. The thresholds and the
+  +-3 s are unchanged. Duration mode only: a title of 2+ words that is the start of the other and whose extra words
+  repeat words of that start (`Ooh La` / `Ooh La La La`) passes.
 
 The first line of the output is the verdict (the line you copy into #154), followed by its warnings. It is a go only
 on a sample the gate can be judged on. Otherwise it reads `no verdict: <reasons>` (and never says go) when any of
