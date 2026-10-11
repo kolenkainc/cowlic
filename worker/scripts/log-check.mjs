@@ -5,7 +5,14 @@
 // Responses are checked too (status and body must be unchanged by the logging).
 // Run: node scripts/log-check.mjs   (esbuild resolves through wrangler's hoisted dependency)
 import { createHash } from "node:crypto";
-import { build } from "esbuild";
+// esbuild is not a declared dependency: it comes hoisted from wrangler (like in paging-check.mjs). Fail clearly if not.
+let build;
+try {
+  ({ build } = await import("esbuild"));
+} catch {
+  console.error("FAIL log-check needs esbuild, which npm hoists from wrangler's dependencies; run `npm ci` in worker/ (a wrangler upgrade may change this)");
+  process.exit(1);
+}
 
 const out = await build({ entryPoints: ["src/index.ts"], bundle: true, format: "esm", platform: "neutral", write: false, logLevel: "error" });
 const worker = (await import(`data:text/javascript;base64,${Buffer.from(out.outputFiles[0].text).toString("base64")}`)).default;
@@ -44,6 +51,12 @@ const env = {
       bind: () => ({
         first: async () => {
           if (dbMode === "throw") throw new TypeError(`D1 failure near u=${USER}&t=${TOKEN}&s=${SALT}`);
+          if (dbMode === "badname") {
+            // An error class name carrying newline, quotes, unicode, credentials and 100+ characters.
+            const e = new Error("x");
+            e.name = `Bad\n"Nameé ${USER} ${TOKEN} ` + "A".repeat(100);
+            throw e;
+          }
           return { id: TRACK_ID, tg_file_id: FILE_ID, content_type: "audio/mpeg", suffix: "mp3" };
         },
       }),
@@ -96,6 +109,8 @@ results.push(["stream upstream failure", await call(`/rest/stream?${authQuery}&i
 tgMode = "ok";
 dbMode = "throw";
 results.push(["exception carries credentials in its message", await call(`/rest/getSong?${authQuery}&id=${TRACK_ID}`)]);
+dbMode = "badname";
+results.push(["error with a hostile class name", await call(`/rest/getSong?${authQuery}&id=${TRACK_ID}`)]);
 dbMode = "ok";
 results.push(["unknown method name", await call(`/rest/leakcheckSecretMethod?${authQuery}`)]);
 results.push(["not a /rest path with a query", await call(`/leakcheck/path?${authQuery}`)]);
@@ -104,7 +119,7 @@ results.push(["getCoverArt bad token", await call(`/rest/getCoverArt?u=${USER}&t
 Object.assign(console, real);
 
 for (const [name, r] of results) {
-  if (r.thrown && name !== "exception carries credentials in its message") check(`${name}: no exception`, false, String(r.thrown?.stack ?? r.thrown).slice(0, 300));
+  if (r.thrown && name !== "exception carries credentials in its message" && name !== "error with a hostile class name") check(`${name}: no exception`, false, String(r.thrown?.stack ?? r.thrown).slice(0, 300));
 }
 
 // Behaviour: responses are what they were before logging existed.
@@ -156,6 +171,7 @@ check("ping valid logs request/ping/200", JSON.stringify(lines("ping valid")) ==
 check("bad token logs auth_failed (code 40) then request", lines("ping bad token (fake credentials)")[0]?.event === "auth_failed" && lines("ping bad token (fake credentials)")[0]?.code === 40);
 check("upstream failure logs upstream_error route stream status 502", lines("stream upstream failure").some((o) => o.event === "upstream_error" && o.route === "stream" && o.status === 502));
 check("exception logs unhandled_error with the class name only", lines("exception carries credentials in its message").some((o) => o.event === "unhandled_error" && o.route === "getSong" && o.errorClass === "TypeError"));
+check("hostile error name: errorClass falls back to unknown", lines("error with a hostile class name").some((o) => o.event === "unhandled_error" && o.errorClass === "unknown"));
 check("unknown method name is logged as other", lines("unknown method name").every((o) => o.route === "other"));
 check("non-/rest path is logged as not_rest", lines("not a /rest path with a query").every((o) => o.route === "not_rest"));
 check("error lines go to console.error, request lines to console.log", by("exception carries credentials in its message").lines.some((l) => l.method === "error") && by("ping valid").lines.every((l) => l.method === "log"));

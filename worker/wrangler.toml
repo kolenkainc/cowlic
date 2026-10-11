@@ -6,9 +6,12 @@ preview_urls = false
 # Workers Logs. SECURITY: invocation_logs = false is mandatory. An invocation log stores the request URL and Subsonic
 # clients send reusable credentials in its query (u, t, s). Only the explicit console logs of src/log.ts are stored
 # (route name, status, error class). The local gitignored wrangler.local.toml needs the same block for manual deploys.
+# redact_query_string = true is defence in depth (schema of wrangler 4.149.0: query strings are removed from request
+# URLs in logs and traces; its server-side effect is unverified): invocation_logs = false covers one channel only.
 [observability]
 enabled = true
 head_sampling_rate = 1
+redact_query_string = true
 
 [observability.logs]
 enabled = true

@@ -29,7 +29,7 @@ const EXPECTED_SKIPPED = 6; // the stream checks in smoke.mjs
 const MIN_PASS = 51; // the default suite has 51 PASS in CI mode (35 before the artist-image checks of #249); raise when checks are added
 const MIN_PASS_LEGACY = 46; // the same suite on the pre-0003 schema (46 PASS: no photo-fixture checks)
 
-const MIN_PASS_LOGCHECK = 26; // scripts/log-check.mjs (log leak check, #272)
+const MIN_PASS_LOGCHECK = 28; // scripts/log-check.mjs (log leak check, #272)
 
 const workerDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const tmp = mkdtempSync(join(tmpdir(), "cowlic-smoke-"));
