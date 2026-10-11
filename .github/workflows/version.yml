@@ -1,0 +1,56 @@
+# Calculates the GitVersion version and prints it in the job summary. Read-only: it never tags or releases.
+# Contract: docs/releasing.md. Config: GitVersion.yml (GitVersion 6.x, GitHubFlow/v1).
+# No secrets, no `environment:`, no pull_request_target, permissions contents: read only.
+# No path filter on purpose: the job reports on every PR (stable check name "Version / version").
+name: Version
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: version-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Exact tool version (audit in docs/releasing.md). Never upgrade without confirmation.
+  GITVERSION_TOOL_VERSION: "6.8.2"
+  DOTNET_NOLOGO: "1"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+
+jobs:
+  version:
+    name: version
+    # Pinned image (not -latest): the audited image ships .NET SDK 8, 9 and 10.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # Same pin as worker-ci.yml. fetch-depth 0: GitVersion needs the full history and all tags.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install GitVersion.Tool
+        run: |
+          dotnet --list-sdks
+          dotnet tool install GitVersion.Tool --tool-path "$RUNNER_TEMP/gitversion" --version "$GITVERSION_TOOL_VERSION"
+
+      # Branch/ref names reach GitVersion through the runner environment (GITHUB_REF), never through the command line.
+      - name: Calculate version
+        run: |
+          "$RUNNER_TEMP/gitversion/dotnet-gitversion" . /output json /verbosity Quiet > "$RUNNER_TEMP/gitversion.json"
+          {
+            echo "### Version"
+            echo
+            echo "| Variable | Value |"
+            echo "|---|---|"
+            for key in SemVer FullSemVer MajorMinorPatch PreReleaseLabel CommitsSinceVersionSource VersionSourceSha; do
+              echo "| $key | \`$(jq -r --arg k "$key" '.[$k] // ""' "$RUNNER_TEMP/gitversion.json")\` |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          jq -r '"Calculated version: " + .FullSemVer' "$RUNNER_TEMP/gitversion.json"
