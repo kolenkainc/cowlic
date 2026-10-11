@@ -313,6 +313,10 @@ jobs:
           {
             echo "- New migration files since BASE: ${#added[@]} (destructive: ${#destructive[@]})"
             for f in "${added[@]}"; do echo "  - \`$f\`"; done
+            if [ "${#destructive[@]}" -gt 0 ]; then
+              echo "- DESTRUCTIVE (the owner's approval of \`production-destructive\` applies \`--approved\` to ALL pending files; the approval screen lists no files, so check this list and the pending list of \`migrate\` first):"
+              for f in "${destructive[@]}"; do echo "  - \`$f\`"; done
+            fi
             echo "- \`migrate\` runs in the environment \`$environment\`"
             echo "- The classification is advisory: \`migrate\` lists the pending migrations of the remote DB and re-lints them"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -422,9 +426,19 @@ jobs:
           const at = text.indexOf("Migrations to be applied:");
           const names = [];
           if (at >= 0) {
-            for (const line of text.slice(at).split("\n")) {
-              const m = /^│\s*(.*?)\s*│$/.exec(line.trim());
-              if (m && m[1].toLowerCase() !== "name") names.push(m[1]);
+            // Every non-empty line after the heading must be a border line or a one-cell row. A line that is neither
+            // (a changed table layout, a warning, a row with extra separators) fails the step: a file that was
+            // silently dropped here would still be applied by wrangler, but never linted.
+            const lines = text.slice(at).split("\n").slice(1);
+            for (const raw of lines) {
+              const line = raw.trim();
+              if (line === "" || /^[┌├└][─┬┼┴]*[┐┤┘]$/.test(line)) continue;
+              const m = /^│\s*([^│]*?)\s*│$/.exec(line);
+              if (!m) {
+                console.error("::error::unexpected line in the output of wrangler d1 migrations list");
+                process.exit(1);
+              }
+              if (m[1].toLowerCase() !== "name") names.push(m[1]);
             }
           }
           if (none === at >= 0 || (at >= 0 && names.length === 0)) {
@@ -567,8 +581,11 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Nothing is rolled back automatically (a restore overwrites the database, so it is a human decision).
+      # Also runs when the job is cancelled or times out while the apply or the verify was running (their outcome is
+      # then `cancelled`). It never runs when the apply was not started (outcome `skipped`), so it cannot print a
+      # restore hint for a database that was not touched.
       - name: Summary (migration failed)
-        if: always() && (steps.apply.outcome == 'failure' || steps.verify.outcome == 'failure')
+        if: always() && (steps.apply.outcome == 'failure' || steps.apply.outcome == 'cancelled' || steps.verify.outcome == 'failure' || steps.verify.outcome == 'cancelled')
         env:
           PENDING: ${{ steps.pending.outputs.names }}
           BOOKMARK: ${{ steps.bookmark.outputs.bookmark }}
