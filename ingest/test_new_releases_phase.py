@@ -3,6 +3,7 @@ a temp state directory, an injected clock for the 1 s pacing (NoNetwork makes a 
 
 The names below are deliberately odd ("Zyxel ...") so that a leak of an artist or a title into the log is easy to see."""
 import contextlib
+import dataclasses
 import datetime
 import hashlib
 import io
@@ -222,12 +223,14 @@ class Caps(Base):
         self.assertEqual(nrr["not_started"], 8)
         self.assertEqual(r["stop_reason"], "done")  # the phase's own cap is not a stop of the run
         self.assertEqual(len(self.uploaded), 3)
-        # artist 0 is done and evaluated; artist 1 was cut: not evaluated and still due
+        # artist 0 is done and evaluated; artist 1 was cut: not evaluated, checked_at put back (due again)
         self.assertEqual(len(self.entry(artist_names(15)[0])["evaluated"]), 1)
         cut = self.entry(artist_names(15)[1])
         self.assertNotIn("checked_at", cut)
         self.assertEqual(cut.get("evaluated", []), [])
-        # the next night checks the cut artist again (first, it is the oldest due one) and goes on with the others
+        # the next night checks the cut artist again (first, it is the oldest due one) and goes on with the others.
+        # Limit (#238): this fake D1 forgets uploads; with a real one a release of which only some tracks landed is
+        # "in library" afterwards and its remaining tracks are NOT retried.
         code, r, _ = self.run_main(f"- {URL}\n{SECTION}  max_new: 3\n")
         self.assertEqual(self.entry(artist_names(15)[1])["checked_at"], day(0))
         self.assertEqual(r["new_releases"]["checked"], 2)  # artist 1 again (2 tracks), then artist 2 (cut at 3)
@@ -370,6 +373,26 @@ class Order(Base):
         # the release has a failed track: not evaluated, retried later
         self.assertEqual(self.entry(artist_names(1)[0])["evaluated"], [])
 
+    def test_unexpected_exception_in_the_phase_tracks_ends_the_phase_not_the_run(self):
+        boom = type("YTMusicServerError", (Exception,), {})("secret Zyxel Quartet 00 text")
+
+        def find(song):
+            if song["name"].startswith("Zyxel Song 00a"):
+                raise boom
+            return Match()
+        base = self.deps
+        self.deps = lambda: dataclasses.replace(base(), find_match=find)
+        code, r, out = self.run_main(f"- {URL}\n{SECTION}", playlist=[song(1)])
+        self.assertEqual((code, r["failure_class"], r["new_releases"]["status"]), (1, "partial", "failed"))
+        self.assertEqual((r["new_releases"]["failed"], r["new_releases"]["not_started"]), (1, 9))
+        self.assertEqual(self.uploaded, ["Playlist Song 1"])
+        self.assertIn("(YTMusicServerError)", out)
+        self.assertNotIn("Zyxel", out)
+        self.assertIn("new-release check(s) failed", out)
+        self.assertNotIn("could not be enumerated", out)
+        self.assertEqual(self.ytm.calls.count("search"), 1)  # the phase ended
+        self.assertTrue(self.nr_state.exists())  # state was saved
+
     def test_never_computes_the_lastfm_ranking_and_reads_the_stored_one_only(self):
         self.write_ranking(artist_names(2))
         boom = AssertionError("the nightly must never call Last.fm")
@@ -403,7 +426,7 @@ class NothingToDo(Base):
         self.assertNotIn("new_releases", r)
         self.assertNotIn("new releases", out)
 
-    def test_no_stored_ranking_one_line_and_nothing_done(self):
+    def test_no_stored_ranking_one_line_and_nothing_done(self):  # no D1 artist-set fallback (not implemented, see PR)
         code, r, out = self.run_main(f"- {URL}\n{SECTION}", ranking=None, playlist=[song(1)])
         self.assertEqual((code, self.ytm.calls, self.uploaded), (0, [], ["Playlist Song 1"]))
         self.assertEqual([ln for ln in out.splitlines() if "new releases" in ln],

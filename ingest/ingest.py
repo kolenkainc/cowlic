@@ -1608,12 +1608,17 @@ def run_new_releases_phase(nr: NewReleasesRun, cfg: NewReleasesConfig, source, d
             nr.skipped += 1
         outcomes: dict = {}
         interrupted: YouTubeSignInRequired | None = None
+        crashed = False
         if res.records:
             try:
                 nr.add(run(res.records, deps, existing, covers, work, dry, pl, track_state, outcomes, quiet=True))
             except YouTubeSignInRequired as e:
                 interrupted = e
                 nr.add(e.counts or {})
+            except Exception as e:  # noqa: BLE001 - a surprise must not end the run after the playlists; class only, no text
+                crashed = True
+                nr.failed += 1
+                log(f"ERROR new releases {key}: tracks failed unexpectedly ({type(e).__name__}); phase ended")
         if not dry:
             statuses = {sid: NEW_RELEASES_TRACK_STATUS.get(o, "failed") for sid, o in outcomes.items()}
             new_releases.mark_outcomes(nrstate, res, statuses)
@@ -1628,9 +1633,12 @@ def run_new_releases_phase(nr: NewReleasesRun, cfg: NewReleasesConfig, source, d
                 new_releases.save_state(state_path, nrstate)
             except (new_releases.NewReleasesStateError, OSError) as e:
                 log(f"ERROR new releases: cannot write the state file ({type(e).__name__}); phase ended")
-                if not interrupted:
+                if not interrupted and not crashed:
                     nr.status, nr.not_started = "failed", nr.not_started + left - 1
                     break
+        if crashed:  # state is saved above; the rest of the artists stay due
+            nr.status, nr.not_started = "failed", nr.not_started + left - 1
+            break
         if interrupted:
             nr.status, nr.not_started = "interrupted", nr.not_started + left - 1
             nr.not_attempted = interrupted.tracks_not_attempted + 1
@@ -2047,7 +2055,8 @@ def execute(args: argparse.Namespace, state: dict) -> int:
                                           *([nr.counts] if nr else [])])
              for k in (*COUNT_KEYS, "cooldown", "matched_title_only", "matched_normalized")}
     broken = len(results) - len(ok)
-    artists_failed = (fr.failed if fr else 0) + (lr.failed if lr else 0) + (nr.failed if nr else 0)
+    enum_failed = (fr.failed if fr else 0) + (lr.failed if lr else 0)
+    artists_failed = enum_failed + (nr.failed if nr else 0)
     phase_failed = bool(lr and lr.status == "failed")
     nr_failed = bool(nr and nr.status == "failed")
     if fr:
@@ -2057,7 +2066,8 @@ def execute(args: argparse.Namespace, state: dict) -> int:
     if nr and nr.status != "no_ranking":  # no ranking: the one line of the phase was logged already
         log(nr.line())
     log(f"done: {summary(total)}" + (f"; {broken} playlist(s) could not be read" if broken else "")
-        + (f"; {artists_failed} artist(s) could not be enumerated" if artists_failed else "")
+        + (f"; {enum_failed} artist(s) could not be enumerated" if enum_failed else "")
+        + (f"; {nr.failed} new-release check(s) failed" if nr and nr.failed else "")
         + ("; the Last.fm phase failed" if phase_failed else "")
         + ("; the new-release phase failed" if nr_failed else ""))
     log(f"stop reason: {stop_reason(results, None, limits)}")

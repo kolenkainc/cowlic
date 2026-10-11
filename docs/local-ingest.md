@@ -911,8 +911,16 @@ section alone is not a source: the file still needs a playlist. Bounds per night
 `max_new` tracks and 20 minutes for the phase, inside the run's own `--max-new` / `--max-minutes`; a heavy playlist
 night that uses them up leaves the artists `not_started` and they stay due. Per artist at most 5 source requests plus
 1 search on the first check plus 1 `get_album` per missing release, at least 1 s between source calls; the source's
-first refusal (HTTP 429/403) ends the phase without a retry. A YouTube sign-in challenge ends the whole run with
-exit 3 as for any download and is never bypassed. With no stored ranking the phase does nothing and logs one line.
+first refusal (HTTP 429/403) ends the phase without a retry. A YouTube sign-in challenge during a DOWNLOAD ends the
+whole run with exit 3 as for any playlist track and is never bypassed; a bot-check text in the detector's own source
+calls (search, get_artist, get_artist_albums, get_album) is classed as a refusal: it ends the phase with exit 1 (class
+`partial`), not exit 3. An unexpected exception in the phase is logged by class only, ends the phase and gives exit 1.
+With no stored ranking the phase does nothing and logs one line (there is no fallback to the artists in D1).
+
+Known limitation (#238, blocks enabling the phase in the committed `sources.yml` and #175): a release of which only
+some tracks landed (cut by a cap, a failed track, an interruption) has its album in D1 afterwards, so the next check no
+longer sees it as missing and the remaining tracks are not retried. A cut artist is kept due, which only helps releases
+that were not started.
 
 Check state lives in `new-releases-state.json` next to `ingest-state.json` (hashed artist keys, dates, release keys).
 A failed artist check, a failed track or an unreadable state file is a failure of the phase (exit 1, class `partial`),
