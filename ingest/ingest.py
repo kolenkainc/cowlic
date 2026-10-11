@@ -28,10 +28,12 @@ import os
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -638,6 +640,92 @@ def spotdl_run(args: list[str], cwd: Path) -> tuple[list[str], str]:
     return cause_lines(lines), tail
 
 
+# ---- direct yt-dlp download for songs without a Spotify URL (Last.fm, #240) ----
+# spotdl's "<youtube url>|<spotify url>" form needs a real open.spotify.com track URL; a url-less song would make it
+# fetch metadata for a fake id and fail. Such songs skip spotdl: yt-dlp downloads the matched video and WE write the
+# ID3 tags. Same bot-check rules as everywhere (#62): no cookies, proxies, PO tokens or client rotation; yt-dlp runs
+# with --ignore-config so no config file of the user's can add any of them.
+YTDLP_CMD = [sys.executable, "-m", "yt_dlp"]  # tests replace this with a fake
+YTDLP_TIMEOUT_S = 600  # one download; a hung yt-dlp is killed and the track fails
+YTDLP_AUDIO_FILE = "audio"  # output name stem inside the track's temp dir
+VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
+TAG_TEXT_MAX = 300
+TAG_NUMBER_MAX = 9999
+
+
+def ytdlp_args(video_id: str, tdir: Path) -> list[str]:
+    if not VIDEO_ID.fullmatch(video_id or ""):
+        raise IngestError("invalid YouTube video id")
+    return ["--ignore-config", "--no-playlist", "--no-progress", "--format", "bestaudio/best", "--extract-audio",
+            "--audio-format", "mp3", "--audio-quality", BITRATE, "--output", str(tdir / f"{YTDLP_AUDIO_FILE}.%(ext)s"),
+            "--", f"https://music.youtube.com/watch?v={video_id}"]
+
+
+def ytdlp_run(video_id: str, tdir: Path) -> tuple[list[str], str]:
+    """Runs yt-dlp for one video; returns (cause lines, redacted tail <= TAIL_LINES) like spotdl_run. Unlike spotdl,
+    yt-dlp exits non-zero when the download failed. The sign-in challenge raises YouTubeSignInRequired."""
+    cmd = [*YTDLP_CMD, *ytdlp_args(video_id, tdir)]
+    env = {k: v for k, v in os.environ.items() if k not in tg_check.ENV_FROM_FILE and k not in SPOTDL_HIDDEN_ENV}
+    # own process group: a hung yt-dlp is killed together with the ffmpeg it started
+    proc = subprocess.Popen(cmd, cwd=tdir.parent, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+                            start_new_session=True)
+    try:
+        stdout, stderr = proc.communicate(timeout=YTDLP_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.communicate()
+        raise IngestError(f"yt-dlp timed out after {YTDLP_TIMEOUT_S} s") from None
+    lines = clean_lines(stdout + "\n" + stderr, [])
+    tail = "\n".join(lines[-TAIL_LINES:])
+    causes = [*cause_lines(lines), *[ln for ln in lines if ln.startswith("ERROR:")][-MAX_CAUSES:]]
+    causes = list(dict.fromkeys(causes))[-MAX_CAUSES:]
+    failed = proc.returncode != 0 or not any(tdir.glob("*.mp3"))  # a bot-check WARNING beside a good mp3 is no stop
+    if failed and is_sign_in_challenge(lines):
+        raise YouTubeSignInRequired("YouTube asks to sign in (bot check)")
+    if proc.returncode != 0:
+        raise IngestError(f"yt-dlp failed with exit code {proc.returncode}"
+                          + (f"; yt-dlp error: {' | '.join(causes)}" if causes else "")
+                          + (f"; yt-dlp output (last lines):\n{tail}" if tail else ""))
+    return causes, tail
+
+
+def tag_text(value) -> str | None:
+    """A tag value from ingest data: printable text only (control and format characters dropped, whitespace
+    collapsed), at most TAG_TEXT_MAX characters; None when nothing is left."""
+    if not isinstance(value, str):
+        return None
+    text = " ".join("".join(c for c in value if unicodedata.category(c) not in ("Cc", "Cf", "Cs", "Co", "Cn")).split())
+    return text[:TAG_TEXT_MAX] or None
+
+
+def tag_number(value) -> str | None:
+    return str(value) if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= TAG_NUMBER_MAX else None
+
+
+def write_id3_tags(path: Path, song: dict) -> None:
+    """ID3v2.3 tags the way spotdl writes them for playlist tracks (title, artists, album, album artist, track, disc,
+    year); mutagen (a dependency of spotdl, already installed) writes the file directly: no shell, no ffmpeg
+    arguments. Replaces whatever tags yt-dlp/ffmpeg left in the file (the YouTube video title, for one)."""
+    try:
+        from mutagen.id3 import ID3, TALB, TIT2, TPE1, TPE2, TPOS, TRCK, TYER
+        from mutagen import MutagenError
+    except ImportError:  # not caught per track by run(): fail this track, not the session
+        raise IngestError("the mutagen package is not installed (ImportError)") from None
+    artists = [a for a in (tag_text(x) for x in song.get("artists") or []) if a]
+    year = tag_number(song.get("year"))
+    frames = [(TIT2, tag_text(song.get("name"))), (TPE1, artists or None), (TALB, tag_text(song.get("album_name"))),
+              (TPE2, tag_text(song.get("album_artist"))), (TRCK, tag_number(song.get("track_number"))),
+              (TPOS, tag_number(song.get("disc_number"))), (TYER, year)]
+    tags = ID3()
+    for frame, value in frames:
+        if value:
+            tags.add(frame(encoding=3, text=value))
+    try:
+        tags.save(str(path), v2_version=3)
+    except (MutagenError, OSError) as e:
+        raise IngestError(f"could not write the ID3 tags ({type(e).__name__})") from e
+
+
 def js_runtime_problem() -> str | None:
     """Why yt-dlp cannot use Deno (its default JavaScript runtime for YouTube), or None when it looks usable.
     spotdl's own warning cannot be used for this: it is printed for every failed download."""
@@ -773,6 +861,15 @@ def real_deps(ytm, throttle: "Throttle | None" = None) -> Deps:
         return find_match(ytm, song["name"], primary_artist(song), song.get("album_name"), int(d) if d else None)
 
     def download(song, m, tdir):
+        if not song.get("url"):  # no Spotify URL (Last.fm, #240): spotdl cannot take it, yt-dlp does
+            causes, tail = ytdlp_run(m.video_id, tdir)
+            files = list(tdir.glob("*.mp3"))
+            if len(files) != 1:
+                raise IngestError("expected exactly one mp3 after download"
+                                  + (f"; yt-dlp error: {' | '.join(causes)}" if causes else "")
+                                  + (f"; yt-dlp output (last lines):\n{tail}" if tail else ""))
+            write_id3_tags(files[0], song)
+            return files[0]
         causes, tail = spotdl_run(["download", f"https://music.youtube.com/watch?v={m.video_id}|{song['url']}",
                            "--output", str(tdir / "{track-id}.{output-ext}"), "--format", "mp3", "--bitrate", BITRATE,
                             *SPOTDL_DOWNLOAD_ARGS],

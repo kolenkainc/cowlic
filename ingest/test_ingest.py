@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -566,6 +567,252 @@ class RunPlaylistsTest(unittest.TestCase):
         for argv in ([], [GOOD_URL, "--sources", "x.yml"]):
             with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 self.run_main(argv)
+
+
+# ---- songs without a Spotify URL (Last.fm, #240): yt-dlp directly, never spotdl ----
+
+# Fake yt-dlp: argv as the real one; behaviour from FAKE_MODE; records its argv and env in FAKE_RECORD.
+FAKE_YTDLP = r"""
+import json, os, sys
+a = sys.argv[1:]
+rec = {"argv": a, "env": {k: v for k, v in os.environ.items() if k in ("TG_BOT_TOKEN", "SPOTIFY_CLIENT_SECRET")}}
+open(os.environ["FAKE_RECORD"], "a").write(json.dumps(rec) + "\n")
+mode = os.environ["FAKE_MODE"]
+out = a[a.index("--output") + 1].replace("%(ext)s", "mp3")
+if mode == "ok":
+    open(out, "wb").write(b"\xff\xfb\x90\x00" * 100)
+elif mode == "ok_tagged":  # what ffmpeg leaves behind: the YouTube video title as a tag
+    from mutagen.id3 import ID3, TIT2
+    open(out, "wb").write(b"\xff\xfb\x90\x00" * 100)
+    t = ID3(); t.add(TIT2(encoding=3, text="Some Video (Official)")); t.save(out, v2_version=3)
+elif mode == "ok_tsse":  # a frame we never write: it must be gone afterwards
+    from mutagen.id3 import ID3, TSSE
+    open(out, "wb").write(b"\xff\xfb\x90\x00" * 100)
+    t = ID3(); t.add(TSSE(encoding=3, text="Lavf-test")); t.save(out, v2_version=3)
+elif mode == "warn_ok":  # bot-check text as a warning, yet a good mp3 and exit 0
+    print("WARNING: [youtube] abcdefghijk: Sign in to confirm you're not a bot. Some formats are missing", file=sys.stderr)
+    open(out, "wb").write(b"\xff\xfb\x90\x00" * 100)
+elif mode == "hang":
+    import subprocess, time
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    open(os.environ["FAKE_PIDS"], "w").write(f"{os.getpid()} {child.pid}")
+    time.sleep(60)
+elif mode == "big":
+    open(out, "wb").write(b"\0" * 2048)
+elif mode == "two":
+    open(out, "wb").write(b"\0" * 10); open(out.replace("audio", "other"), "wb").write(b"\0" * 10)
+elif mode == "block":
+    print("ERROR: [youtube] abcdefghijk: Sign in to confirm you’re not a bot. Use --cookies-from-browser", file=sys.stderr)
+    sys.exit(1)
+elif mode == "unavailable":
+    print("ERROR: [youtube] abcdefghijk: Video unavailable. This video is private", file=sys.stderr)
+    sys.exit(1)
+sys.exit(0)
+"""
+# a spotdl that must never run for a url-less song: it leaves a marker and fails
+FAKE_SPOTDL_FORBIDDEN = """
+import os, sys
+open(os.environ["FAKE_SPOTDL_MARKER"], "w").write("spotdl was called")
+sys.exit(1)
+"""
+VID = "abcdefghijk"
+LASTFM_SONG = {"song_id": "lfm:0123456789abcdef", "name": "Title é ‮\x00x", "artists": ["Art", "Guest"],
+               "album_artist": "Art", "album_name": "Alb", "year": None, "track_number": 7, "disc_number": 1,
+               "duration": 200, "url": None, "cover_url": None, "album_type": None, "release_date": None,
+               "explicit": None}
+
+
+class UrllessDownloadTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.work = Path(tmp.name)
+        (self.work / "ytdlp.py").write_text(FAKE_YTDLP)
+        (self.work / "spotdl.py").write_text(FAKE_SPOTDL_FORBIDDEN)
+        self.record, self.marker = self.work / "record.jsonl", self.work / "spotdl-called"
+        for p in (mock.patch.object(ingest, "YTDLP_CMD", [sys.executable, str(self.work / "ytdlp.py")]),
+                  mock.patch.object(ingest, "SPOTDL_CMD", [sys.executable, str(self.work / "spotdl.py")]),
+                  mock.patch.dict(os.environ, {"SPOTIFY_CLIENT_ID": CID, "SPOTIFY_CLIENT_SECRET": SECRET,
+                                               "FAKE_MODE": "ok", "FAKE_RECORD": str(self.record),
+                                               "FAKE_SPOTDL_MARKER": str(self.marker)})):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def download(self, mode="ok", s=LASTFM_SONG, vid=VID):
+        os.environ["FAKE_MODE"] = mode
+        tdir = self.work / "t"
+        tdir.mkdir(exist_ok=True)
+        return ingest.real_deps(None).download(s, SimpleNamespace(video_id=vid), tdir)
+
+    def deps_for(self, **kw):
+        real = ingest.real_deps(None, kw.pop("throttle", None))
+        parts = dict(find=lambda s: SimpleNamespace(video_id=VID), audio=None, cover=None, d1=None, delete=None)
+        parts.update(kw)
+        return ingest.Deps(parts["find"], real.download, parts["audio"], parts["cover"], parts["d1"], parts["delete"])
+
+    def test_spotdl_is_never_called_for_a_urlless_song(self):
+        self.download()
+        self.assertFalse(self.marker.exists(), "a url-less song reached spotdl")
+
+    def test_a_song_with_a_url_still_goes_through_spotdl(self):
+        os.environ["FAKE_MODE"] = "ok"
+        with self.assertRaises(ingest.IngestError):  # the forbidden fake spotdl fails
+            ingest.real_deps(None).download(dict(LASTFM_SONG, url="https://open.spotify.com/track/" + "a" * 22),
+                                            SimpleNamespace(video_id=VID), self.work)
+        self.assertTrue(self.marker.exists())
+        self.assertFalse(self.record.exists())
+
+    def test_empty_string_url_is_urlless_too(self):
+        self.download(s=dict(LASTFM_SONG, url=""))
+        self.assertFalse(self.marker.exists())
+
+    def test_ytdlp_arguments(self):
+        self.download()
+        argv = json.loads(self.record.read_text())["argv"]
+        self.assertEqual(argv[-2:], ["--", f"https://music.youtube.com/watch?v={VID}"])
+        self.assertEqual(argv[argv.index("--format") + 1], "bestaudio/best")
+        self.assertEqual(argv[argv.index("--audio-format") + 1], "mp3")
+        self.assertEqual(argv[argv.index("--audio-quality") + 1], ingest.BITRATE)
+        self.assertIn("--extract-audio", argv)
+        self.assertIn("--ignore-config", argv)  # no user config can add cookies or proxies
+        self.assertIn("--no-playlist", argv)
+        for banned in ("cookie", "proxy", "po_token", "extractor-args", "player_client"):
+            self.assertFalse(any(banned in x.lower() for x in argv), banned)
+
+    def test_spotify_credentials_do_not_reach_ytdlp(self):
+        self.download()
+        self.assertEqual(json.loads(self.record.read_text())["env"], {})  # TG_BOT_TOKEN unset here; secret filtered
+
+    def test_bad_video_id_is_refused_before_running_anything(self):
+        bad = ("--exec", "a b", "x;y", "", "short", "abcdefghi;k", "abcdefghi k", "abcdefghijk\n", "abcdefgh$()", "abcdefghij\u00e9",
+               "abcdefghij", "abcdefghijkl", "abcdefghijk;id")
+        for vid in bad:
+            with self.subTest(vid):
+                with self.assertRaises(ingest.IngestError):
+                    self.download(vid=vid)
+        self.assertFalse(self.record.exists())
+
+    def test_leading_dash_video_id_is_valid_and_sits_after_the_separator(self):
+        self.download(vid="-abcdefghij")
+        argv = json.loads(self.record.read_text())["argv"]
+        self.assertEqual(argv[-2:], ["--", "https://music.youtube.com/watch?v=-abcdefghij"])
+
+    def test_missing_mutagen_fails_the_track_not_the_session(self):
+        with mock.patch.dict(sys.modules, {"mutagen": None, "mutagen.id3": None}):
+            with self.assertRaisesRegex(ingest.IngestError, "mutagen"):
+                self.download()
+            with contextlib.redirect_stdout(io.StringIO()):
+                counts = ingest.run([LASTFM_SONG], self.deps_for(), set(), {}, self.work, False)
+        self.assertEqual(counts["failed"], 1)
+
+    def test_bot_check_warning_with_a_good_mp3_is_not_a_stop(self):
+        self.assertTrue(self.download("warn_ok").exists())
+
+    def test_leftover_frames_we_do_not_write_are_removed(self):
+        from mutagen.id3 import ID3
+        self.assertNotIn("TSSE", ID3(str(self.download("ok_tsse"))))
+
+    def test_a_hung_ytdlp_is_killed_with_its_children(self):
+        pids = self.work / "pids"
+        os.environ["FAKE_PIDS"] = str(pids)
+        with mock.patch.object(ingest, "YTDLP_TIMEOUT_S", 2):
+            with self.assertRaisesRegex(ingest.IngestError, "timed out after 2 s"):
+                self.download("hang")
+        for pid in map(int, pids.read_text().split()):
+            for _ in range(50):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.1)
+            else:
+                self.fail(f"process {pid} still alive")
+
+    def test_tags_are_written_and_replace_the_video_tags(self):
+        from mutagen.id3 import ID3
+        t = ID3(str(self.download("ok_tagged")))
+        self.assertEqual(t.version, (2, 3, 0))
+        self.assertEqual(t["TIT2"].text, ["Title é x"])  # control and bidi characters dropped
+        self.assertEqual(t["TPE1"].text, ["Art/Guest"])  # v2.3 joins multiple artists with "/", as spotdl does
+        self.assertEqual(t["TALB"].text, ["Alb"])
+        self.assertEqual(t["TPE2"].text, ["Art"])
+        self.assertEqual(t["TRCK"].text, ["7"])
+        self.assertEqual(t["TPOS"].text, ["1"])
+        self.assertNotIn("TDRC", t)  # year unknown: no frame (mutagen reads a v2.3 TYER as TDRC)
+        self.assertNotIn("Official", t.pprint())
+
+    def test_unknown_album_and_track_write_no_empty_frames(self):
+        from mutagen.id3 import ID3
+        t = ID3(str(self.download(s=dict(LASTFM_SONG, album_name=None, track_number=None, year=2019))))
+        self.assertNotIn("TALB", t)
+        self.assertNotIn("TRCK", t)
+        self.assertEqual(str(t["TDRC"].text[0]), "2019")
+
+    def test_tag_values_are_bounded(self):
+        self.assertEqual(len(ingest.tag_text("a" * 5000)), ingest.TAG_TEXT_MAX)
+        self.assertIsNone(ingest.tag_text("\x00​  "))
+        self.assertIsNone(ingest.tag_text(5))
+        self.assertIsNone(ingest.tag_number(0))
+        self.assertIsNone(ingest.tag_number(True))
+        self.assertIsNone(ingest.tag_number(ingest.TAG_NUMBER_MAX + 1))
+        self.assertEqual(ingest.tag_number(12), "12")
+
+    def test_sign_in_challenge_ends_the_run_with_exit_3_and_no_retry(self):
+        os.environ["FAKE_MODE"] = "block"
+        searched = []
+
+        def find(s):
+            searched.append(s["song_id"])
+            return SimpleNamespace(video_id=VID)
+
+        songs = [dict(LASTFM_SONG, song_id=f"lfm:{i:016x}") for i in (1, 2)]
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(ingest.YouTubeSignInRequired):
+                ingest.run(songs, self.deps_for(find=find), set(), {}, self.work, False)
+        self.assertEqual(len(searched), 1)  # the second track is never tried
+        self.assertEqual(len(self.record.read_text().splitlines()), 1)  # no retry
+        self.assertFalse(self.marker.exists())
+        self.assertEqual(ingest.EXIT_YOUTUBE_SIGN_IN, 3)
+
+    def test_sign_in_challenge_through_the_throttle_is_not_retried(self):
+        os.environ["FAKE_MODE"] = "block"
+        deps = self.deps_for(throttle=ingest.Throttle(0, 0, 3))
+        with mock.patch.object(ingest.time, "sleep"), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(ingest.YouTubeSignInRequired):
+                ingest.run([LASTFM_SONG], deps, set(), {}, self.work, False)
+        self.assertEqual(len(self.record.read_text().splitlines()), 1)
+
+    def test_other_ytdlp_failure_is_a_track_failure_with_the_cause(self):
+        os.environ["FAKE_MODE"] = "unavailable"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            counts = ingest.run([LASTFM_SONG], self.deps_for(), set(), {}, self.work, False)
+        self.assertEqual(counts["failed"], 1)
+        self.assertIn("Video unavailable", out.getvalue())
+
+    def test_exit_zero_with_two_files_fails(self):
+        with self.assertRaisesRegex(ingest.IngestError, "expected exactly one mp3"):
+            self.download("two")
+
+    def test_too_big_goes_through_the_same_check_and_is_not_uploaded(self):
+        os.environ["FAKE_MODE"] = "big"
+        uploaded = []
+        deps = self.deps_for(audio=lambda s, p: uploaded.append(s))
+        with mock.patch.object(ingest, "MAX_BYTES", 1024), contextlib.redirect_stdout(io.StringIO()):
+            counts = ingest.run([LASTFM_SONG], deps, set(), {}, self.work, False)
+        self.assertEqual((counts["too_big"], counts["new"], counts["failed"]), (1, 0, 0))
+        self.assertEqual(uploaded, [])
+
+    def test_a_good_download_is_uploaded_and_stored(self):
+        os.environ["FAKE_MODE"] = "ok"
+        batches = []
+        deps = self.deps_for(audio=lambda s, p: {"message_id": 1, "audio": {"file_id": "f"}}, d1=batches.append)
+        existing = set()
+        with contextlib.redirect_stdout(io.StringIO()):
+            counts = ingest.run([LASTFM_SONG], deps, existing, {}, self.work, False)
+        self.assertEqual(counts["new"], 1)
+        self.assertEqual(len(batches), 1)
+        self.assertIn(LASTFM_SONG["song_id"], existing)
 
 
 class YouTubeSignInTest(FakeSpotdlCase):

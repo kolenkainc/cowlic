@@ -251,8 +251,9 @@ The end state is the `status` line `done: N artists, M tracks` (with `, K parked
 1. Read the second line and the parked count; decide parked artists (`--unpark` or `exclude`) and accept the empty
    artists as a known gap (a spelling gap is not fixed by `exclude`).
 2. No more sessions are needed. The nightly 21:10 run takes over: it stays lean (unit caps, no ranking, no backfill,
-   section 8). The planned nightly new-release check (#172, not merged when this page was written) runs EVERY night
-   after the playlists, bounded by its own caps, and reads only the stored ranking file; nobody starts it by hand.
+   section 8). The nightly new-release check (#172, merged) runs EVERY night after the playlists, bounded by its own
+   caps, and reads only the stored ranking file; nobody starts it by hand. It is OFF in the committed `sources.yml`
+   (no `new_releases:` section) and stays off until #238 (a partly landed release is not retried) is fixed.
 3. Do NOT run `rank --refresh` as part of "finishing"; it replaces the ranking and makes new artists `pending`. Do it
    only on purpose, with the same steps again (`status`, `plan`, a small `run`).
 
@@ -315,6 +316,11 @@ anything by hand, the match quality from the code is acceptable to me"). So:
   accepted storing it locally once, recomputed only with `--refresh` (#165 question 3, answered on 2026-10-11, "default
   options are ok"). The wording of the Last.fm caching clause itself is still [R], not independently confirmed.
 - **YouTube:** the bot check is never bypassed (#62). Pacing is the engine default (5 s plus 0..5 s between downloads).
+- **Last.fm songs are downloaded by yt-dlp directly (#240).** They have no Spotify URL, which spotdl's download needs,
+  so the engine skips spotdl for them: yt-dlp fetches the matched video as mp3 at 256k (no cookies, no config file) and
+  the engine writes the ID3 tags itself (title, artists, album, album artist, track, disc). Playlist and followed-artist
+  songs still go through spotdl, unchanged. Sign-in stop, `too_big` and upload behave the same for both. The first real
+  bootstrap session of #176 is the verification of this path on real Last.fm songs.
 - **Telegram:** `getFile` limit 20 MB, so a track over about 10 minutes at 256k is `too_big` and skipped.
 - **Not run by the author:** every step of sections 2 to 7 except the offline commands listed in section 0. Real call
   counts, run times and track counts per artist are unmeasured; the first sessions give them.
