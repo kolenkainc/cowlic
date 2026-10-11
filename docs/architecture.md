@@ -101,9 +101,9 @@ Worker только передаёт поток и не буферизует е�
 
 ## 4. Конфигурация и секреты
 
-Planned (design, not yet implemented): the Worker deploy and D1 migrations will run from GitHub Actions with a scoped Cloudflare token kept as a GitHub environment secret, see [worker-cicd.md](worker-cicd.md). The statements below about GitHub and secrets stay true for ingest; the final wording is updated by #203.
+The Worker deploy and D1 migrations run from GitHub Actions on a merge to master (`.github/workflows/worker-deploy.yml`), with the owner's Cloudflare token kept as a GitHub ENVIRONMENT secret (environments `production` and `production-destructive`; never repository or organisation secrets), see [worker-cicd.md](worker-cicd.md) and [worker-deploy-runbook.md](worker-deploy-runbook.md). Migration 0002 was applied by hand (#122); that was the last manual migration exception, the manual path stays only as the documented fallback. The statements below about GitHub and secrets are about ingest and the Worker's own secrets.
 
-Single-source rule: every secret and config value is edited only in the local gitignored `.env` (template: `.env.example`) on the owner's machine. Ingest reads it directly. The three Worker secrets (`TG_BOT_TOKEN`, `SUBSONIC_USER`, `SUBSONIC_PASSWORD`) are set once by hand with `wrangler secret put` (see below); there is no sync script. GitHub is not used for secrets any more: the ingest workflow and its `ingest` environment are gone. Never edit values in the Cloudflare UI.
+Single-source rule: every secret and config value is edited only in the local gitignored `.env` (template: `.env.example`) on the owner's machine. Ingest reads it directly. The three Worker secrets (`TG_BOT_TOKEN`, `SUBSONIC_USER`, `SUBSONIC_PASSWORD`) are set once by hand with `wrangler secret put` (see below); there is no sync script. GitHub holds no ingest secrets and no Worker secrets: the ingest workflow and its `ingest` environment are gone; the only GitHub secrets are the environment secrets of the Worker deploy (`CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `D1_DATABASE_ID`, `WORKER_URL`). Never edit values in the Cloudflare UI.
 
 | `.env` key | Where it lives | Purpose |
 |---|---|---|
@@ -114,7 +114,7 @@ Single-source rule: every secret and config value is edited only in the local gi
 | `INGEST_CLOUDFLARE_API_TOKEN` | local `.env` | Narrow token (D1:Edit only) for ingest writing to D1 over the REST API. The only Cloudflare token ingest reads: no fallback to `CLOUDFLARE_API_TOKEN`; if it is missing the run stops with an error naming this key. |
 | `CLOUDFLARE_ACCOUNT_ID`, `D1_DATABASE_ID` | local `.env` | D1 REST API addressing |
 | `SUBSONIC_USER`, `SUBSONIC_PASSWORD` | local `.env`, Worker secrets | Client login |
-| `CLOUDFLARE_API_TOKEN` (optional) | local `.env` only | Broad personal token for local wrangler/deploy/ad-hoc work only. Ingest never reads it and hides it from the spotdl subprocess. |
+| `CLOUDFLARE_API_TOKEN` (optional) | local `.env`, and the GitHub environment secrets `production` and `production-destructive` | Broad personal token for local wrangler/ad-hoc work and the Worker deploy workflow. Ingest never reads it and hides it from the spotdl subprocess. Rotate it in all places, see worker-cicd.md section 3 rule 10. |
 
 The ingest values are not copied anywhere. The GitHub environment secrets of the former workflow (`TG_BOT_TOKEN`, `TG_CHANNEL_ID`, `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `D1_DATABASE_ID` in the environment `ingest`) are unnecessary and can be removed by the owner together with the environment (ticket #75).
 
