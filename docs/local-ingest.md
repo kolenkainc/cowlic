@@ -505,7 +505,8 @@ ingest/.venv/bin/python ingest/match_report.py <artist id or URL> [<artist id or
   result YouTube Music returned and `reason` is `title` (no result with title similarity >= 0.85), `duration` (the
   title fit but the duration was more than 3 s off) or `no_results`); `uncomparable` (no usable title or duration,
   not searched); `error` (the search failed after retries). `pattern` tags every `no_match` row (below);
-  `reviewed` is empty: you fill it with `ok` or `wrong` for the matched rows you check.
+  `reviewed` is empty: optional, you may fill it with `ok` or `wrong` for the matched rows you check (labelling is
+  optional tooling, not a gate; the owner chose not to label, see "How to read it").
 - Failing patterns, one primary pattern per `no_match` row so the counts add up, first rule that fits wins, taken
   from the Spotify title: `remaster` (remaster, deluxe, anniversary, expanded, reissue, bonus track), `live` (live,
   acoustic, session, unplugged), `remix` (remix, rmx, edit, mix), `non-latin` (any letter outside the Latin script:
@@ -520,20 +521,24 @@ ingest/.venv/bin/python ingest/match_report.py <artist id or URL> [<artist id or
 
 ### How to read it
 
-The gate is the one from assessment #92: **matched >= 80% AND wrong <= 2%**. Match rate = `matched / (matched +
+The gate of assessment #92 reads **matched >= 80% AND wrong <= 2%**. Only the matched half is measured by code; the
+wrong half needs labels, which are optional tooling, not a gate: the owner decided on 2026-10-11 (#214) not to label,
+so the wrong-recording rate is an accepted, unmeasured risk (mitigations and how to reverse it:
+[bootstrap.md](bootstrap.md), "Accepted risk"). Match rate = `matched / (matched +
 no_match)` on the sample (`uncomparable` and `error` are left out; look at them separately, many of either means
 the sample or the connection is bad). The script prints one of three verdicts:
 
 | Verdict | Meaning |
 |---|---|
-| `matched rate >= 80%: go IF the owner's spot-check of matched rows finds <= 2% wrong` | Half the gate. Do the spot-check below; only if it holds, start the capped first run (#113) |
+| `matched rate >= 80%: go IF the owner's spot-check of matched rows finds <= 2% wrong` | Half the gate. The spot-check below is optional tooling, not a blocker (the owner chose not to label, #214); if someone does it and it finds more than 2% wrong, that is a finding to decide on |
 | `matched rate < 80%: no-go for now (tune the matcher; see the top failing patterns)` | Tune the matcher for the most frequent failing pattern, re-run the report on the same artists, compare |
 | `no verdict` | Nothing was compared (all `uncomparable` or `error`) |
 
 The wrong-match rate cannot be computed automatically (the script cannot know that a matched video is the wrong
-recording). It comes from the owner: label a random sample of `matched` rows `ok` or `wrong` in the `reviewed`
+recording). It can only come from a human, and only if someone chooses to measure it (optional; the owner chose not
+to): label a random sample of `matched` rows `ok` or `wrong` in the `reviewed`
 column (open the matched video on https://music.youtube.com; a live or cover version that slipped through is
-`wrong`; at least 50 rows is a sensible sample), wrong rate = wrong / checked, must be <= 2%. You can pass the counts
+`wrong`; at least 50 rows is a sensible sample), wrong rate = wrong / checked, should be <= 2%. You can pass the counts
 back (`--wrong N --checked M` on a re-run; it only prints the rate against the limit, it does not change the
 verdict line). A sample under 30 compared tracks only gives a hint (the summary says so). Read the per-artist lines
 too: one artist at 20% in an otherwise good sample (say, a non-Latin name) is a finding even when the overall rate
@@ -544,7 +549,7 @@ and sort by `similarity` ascending (the stdout list is the same view). For a han
 https://music.youtube.com whether a correct video exists. `reason = duration` with a right-looking video means the
 tolerance is too tight or the Spotify release is a different edit; `reason = title` with a right-looking video means
 the title normalisation misses something (remaster or live suffixes, transliteration); `no_results` means search,
-not scoring, is the problem. Do the `matched` spot-check above. Then write the match rate, the wrong rate, the
+not scoring, is the problem. The `matched` spot-check above is optional. Then write the match rate, the wrong rate, the
 decision and the top failing patterns in #112. Do not commit the CSV.
 
 ## Exit codes
@@ -712,8 +717,9 @@ Before any Last.fm track is downloaded (umbrella #102, ticket #153) measure how 
 (#92: matched >= 80% AND wrong <= 2%). It makes read-only Last.fm calls and YouTube Music searches only: no
 download, no upload, no Telegram, no D1 write, no cookies, no Spotify. It is NOT part of the 21:10 run and does not
 touch `sources.yml`: the nightly timer must not use the `lastfm_artists` section (see the next section); the bootstrap
-that does the real first run comes in Release 3 (#163), and this report is the go / no-go gate before its first
-session. The owner runs it by hand; the first run is the owner's (#154).
+that does the real first run comes in Release 3 (#163), and this report was the go / no-go input before its first
+session (#154 closed as GO on the matched rate, 2026-10-11). Its labelling step is optional tooling, not a gate: the
+owner decided not to label (#214), see the runbook [bootstrap.md](bootstrap.md).
 
 Setup: `LASTFM_API_KEY=<key>` in the local `.env` (name only here; never in a command line, a log or the CSV). The
 Last.fm profile must be public (listening data private gives error 17, a clear message, no CSV). The user name is
@@ -723,7 +729,7 @@ given on the command line and is not printed.
 ingest/.venv/bin/python ingest/lastfm_report.py --lastfm-user <name> \
     [--years 5] [--artists 100] [--sample-artists 10] [--max-tracks 150] [--max-minutes 45] \
     [--min-interval 1.0] [--check-stored] [--out match-report-lastfm-NAME.csv]
-ingest/.venv/bin/python ingest/lastfm_report.py --summarize match-report-lastfm-NAME.csv   # offline, after labelling
+ingest/.venv/bin/python ingest/lastfm_report.py --summarize match-report-lastfm-NAME.csv   # offline, optional, after labelling
 ```
 
 What a run does, in order:
@@ -787,7 +793,9 @@ on a sample the gate can be judged on. Otherwise it reads `no verdict: <reasons>
 these holds: fewer than 30 compared tracks (`matched + no_match`); more than 10% of the searches failed; the run
 stopped early (sign-in challenge, search or time budget, 3 failures in a row, interrupted; `--summarize` reads this from
 the CSV); or a mode with matched rows has fewer than min(30, its matched rows) rows labelled `ok`/`wrong`. When none of
-them holds: matched < 80% is `no-go`, a wrong rate above 2% overall or in a mode is `no-go`, else `go`.
+them holds: matched < 80% is `no-go`, a wrong rate above 2% overall or in a mode is `no-go`, else `go`. The tool prints
+`no verdict` for a CSV without labels; that is how the tool works and not a blocker for bootstrap, because labelling
+is optional tooling and not a gate (the owner chose not to label, #214).
 
 The rest of the summary on stdout gives: artists ranked and sampled; tracks listed and unique; the share WITH and WITHOUT a
 Last.fm duration (how often Last.fm gives none, overall and in the sample); Last.fm calls and YouTube searches
@@ -798,7 +806,7 @@ title-only matches with the lowest title similarity; the 15 lowest-similarity fa
 Exit code 0 normally, 2 if the run stopped early or an artist failed (the CSV is still written), 1 for invalid input
 or a missing or malformed key.
 
-How to label and read it:
+How to label and read it (optional tooling, not a gate; the `--summarize` command still works if someone labels):
 
 1. Open the CSV. In the `reviewed` column write `ok` or `wrong` for matched rows: open the matched video on
    https://music.youtube.com (a live, remix or cover version, or another artist's track with the same title, is
@@ -811,7 +819,7 @@ How to label and read it:
    few labels (under min(30, its matched rows)), a sample under 30 compared tracks, a partial run or many failed
    searches give `no verdict: ...` (see above), not a go. Rate below 80% with a good wrong rate means tuning the matcher by the most
    frequent failing pattern; a high wrong rate in the title-only mode means raising its thresholds or turning it off.
-3. Write the numbers and the decision in #154. Check also: how many tracks Last.fm gives no duration for (a high share
+3. Write the numbers and the decision in the ticket that asked for them (#154 is closed). Check also: how many tracks Last.fm gives no duration for (a high share
    means most matches are title-only), and the per-artist lines (one artist at 20% in an otherwise good sample is a
    finding).
 
@@ -861,7 +869,7 @@ the wrapper enforces it (#174, see "The cap and the 21:10 timer"): the `lastfm_a
 commented out in the nightly `sources.yml`, `enabled: false` is not enough. The bootstrap process (#163, #168) uses its
 own config, a separate local file outside the repo. Do not add the section to the nightly `sources.yml`
 to try it: measure first with the report above, and take the dry run and the first capped session from the bootstrap
-runbook when it exists (#170).
+runbook, [bootstrap.md](bootstrap.md) (#170).
 
 Ids and dedupe: Last.fm has no track ids, so a track gets `lfm:` + the first 16 hex digits of a SHA-256 of the
 normalised artist and title (the album is not part of it, so one title on two albums is one track). A track whose

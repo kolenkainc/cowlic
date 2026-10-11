@@ -31,7 +31,7 @@ yet. Function names below are those of master when this page was last updated; #
 | Term | Meaning |
 |---|---|
 | Ranking | The owner's top artists over a window (default 5 years), summed from weekly Last.fm charts: 1 call `user.getWeeklyChartList` plus one `user.getWeeklyArtistChart` per week, about 261 calls at 1 call/s, about 5 minutes [V, `ingest/lastfm.py` docstring and `MIN_INTERVAL = 1.0`] |
-| Bootstrap | A ONE-TIME, manual, resumable job that works through the stored ranking artist by artist and fills the library. Started by the owner, capped per session, ends with `done: N artists, M tracks` |
+| Bootstrap | A ONE-TIME, manual, resumable job that works through the stored ranking artist by artist and fills the library. Started by the coordinator or an agent through the wrapper (owner decision 2026-10-11, #165 question 7), capped per session, ends with `done: N artists, M tracks` |
 | Ongoing | The daily 21:10 run: the playlists exactly as today, then a bounded check for missing releases of artists already in the library |
 | Engine | The shared code path ranking -> tracks -> dedupe -> match -> download -> upload -> D1 (`run_lastfm` of #152 and the per-track pipeline `run` / `process_track` in `ingest/ingest.py` [V]) |
 | Session | One invocation of `bootstrap.py run` |
@@ -71,7 +71,7 @@ any change a ticket makes must be written back to this page.
 | `ingest/bootstrap.py` | #168 | The command, subcommands `rank`, `plan`, `run`, `status` |
 | `ingest/bootstrap_ranking.py` | #167 | `compute`, `save`, `load`, `order` of the stored ranking (new module, stdlib only) |
 | `scripts/run-bootstrap-local.sh` | #169 | The wrapper: shared lock, own log and status file |
-| `docs/bootstrap.md` | #170 | Owner runbook (commands, troubleshooting). This page is the design, that one is the how-to |
+| `docs/bootstrap.md` | #170 | Runbook for the coordinator and the owner (commands, troubleshooting). This page is the design, that one is the how-to |
 
 The engine changes needed first are #166 (see 2.6). The wrapper adds the log and the status file. The lock is
 NOT only the wrapper's job: `bootstrap.py run` (and `rank --refresh`, which writes the ranking) takes the same
@@ -552,8 +552,10 @@ default.
   itself too (2.1), so calling the Python entry point directly cannot overlap. So a bootstrap session started
   while the timer runs exits 75 at once, and a timer run that starts during a session exits 75 and does nothing
   that night. [V for the nightly side, [P] for the new wrapper and `bootstrap.py`]
-- **Session timing.** Because of that, bootstrap sessions are started in the evening after the 21:10 run
-  finished, with `--max-minutes` chosen so the session ends before the next 21:10 (proposed, #165-7). The timer
+- **Session timing.** Because of that, bootstrap sessions (started by the coordinator or an agent, not by the owner:
+  owner decision 2026-10-11, #165-7) start once the feature is merged and reviewed, but never while the 21:10 run
+  holds the lock, with `--max-minutes` chosen so the session ends before the next 21:10 (the wrapper refuses a
+  session that would cross it). The timer
   has `RandomizedDelaySec=60` and `Persistent=true` [V, `deploy/systemd/cowlic-ingest.timer`]. **This page does
   NOT promise a catch-up** for a night lost to the lock: whether systemd re-fires a run whose activation already
   happened and exited 75 is [R] and unverified (the reading is that `Persistent=true` covers elapses missed
@@ -585,7 +587,7 @@ default.
 | #152 / PR #162 (merged) | THE ENGINE for both processes: bootstrap calls it with the stored ranking and its own state (after #166); the nightly never enables the `lastfm_artists:` section. The merged docs section in `docs/local-ingest.md` that describes enabling the section for the timer is superseded by this page (#170 and #174 add the note and the guard) |
 | #153 report | Stays the match-rate gate before the first bootstrap session. Its runbook part about a first capped run through the nightly `sources.yml` is NOT written; #170 carries the dry run and first session steps through `bootstrap.py` (planner comment on #153) |
 | #154 go/no-go | Stays the gate; #176 is blocked by it |
-| #155 first capped run via the `sources.yml` section | Superseded by #176 (first bootstrap evening) if the owner agrees (#165-8); until then the section must not be enabled where the timer reads it |
+| #155 first capped run via the `sources.yml` section | Superseded by #176 (first bootstrap session; the owner agreed, #165-8); the section must never be enabled where the timer reads it |
 | #110 terms stance | Owner decision, not a technical prerequisite |
 | #163 (this page) | Contract for #166-#178 |
 | #164 | DONE (research and live probe): the source is YouTube Music `get_artist_albums(order="Recency")`, set difference by (artist, normalised title), no date watermark (4.3-4.4). Blocks #171, whose body (`since`, `watermark`, `lookback_days`) is now stale |
@@ -600,7 +602,7 @@ default.
 | #173 | Metrics and one dashboard panel |
 | #174 | Lean 21:10: unit caps, `TimeoutStartSec=1h`, wrapper guard |
 | #175 | Owner: install the lean unit, enable the check |
-| #176, #177 | Owner: first bootstrap evening, sessions until `done` |
+| #176, #177 | Coordinator/agents: first bootstrap session, sessions until `done` (owner decision 2026-10-11, #165-7; the owner may interrupt at any time) |
 | #178 | Owner: one week of nightly results |
 
 Order of work on `ingest/ingest.py`, never two agents at once: #152 -> #166 -> #168 -> #172. `docs/local-ingest.md`
@@ -609,11 +611,12 @@ is edited by #153, #170 (pointer) and #174: not together. Critical path: #152 ->
 
 ## 7. Open questions (one to one with #165)
 
-Answers are not recorded yet: #165 has no owner comment [V at the time of writing]. The defaults below are marked
-"proposed" everywhere on this page. When the owner answers, the planner updates this page with a small follow-up.
+Owner answers of 2026-10-11 (#165): the defaults below are accepted for all questions, except question 5 (the check
+runs EVERY night after the 21:10 playlists, bounded, #172) and question 7 (changed, see there). Entries not marked
+"Decided" still read as the original proposal.
 
 1. **Scale and per-artist limit.** Default: whole discography per artist as #149 enumerates it (bounded by 100
-   albums and 150 calls), ranked by artist, 100 artists; re-decide after the first evening (#176) when real counts
+   albums and 150 calls), ranked by artist, 100 artists; re-decide after the first bootstrap session (#176) when real counts
    exist [R: thousands of tracks at about a minute each, unmeasured]. Alternative: top K albums per artist.
 2. **Priority.** Default: 5-year playcount descending, ties by normalised name. Alternative: weight recent years
    more (how much).
@@ -629,9 +632,10 @@ Answers are not recorded yet: #165 has no owner comment [V at the time of writin
    (4.3, 4.5). (The unit's run-wide `--max-new 30 --max-minutes 30` in #174 is the outer bound.)
 6. **Config file.** Default: a local file outside the repo, under the owner's config directory, passed with
    `--config`. Alternative: commit it (not recommended: the Last.fm user name would be public).
-7. **Session timing against the shared lock.** Default: the owner starts sessions in the evening after the 21:10
-   run finished, with `--max-minutes` so they end before the next 21:10; a session started while the timer runs
-   exits 75.
+7. **Session timing against the shared lock.** Decided 2026-10-11 (#165, changed answer): the owner does NOT
+   start sessions; the coordinator or an agent starts them through the wrapper as soon as the feature is merged and
+   reviewed, with `--max-minutes` so they end before the next 21:10 (the wrapper refuses a session that would cross
+   it); a session started while the timer runs exits 75. The first session is small, after a `plan`.
 8. **#155 replaced by #176** so that the nightly timer never picks up the Last.fm section.
 
 ### Raised by #164, NOT in #165
