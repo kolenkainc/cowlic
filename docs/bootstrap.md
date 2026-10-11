@@ -83,6 +83,7 @@ Files bootstrap creates (names only; no contents are described or shown here) in
 | `bootstrap-state.json` | the engine (`run`) | Track cooldowns and scan dates; never the nightly `ingest-state.json` |
 | `bootstrap.log` | the wrapper | Output of every wrapper invocation that got past the lock, rotated by size (`.1` .. `.N`) |
 | `bootstrap-last-run.json` | the wrapper | Result of the last invocation (section 5) |
+| `cover-backfill.json` | `covers` | Cooldown of albums without a match or with a mismatch: album id (a hash), result word, date; no names (section 11) |
 | `ingest.lock` | wrapper and nightly | The ONE lock shared with the 21:10 timer |
 
 Bootstrap ships LOGS ONLY to Grafana Cloud Loki (#244), see section 5: no metrics, no Influx push, no
@@ -228,8 +229,9 @@ ticket. What bootstrap itself writes (status, summaries, the progress and result
 
 ### Grafana Loki (logs only)
 
-`run` and `plan` also ship the session log to your Grafana Cloud Loki, live, under the label `job="cowlic-bootstrap"`
-(`rank` and `status` ship nothing). Nothing else is sent: no `run_summary` line, no Influx push, no `cowlic_ingest_*`
+`run`, `plan` and `covers` (a real session, not `covers --count`) also ship the session log to your Grafana Cloud Loki, live,
+under the label `job="cowlic-bootstrap"` (`rank`, `status` and `covers --count` ship nothing; decision of #250: a covers
+session is shipped exactly like a run, the covers lines hold counts and class words only). Nothing else is sent: no `run_summary` line, no Influx push, no `cowlic_ingest_*`
 series, nothing from `bootstrap-last-run.json`.
 
 - **What is shipped (decision of #244).** The whole session log from the wrapper's `start:` line to its `finished:` line,
@@ -350,7 +352,7 @@ anything by hand, the match quality from the code is acceptable to me"). So:
 ## 10. Limits and terms
 
 - **Last.fm use:** non-commercial, personal use; names, playcounts, album and track names only; no artwork and no audio
-  from Last.fm (covers stay empty for Last.fm tracks); at most 1 call per second with bounded backoff. The clause
+  from Last.fm (no Last.fm artwork is used: covers of Last.fm tracks come from YouTube Music, section 11); at most 1 call per second with bounded backoff. The clause
   numbers (3.1, 5.1.8) are [R]: re-check them against https://www.last.fm/api/tos before relying on one.
 - **The stored ranking is a derived list** (artist names, playcounts, the computation date; no user name). The owner
   accepted storing it locally once, recomputed only with `--refresh` (#165 question 3, answered on 2026-10-11, "default
@@ -364,3 +366,93 @@ anything by hand, the match quality from the code is acceptable to me"). So:
 - **Telegram:** `getFile` limit 20 MB, so a track over about 10 minutes at 256k is `too_big` and skipped.
 - **Not run by the author:** every step of sections 2 to 7 except the offline commands listed in section 0. Real call
   counts, run times and track counts per artist are unmeasured; the first sessions give them.
+
+## 11. Backfill the covers of albums stored without one (`covers`, #250)
+
+Albums that were stored before album covers existed (#248) have `cover_file_id` empty. `covers` gives them one WITHOUT
+downloading audio. Design: [cover-art.md](cover-art.md) section 7. Artist photos are NOT part of it (#253).
+
+**When.** BETWEEN sessions, never during a bootstrap session: it takes the same lock as `run` and the 21:10 timer, so
+while one of them runs it exits 75 and does nothing (the reverse holds too: a covers session still running at 21:10 makes
+that night's timer run exit 75). It does not read or write the Last.fm ranking, the bootstrap progress file or any engine
+state; it needs no Last.fm key and no config file, only the Telegram and Cloudflare D1 variables of the ingest `.env`
+(`--count` needs only the D1 ones).
+
+**What one session does.** It reads from D1 the albums with `cover_file_id IS NULL` (an album named like the placeholder
+`Unknown Album` is never filled; an album without a track is not selected), in id order, one stored track per album, and for
+each one:
+
+1. runs the SAME matcher as ingest on that track (1 to 3 YouTube Music searches, paced and retried, below);
+2. applies the cover guard of #248: the matched result's album name must be the stored album (an edition word such as
+   deluxe or live, another volume or number, or a bare plural `s` is another release) and its artist must be the stored
+   artist (the Latin/Cyrillic-aware check); otherwise the album is skipped and counted, and stays empty;
+3. fetches the thumbnail through the hardened route of #248 (https, host allowlist, no redirects, `image/jpeg`, JPEG magic
+   bytes, 10 MB and a total time limit) and sends it as a Telegram photo (the same `sendPhoto` path of ingest);
+4. writes `UPDATE albums SET cover_file_id = ? WHERE id = ? AND cover_file_id IS NULL` (parameterized). A cover another
+   process stored meanwhile is never replaced (counted `already`; the cost is one orphan photo in the channel).
+
+Nothing is downloaded as audio and no track row is touched.
+
+### Commands
+
+```sh
+scripts/run-bootstrap-local.sh covers --count
+scripts/run-bootstrap-local.sh covers --max-new 3 --max-minutes 5
+scripts/run-bootstrap-local.sh covers --max-new 50 --max-minutes 30
+```
+
+Not run by the author (section 0). Order: `--count` first, then a small session, read the log and
+`bootstrap-last-run.json`, then raise the caps; repeat until the count says nothing is left to try.
+
+- **`covers --count`** is read-only: D1 reads only, no YouTube call, no Telegram call, no write, no file. It takes no
+  `--max-new` and no `--max-minutes` (the wrapper rejects them with `--count`, exit 78), has no 21:10 guard (it ends in
+  seconds) and still takes the lock (exit 75 while a session or the timer run holds it). It prints counts only:
+  `covers: albums without a cover: N (to try: T, in cooldown: C, unknown album: U, unreadable rows: B; retry cooldown D days)`
+  and `covers: artists without an image: ...`. The artist half is `not counted yet (the artists.image_file_id column does not
+  exist)` until the artist-image migration is in production (#249); the output shape already has the line.
+- **`covers --max-new N --max-minutes M`** needs BOTH caps (1..1000000 and 1..1440, the wrapper and `bootstrap.py` both
+  refuse a missing or out-of-range one). `--max-new` counts albums ATTEMPTED (every attempt costs search calls, matched or
+  not); albums resting in the cooldown are skipped and not counted. `--max-minutes` is wall clock: no new album starts
+  after it, one album in progress finishes (up to 3 paced searches plus retries; leave a margin of a few minutes).
+- **`--retry-days D`** (0..3650, default 30; also accepted by `--count`): how long an album without a match (`no_match`) or
+  with a mismatch rests before it is tried again. `0` retries everything every session.
+- **The 21:10 guard** is the one of `run`: the wrapper (and `bootstrap.py` itself) refuse to start when `now + --max-minutes
+  + 10 min + 60 s` reaches the next 21:10 local time (exit 78, one line, nothing touched). `--count` is exempt.
+- **Pacing and retries.** At least 1.5 s plus 0..1 s of jitter between two YouTube Music calls; a transient error (HTTP
+  429/5xx, network) is retried at most twice with a growing wait; any other error is not retried. Three failed albums in a
+  row stop the session (stop reason `failed`, exit 1: D1, Telegram or the network are probably down).
+- **Sign-in stop.** A YouTube bot check ends the session at once with exit 3 (stop reason `sign-in`), is never retried
+  and never bypassed: no cookies, no proxies, no PO-token tricks, no client rotation (#62). Wait and run again later; if
+  a second session in a row ends with exit 3, stop and report to the owner.
+
+### Resuming, the cooldown file, results
+
+The work list comes from D1 every time, so a stopped or killed session resumes by itself: albums that got a cover are no
+longer selected. `cover-backfill.json` in the state directory (0600, atomic writes, directory 0700) remembers only the
+hopeless ones: `{"version": 1, "albums": {<album id>: {"result": "no_match" | "mismatch", "on": "YYYY-MM-DD"}}}` (ids are
+hashes, no names). A later success removes the entry. Failures (a Telegram, D1 or fetch error) are NOT cooled: they are
+retried in the next session and cost an attempt each time. A file that is not valid (unknown field, bad date, wrong
+version, not a regular file) is refused with exit 2 and nothing runs; to start empty, move it aside by hand (there is no
+`--reset-state` for `covers`).
+
+Log lines are counts and class words only, never a name or a title (`covers: album 7: no_match`, a summary
+`covers: covered 12, already 0, no_match 3, album_mismatch 5, artist_mismatch 1, no_cover_in_match 0, failed 0, cooldown 4,
+not attempted 20`, `covers: R album(s) still without a cover`, `stop reason: cap | time | done | sign-in | failed`).
+Outcome words: `covered`, `already` (filled meanwhile), `no_match` (the matcher found nothing), `album_mismatch`,
+`artist_mismatch` (the guard refused the match), `no_cover_in_match` (the match has no usable thumbnail or album),
+`failed`. `bootstrap-last-run.json` holds `subcommand: covers` and, for a session, the result object (`stop_reason`,
+`exit_code`, `counts` with the words above plus `cooldown` and `not_attempted`; `artists` is empty). Exit codes: 0 ok (a cap,
+time or empty-list stop is not a failure), 1 a failed album or an unsaved cooldown file, 2 usage, missing environment or an
+unusable cooldown file, 3 sign-in stop, 75 locked, 78 guard or wrapper usage.
+
+### Limits of this runbook
+
+- The similarity thresholds of the guard were tested offline with invented names, not on the real library; the first
+  sessions show how many albums end `album_mismatch` or `no_match`. A high count is a reason to look at the guard, not to
+  loosen it blindly (a wrong cover stays for good: the first stored cover is never replaced).
+- A match can fail when YouTube Music lists the album under another title; such albums rest in the cooldown and stay without a
+  cover. Whether to add another source (Cover Art Archive, design doc section 8 item 5) is decided from the first counts.
+- Search call limits of YouTube Music are undocumented [R]; the pacing above is a conservative guess, not a measured limit.
+- Not run by the author: every command of this section. The tests (`ingest/test_bootstrap_covers.py`,
+  `scripts/test-run-bootstrap-local.sh`) use fakes and an in-memory SQLite copy of the real schema; no D1, Telegram,
+  YouTube or Loki call was made.
