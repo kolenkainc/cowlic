@@ -337,6 +337,15 @@ class ErrorReason(unittest.TestCase):
     def test_error_reason_redacts_on_its_own(self):  # not only through the caller's final redact
         self.assertEqual(ingest.error_reason({"error": {"message": f"a {CANARY} b"}}, [CANARY]), "a *** b")
 
+    def test_secret_split_by_control_or_zero_width_characters_is_redacted(self):
+        for inserted in ("\x00", "\u200b", "\u2060", "\ufeff", "\x07", "\x1f"):
+            half = len(CANARY) // 2
+            msg = f"bad {CANARY[:half]}{inserted}{CANARY[half:]} here"
+            out = ingest.error_reason({"error": {"message": msg}}, [CANARY])
+            self.assertNotIn(CANARY[:half], out, repr(inserted))
+            self.assertNotIn(CANARY[half:], out, repr(inserted))
+            self.assertEqual(out, "bad *** here")
+
     def test_control_characters_are_cleaned(self):
         msg = self.fail_with({"error": {"message": "line1\nline2\r\x1b[31mred\x00\x07 tab\there‮"}})
         self.assertTrue(msg.isprintable(), repr(msg))
