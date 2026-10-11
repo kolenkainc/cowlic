@@ -209,7 +209,10 @@ def _count(v):
 def _iso(v) -> datetime:
     if not isinstance(v, str) or not ISO_RE.fullmatch(v):
         raise ShipError("last-run.json has an unexpected value")
-    return datetime.strptime(v, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    try:
+        return datetime.strptime(v, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:  # matches the pattern but is not a real date (month 13): fixed text, no value
+        raise ShipError("last-run.json has an unexpected value") from None
 
 
 def parse_last_run(path: str, started_at: str | None = None) -> dict:
@@ -317,7 +320,12 @@ def post(url: str, body: bytes, auth: str, opener=None, content_type: str = "app
 
 def ship(log_path: str, offset: int, last_run_path: str, env=os.environ, opener=None, redact=None,
          started_at: str | None = None) -> None:
-    url, user, token = read_config(env)
+    try:
+        url, user, token = read_config(env)
+    except ShipError as e:
+        if str(e) == "not configured" and (env.get("INGEST_GRAFANA_PROM_URL") or env.get("INGEST_GRAFANA_PROM_USER")):
+            raise ShipError("not configured (metrics skipped: they are sent only when the log step is configured)") from None
+        raise
     if redact is None:
         from ingest import redact  # fail closed: without ingest's redaction nothing is sent
     auth = "Basic " + base64.b64encode(f"{user}:{token}".encode()).decode()
