@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
-# One local bootstrap command: ingest/bootstrap.py (rank | plan | run | status), started by hand or by the coordinator,
+# One local bootstrap command: ingest/bootstrap.py (rank | plan | run | status | covers), started by hand or by the coordinator,
 # NOT by the 21:10 timer. Design: docs/bootstrap-ongoing.md (sections 2.1, 2.2, 5). Usage (arguments are forwarded to
 # bootstrap.py as they are, never echoed):
 #   scripts/run-bootstrap-local.sh run  --max-new N --max-minutes M [--config FILE] ...
 #   scripts/run-bootstrap-local.sh plan --max-new N --max-minutes M [--config FILE]
 #   scripts/run-bootstrap-local.sh rank [--config FILE] [--refresh]
 #   scripts/run-bootstrap-local.sh status
+#   scripts/run-bootstrap-local.sh covers --max-new N --max-minutes M [--retry-days D]   (backfill covers, #250)
+#   scripts/run-bootstrap-local.sh covers --count [--retry-days D]                       (read-only dry count)
 #
 # - Never reads, sources or parses .env: bootstrap.py loads it itself. Never traces (set +x), never prints env values,
 #   no eval: the arguments are only matched by `case`, then forwarded verbatim as an array.
 # - Argument rules (checked first, nothing is touched on a violation: one stderr line, exit 78): the subcommand is one of
-#   rank|plan|run|status; run and plan REQUIRE --max-new (1..1000000) and --max-minutes (1..1440), each once, as
-#   "--opt N" or "--opt=N"; rank and status take no --max-*; any abbreviation of --max-* or any prefix of --result-json from --r on is rejected
+#   rank|plan|run|status|covers; run, plan and covers (without --count) REQUIRE --max-new (1..1000000) and --max-minutes
+#   (1..1440), each once, as "--opt N" or "--opt=N"; rank, status and covers --count take no --max-*; --count belongs to
+#   covers only (read-only: D1 reads only, no YouTube, no Telegram, no write); any abbreviation of --max-* or any prefix of --result-json from --r on is rejected
 #   (argparse would accept it behind the wrapper's back); --result-json belongs to the wrapper (it is added for run).
 # - Lock: the SAME file as the nightly wrapper (ingest.lock), taken exactly like it: exec 9>, flock -n 9, exit 75 with
 #   one stderr line before anything else; a blocked invocation touches neither the log nor bootstrap-last-run.json.
@@ -20,7 +23,7 @@
 #   never in the unit or in .env; an inherited COWLIC_LOCK_HELD is unset here, so no other child of this wrapper sees it.
 #   Reading order for bootstrap.py (#168): COWLIC_LOCK_HELD from the real process environment BEFORE any .env load;
 #   a value in .env is ignored.
-# - Overlap guard (run and plan): refuses to start (exit 78, one stderr line, nothing touched) when now + --max-minutes
+# - Overlap guard (run, plan and covers without --count; covers --count ends in seconds and has none): refuses to start (exit 78, one stderr line, nothing touched) when now + --max-minutes
 #   + 10 minutes margin + 60 s (the timer's RandomizedDelaySec) reaches the next 21:10 LOCAL time. The next 21:10 is
 #   computed from the clock (the timer's OnCalendar is a fixed local time), not read from systemctl. Within 60 s after
 #   21:10 the run may still be about to start, so that day's 21:10 counts as next. Test hook:
@@ -32,7 +35,8 @@
 #   wrapper leaves none; written after EVERY invocation that got past the lock and the guard (started_at,
 #   finished_at, subcommand, exit_code, stop_reason, log_file, result = bootstrap.py's --result-json object or null).
 #   Always valid JSON, atomic, 0600. NEVER touches last-run.json or ingest.log.
-# - Grafana (#244, run and plan only): the redacted session log is shipped LIVE to Grafana Cloud Loki under the job label
+# - Grafana (#244, run, plan and covers without --count; covers sessions are shipped like run, decision of #250: the same
+#   job label and the same log, the covers lines hold counts and class words only): the redacted session log is shipped LIVE to Grafana Cloud Loki under the job label
 #   cowlic-bootstrap, LOGS ONLY (ship_grafana.py --logs-only: no run_summary, no Influx push, no cowlic_ingest_* series,
 #   nothing from last-run.json). A background loop ships the new complete lines every COWLIC_BOOTSTRAP_SHIP_INTERVAL seconds
 #   (default 20; offset kept in .bootstrap-ship.offset) and once more at the end (--final), exactly like
@@ -41,6 +45,8 @@
 #   Best effort: timeout, stdin closed, lock descriptor not inherited, result ignored: it never changes the exit code,
 #   the lock handling or the signal handling. The Loki keys (names only) come from .env, read by the shipper itself; when
 #   they are missing the shipper says so and sends nothing. A locked, refused or usage-failed invocation ships nothing.
+# - `covers` is the album cover backfill: it takes this same lock, so it never runs together with a bootstrap session or the
+#   21:10 run (exit 75): run it BETWEEN sessions. A covers session (not --count) gets --result-json like run.
 # - Exit code: bootstrap.py's own (0 ok, 1 failed, 2 usage, 3 YouTube sign-in stop); 128+N when interrupted by signal N.
 #   Wrapper: 75 locked, 78 prerequisite/usage/guard.
 # - The child and its helpers run in their own process group; they are stopped when the wrapper ends or gets a signal.
@@ -56,14 +62,15 @@ EXIT_PREREQ=78  # usage, guard, venv, prerequisites or state dir problem; nothin
 EXIT_LOCKED=75  # another run or session holds the lock; nothing ran
 
 # ---- arguments (pure checks, no side effects) --------------------------------------------------------------------
-usage_fail() { echo "run-bootstrap-local: $* (usage: run-bootstrap-local.sh rank|plan|run|status; run and plan need --max-new 1..1000000 and --max-minutes 1..1440)" >&2; exit "$EXIT_PREREQ"; }
+usage_fail() { echo "run-bootstrap-local: $* (usage: run-bootstrap-local.sh rank|plan|run|status|covers; run, plan and covers need --max-new 1..1000000 and --max-minutes 1..1440, covers --count takes none)" >&2; exit "$EXIT_PREREQ"; }
 
 SUB="${1-}"
 [ "$#" -eq 0 ] || shift
-case "$SUB" in rank | plan | run | status) ;; *) usage_fail "missing or unknown subcommand" ;; esac
+case "$SUB" in rank | plan | run | status | covers) ;; *) usage_fail "missing or unknown subcommand" ;; esac
 ARGS=("$@")
 MAX_NEW=""
 MAX_MINUTES=""
+COUNT=0
 check_cap() { # option value max: sets the global named by the option, rejects a second one
   local opt="$1" val="$2" max="$3"
   case "$val" in '' | *[!0-9]* | 0*) usage_fail "$opt needs a positive integer" ;; esac
@@ -78,6 +85,9 @@ i=0
 while [ "$i" -lt "$n_args" ]; do
   a="${ARGS[i]}"
   case "$a" in
+    --count)
+      [ "$SUB" = covers ] || usage_fail "--count belongs to covers only"
+      COUNT=1 ;;
     --r*)
       name="${a%%=*}"  # every prefix of --result-json (at least --r) is an abbreviation argparse could accept
       case "--result-json" in "$name"*) usage_fail "--result-json is set by the wrapper" ;; esac ;;
@@ -97,7 +107,16 @@ while [ "$i" -lt "$n_args" ]; do
 done
 case "$SUB" in
   run | plan) { [ -n "$MAX_NEW" ] && [ -n "$MAX_MINUTES" ]; } || usage_fail "$SUB requires --max-new and --max-minutes" ;;
+  covers)
+    if [ "$COUNT" = 1 ]; then
+      { [ -z "$MAX_NEW" ] && [ -z "$MAX_MINUTES" ]; } || usage_fail "covers --count takes no --max-new or --max-minutes"
+    else
+      { [ -n "$MAX_NEW" ] && [ -n "$MAX_MINUTES" ]; } || usage_fail "covers requires --max-new and --max-minutes (or --count)"
+    fi ;;
 esac
+# LONG=1: a session that is guarded against the 21:10 run and shipped to Grafana (run, plan, covers without --count)
+LONG=0
+case "$SUB" in run | plan) LONG=1 ;; covers) [ "$COUNT" = 1 ] || LONG=1 ;; esac
 unset i a n_args name
 
 # ---- paths -------------------------------------------------------------------------------------------------------
@@ -182,7 +201,7 @@ write_last_run() { # exit_code
 PIPE_PID=""
 WATCH_PID=""
 TICK_PID=""
-SHIP_ON=0  # 1 only for run and plan, after the child was started
+SHIP_ON=0  # 1 only for the long sessions (LONG=1), after the child was started
 LOG_OFFSET=0
 INTERRUPTED=0
 stop_group() { # pid: stop the process group led by this job
@@ -230,10 +249,10 @@ if ! flock -n 9; then
   exit "$EXIT_LOCKED"
 fi
 
-# ---- 21:10 overlap guard (run and plan) --------------------------------------------------------------------------
+# ---- 21:10 overlap guard (run, plan, covers without --count) --------------------------------------------------------------------------
 guard_fail() { echo "run-bootstrap-local: $*" >&2; exit "$EXIT_PREREQ"; }
-case "$SUB" in
-  run | plan)
+case "$LONG" in
+  1)
     NOW="${COWLIC_BOOTSTRAP_NOW_EPOCH-}"
     if [ -n "$NOW" ]; then
       case "$NOW" in *[!0-9]* | 0*) guard_fail "COWLIC_BOOTSTRAP_NOW_EPOCH must be epoch seconds" ;; esac
@@ -259,8 +278,8 @@ STARTED_AT="$(now_utc)"
 rm -f "$RESULT"
 rm -f "$LAST_RUN"  # a kill -9 (no trap runs) must not leave the previous run's record looking like this session's
 rotate_log
-case "$SUB" in
-  run | plan) # shipping starts at this session's first line (rotation happens only here, under the lock)
+case "$LONG" in
+  1) # shipping starts at this session's first line (rotation happens only here, under the lock)
     rm -f "$OFFSET_FILE"
     LOG_OFFSET="$({ wc -c < "$LOG"; } 2> /dev/null)" || LOG_OFFSET=0
     case "$LOG_OFFSET" in '' | *[!0-9]*) LOG_OFFSET=0 ;; esac
@@ -297,7 +316,7 @@ trap 'on_signal 1' HUP
 set -m  # every background job gets its own process group, so stop_group can end it with all its children
 
 EXTRA=()
-[ "$SUB" != run ] || EXTRA=(--result-json "$RESULT")
+if [ "$SUB" = run ] || { [ "$SUB" = covers ] && [ "$COUNT" = 0 ]; }; then EXTRA=(--result-json "$RESULT"); fi
 
 # The session: stdout+stderr -> redaction filter -> tee (terminal and log). Its exit code comes from PIPESTATUS, so
 # neither the filter nor tee can hide it. -u: unbuffered. 9>&-: nobody in the group holds the lock; COWLIC_LOCK_HELD=1
@@ -311,11 +330,11 @@ EXTRA=()
 PIPE_PID=$!
 WRAPPER_PID=$$
 
-# The live shipper (run and plan): its own process group, output dropped. It exits by itself as soon as the wrapper is
+# The live shipper (the long sessions): its own process group, output dropped. It exits by itself as soon as the wrapper is
 # gone (kill -0 before every one-second sleep step and before every push), so even a kill -9 of the wrapper ends it within
 # about a second. Nothing here can change the session: it only reads the log. It does not hold the lock descriptor.
-case "$SUB" in
-  run | plan)
+case "$LONG" in
+  1)
     SHIP_ON=1
     (
       warned=0
