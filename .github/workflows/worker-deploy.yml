@@ -32,7 +32,9 @@ permissions:
   contents: read
 
 # One deploy at a time, a running deploy is never cancelled (section 3 rule 5). A pending run replaced by a newer one
-# is fine: the newer run deploys a later master commit that contains the older one.
+# is fine: the newer run deploys a later master commit that contains the older one. A run whose commit is no longer
+# the master head still deploys when no worker/ file changed after it (see `plan`), so a docs-only merge right after a
+# worker/ merge cannot cause a silently missed deploy.
 concurrency:
   group: worker-deploy
   cancel-in-progress: false
@@ -80,13 +82,41 @@ jobs:
           if [ "$head_sha" = "$EVENT_SHA" ]; then
             echo "deploy=true" >> "$GITHUB_OUTPUT"
             echo "commit $EVENT_SHA is the head of master"
+            exit 0
+          fi
+          # Master moved on. Whether the newer commits start a deploy run of their own depends on the path filter
+          # (worker/**): a docs-only or ingest-only commit starts none, so skipping would silently leave production
+          # on old code. Compare sha...head: the status must be "ahead" (sha is an ancestor of the head), and the
+          # files in between decide: no worker/ file (a rename out of worker/ counts too) -> deploy sha (its worker/
+          # content equals the head's); a worker/ file -> a newer run with a worker/ change exists and deploys, so
+          # skip. The compare response lists at most 300 files: reaching that is treated as unknown and FAILS (deploying
+          # an older sha when unsure could put old code over a newer commit). Any other status or error fails closed.
+          if ! cmp=$(gh api "repos/$REPO/compare/$EVENT_SHA...$head_sha" --jq '.status, (.files | length), ([.files[] | select((.filename | startswith("worker/")) or ((.previous_filename // "") | startswith("worker/")))] | length)'); then
+            echo "::error::cannot compare the commit with the head of master"
+            exit 1
+          fi
+          { read -r cmp_status; read -r cmp_files; read -r cmp_worker; } <<< "$cmp"
+          case "$cmp_files$cmp_worker" in
+            "" | *[!0-9]*) echo "::error::unexpected compare result"; exit 1 ;;
+          esac
+          if [ "$cmp_status" != "ahead" ]; then
+            echo "::error::unexpected compare status (the commit is not an ancestor of the master head)"
+            exit 1
+          fi
+          if [ "$cmp_files" -ge 300 ]; then
+            echo "::error::too many changed files between the commit and the master head to decide; start the run for the head by hand"
+            exit 1
+          fi
+          if [ "$cmp_worker" -eq 0 ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            echo "master moved on, but no worker/ file changed after $EVENT_SHA: deploying this commit"
           else
             echo "deploy=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::skipped: $EVENT_SHA is not the head of master any more; the run for the newer commit deploys"
+            echo "::notice::skipped: a newer commit on master changes worker/ and has its own deploy run"
             {
               echo "### Worker deploy skipped"
               echo
-              echo "Commit \`$EVENT_SHA\` is no longer the head of master. A newer commit deploys instead."
+              echo "Commit \`$EVENT_SHA\` is no longer the head of master and a newer commit changes \`worker/\`: that commit has its own deploy run."
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
@@ -179,6 +209,14 @@ jobs:
           WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-output.ndjson
         run: |
           npx wrangler deploy -c wrangler.ci.toml
+
+      # Separate step (no secrets) so that a parse failure is visible as such while the deploy itself stays "success":
+      # the failure summary below then still prints the rollback text.
+      - name: Read the deployed version id
+        id: version
+        env:
+          WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-output.ndjson
+        run: |
           node --input-type=module - <<'EOF'
           import { appendFileSync, readFileSync } from "node:fs";
           const lines = readFileSync(process.env.WRANGLER_OUTPUT_FILE_PATH, "utf8").split("\n").filter(Boolean);
@@ -202,7 +240,8 @@ jobs:
       # Prints fixed texts only (no URL, no host, no response body).
       # Known limitation: it does NOT exercise D1, the Subsonic credentials or Telegram. Error 40 is also what the Worker
       # answers when its own secrets are missing (auth fails closed), so a deploy that lost them still passes: the owner
-      # checks `wrangler secret list` after the first run.
+      # checks `wrangler secret list` after the first run. It also cannot show that the NEW version is the one serving:
+      # the old version answers error 40 as well.
       - name: Health check
         id: health
         env:
@@ -236,7 +275,7 @@ jobs:
       - name: Summary
         if: success()
         env:
-          VERSION_ID: ${{ steps.deploy.outputs.version_id }}
+          VERSION_ID: ${{ steps.version.outputs.version_id }}
           GIT_SHA: ${{ github.sha }}
         run: |
           {
@@ -248,17 +287,17 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       # No automatic rollback (a rollback is a production change and needs a human decision). Runs only when the
-      # deploy itself succeeded and the health check failed.
-      - name: Summary (health check failed)
-        if: always() && steps.deploy.outcome == 'success' && steps.health.outcome == 'failure'
+      # deploy itself succeeded and anything after it failed (reading the version id, the health check).
+      - name: Summary (failure after deploy)
+        if: always() && steps.deploy.outcome == 'success' && (steps.version.outcome == 'failure' || steps.health.outcome == 'failure')
         env:
-          VERSION_ID: ${{ steps.deploy.outputs.version_id }}
+          VERSION_ID: ${{ steps.version.outputs.version_id }}
           GIT_SHA: ${{ github.sha }}
         run: |
           {
-            echo "### Worker deployed, HEALTH CHECK FAILED"
+            echo "### Worker deployed, a step after the deploy FAILED (version id or health check)"
             echo
-            echo "- Version id: \`$VERSION_ID\`"
+            echo "- Version id: \`${VERSION_ID:-unknown}\`"
             echo "- Git SHA: \`$GIT_SHA\`"
             echo
             echo "Roll back by hand (owner, from \`worker/\` on the owner's machine), then check the Symfonium login:"
