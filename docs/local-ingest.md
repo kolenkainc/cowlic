@@ -890,6 +890,45 @@ Known limitations:
   nights with `COWLIC_INGEST_ARGS` (`--max-new`, `--max-minutes`, `--pace-seconds`, see above) and a small
   `max_artists`; progress is kept in the state file (`artists` map, keys `lfm:<16 hex>`) and the next run continues.
 
+## New releases of known artists (nightly, bounded)
+
+Added in #172 (contract: [bootstrap-ongoing.md](bootstrap-ongoing.md) section 4). An opt-in `new_releases:` section of
+`sources.yml` makes a run check, AFTER the playlists (and the other sections), the artists of the stored bootstrap
+ranking (`bootstrap-ranking.json`, computed by the bootstrap command only, never by this run) for releases that are
+not in the library, and ingest their tracks through the same pipeline as a playlist. A file without the section, or
+with `enabled: false`, behaves exactly as before. The committed `sources.yml` keeps it off until the owner turns it on.
+
+```yaml
+# new_releases:
+#   enabled: true        # default true
+#   max_artists: 10      # due artists checked per night, 1..1000; default 10
+#   recheck_days: 7      # a checked artist is due again after this many days, 1..365; default 7
+#   max_new: 20          # tracks added by this phase per night, 1..1000; default 20
+```
+
+Same strictness as the other sections (unknown or repeated keys are errors; `lookback_days` does not exist). The
+section alone is not a source: the file still needs a playlist. Bounds per night: at most `max_artists` artists,
+`max_new` tracks and 20 minutes for the phase, inside the run's own `--max-new` / `--max-minutes`; a heavy playlist
+night that uses them up leaves the artists `not_started` and they stay due. Per artist at most 5 source requests plus
+1 search on the first check plus 1 `get_album` per missing release, at least 1 s between source calls; the source's
+first refusal (HTTP 429/403) ends the phase without a retry. A YouTube sign-in challenge during a DOWNLOAD ends the
+whole run with exit 3 as for any playlist track and is never bypassed; a bot-check text in the detector's own source
+calls (search, get_artist, get_artist_albums, get_album) is classed as a refusal: it ends the phase with exit 1 (class
+`partial`), not exit 3. An unexpected exception in the phase is logged by class only, ends the phase and gives exit 1.
+With no stored ranking the phase does nothing and logs one line (there is no fallback to the artists in D1).
+
+Known limitation (#238, blocks enabling the phase in the committed `sources.yml` and #175): a release of which only
+some tracks landed (cut by a cap, a failed track, an interruption) has its album in D1 afterwards, so the next check no
+longer sees it as missing and the remaining tracks are not retried. A cut artist is kept due, which only helps releases
+that were not started.
+
+Check state lives in `new-releases-state.json` next to `ingest-state.json` (hashed artist keys, dates, release keys).
+A failed artist check, a failed track or an unreadable state file is a failure of the phase (exit 1, class `partial`),
+the playlists are not affected. The shipped `ingest.log` gets counts and hashed keys only (`new releases lfm:<16 hex>:
+...`, tracks are named by their `lfm:` song id): no artist or release names. The result JSON gets an additive
+`new_releases` object (counts only: `due`, `checked`, `with_new`, `added`, `skipped`, `failed`, `not_started`, and a
+`status` word); its track counts are also part of `counts`.
+
 ## Troubleshooting
 
 | Symptom | Likely cause and fix |
