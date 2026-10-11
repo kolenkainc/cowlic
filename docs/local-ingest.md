@@ -964,6 +964,30 @@ Log and summary (counts and ids only, never names):
 - The per-playlist and final summary lines get `, N covers from the match` (counted after a successful upload) and
   `, N without a cover` (tracks the guard refused), each only when non-zero. They are not part of the result JSON.
 
+## Artist photos from YouTube Music (#251)
+
+A track without a Spotify cover URL (Last.fm and new-release tracks, the same set as the album covers above) can also
+give its artist a photo: one `get_artist(artists[0].id)` call per artist and run, using the artist id of the matched
+search result; the thumbnail base plus `=w800-h800-p-l90-rj` (a square crop of the banner) is fetched through the same
+hardened route as a cover (https, the two Google image hosts, no redirect, JPEG, 10 MB, 60 s) and uploaded with `sendPhoto`.
+The file id is written to `artists.image_file_id` in the track's own D1 batch with
+`COALESCE(excluded.image_file_id, artists.image_file_id)`. Spotify playlist tracks never trigger it: a nightly run with
+only playlists makes no extra call, no extra D1 query and no extra log line.
+
+- Gate: the artist statement names `image_file_id` only when there is a photo to write, and before the first photo is
+  considered the run checks `pragma_table_info('artists')` once. When the column is missing (migration 0003 not applied)
+  the run logs `artist photos: off, ...` once and nothing else changes; track inserts cannot fail on the missing column.
+  The stored photos are read in the same step (`SELECT id, image_file_id FROM artists WHERE image_file_id IS NOT NULL`),
+  so an artist that already has a photo costs no call and its photo is never replaced.
+- Guard: the matched result's artist names must match the track's artist (the album-cover artist check: bar 0.8,
+  article-insensitive, Latin/Cyrillic aware, plural-only differences refused). It gates only the photo, never the audio
+  match. A match without an artist id is a silent no-op.
+- Pacing and failure: 2 s pause before each `get_artist`, transient errors get at most 3 attempts in total (`--retry-attempts`), like the search. A
+  failed photo is `WARN artist photo failed for <song id>: <error class>` and never fails the track; the artist is not
+  retried in the same run. A sign-in challenge in that call ends the run with exit 3 as everywhere else (never bypassed).
+- Log and summary: counts and ids only. The summary lines get `, N artist photos` when non-zero. Artists stored earlier
+  without a photo are not filled here (the backfill is #253).
+
 ## Troubleshooting
 
 | Symptom | Likely cause and fix |

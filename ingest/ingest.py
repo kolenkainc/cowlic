@@ -37,12 +37,13 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 import tg_check
-from match import MODE_TITLE_ONLY, cover_url_from_match, find_match, normalize
+from match import MODE_TITLE_ONLY, artist_id_from_match, artist_photo_url, cover_url_from_match, find_match, normalize
 
 MAX_BYTES = 20 * 1024 * 1024  # Telegram Bot API getFile limit
 BITRATE = "256k"
@@ -536,13 +537,20 @@ def too_big(size_bytes: int) -> bool:
 
 
 def upsert_statements(song: dict, size_bytes: int, tg_file_id: str, tg_message_id: int,
-                      cover_file_id: str | None) -> list[tuple[str, list]]:
-    """Parameterized SQL for one track. Existing cover_file_id is kept when no new cover is given."""
+                      cover_file_id: str | None, artist_image_file_id: str | None = None) -> list[tuple[str, list]]:
+    """Parameterized SQL for one track. Existing cover_file_id is kept when no new cover is given. The artist statement
+    mentions image_file_id ONLY when there is an image to write (#251): without one it is the statement it always was, so
+    a database without the column (migration 0003 not applied) never sees the name."""
     artist, album = primary_artist(song), song.get("album_name") or UNKNOWN_ALBUM
     ar, al, tr = artist_id(artist), album_id(artist, album), track_id(song["song_id"])
+    artist_stmt = (("INSERT INTO artists (id, name) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name",
+                    [ar, artist]) if artist_image_file_id is None else
+                   ("INSERT INTO artists (id, name, image_file_id) VALUES (?, ?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET name = excluded.name, "
+                    "image_file_id = COALESCE(excluded.image_file_id, artists.image_file_id)",
+                    [ar, artist, artist_image_file_id]))
     return [
-        ("INSERT INTO artists (id, name) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name",
-         [ar, artist]),
+        artist_stmt,
         ("INSERT INTO albums (id, artist_id, name, year, cover_file_id) VALUES (?, ?, ?, ?, ?) "
          "ON CONFLICT(id) DO UPDATE SET name = excluded.name, year = excluded.year, "
          "cover_file_id = COALESCE(excluded.cover_file_id, albums.cover_file_id)",
@@ -828,6 +836,46 @@ class Deps:
     upload_cover: Callable[[dict, Path], str]        # -> cover file_id
     d1_batch: Callable[[list], object]
     delete_message: Callable[[int], None]
+    # Artist photos (#251). The feature is ON only when all three are set. artist_images is a loader called at most once
+    # per run, right before the first artist photo is considered: it returns the dict artist id -> Telegram file_id (None
+    # = looked at in this run without a result), or None when the column artists.image_file_id does not exist (feature off).
+    artist_images: Callable[[], dict | None] | None = None
+    artist_photo_url: Callable[[str], str | None] | None = None   # YouTube Music artist id -> photo URL (one get_artist call)
+    upload_artist_image: Callable[[str, Path], str] | None = None  # photo URL, dir -> Telegram file_id
+
+
+def take_artist_photo(song: dict, m, deps: Deps, tdir: Path, sid: str, notes: dict | None) -> str | None:
+    """Artist photo for a song without a Spotify cover (Last.fm, new releases): file_id or None. At most one
+    get_artist call per artist and run (a failed attempt is remembered too). Never raises except for the sign-in
+    challenge; the artist guard gates only this photo, never the audio match."""
+    if deps.artist_images is None or deps.artist_photo_url is None or deps.upload_artist_image is None:
+        return None
+    images = deps.artist_images()
+    if images is None:
+        return None
+    ar = artist_id(primary_artist(song))
+    if ar in images:  # a stored photo, one found earlier in this run, or an attempt that already failed
+        return images[ar]
+    aid, why = artist_id_from_match(primary_artist(song), m)
+    if not aid:
+        if why != "no_artist_id":  # a match without an artist id is silent: nothing to look up
+            log(f"artist photo skipped for {sid}: {why}")
+        return None
+    images[ar] = None
+    try:
+        url = deps.artist_photo_url(aid)
+        if not url:
+            log(f"artist photo skipped for {sid}: no_thumbnail")
+            return None
+        images[ar] = deps.upload_artist_image(url, tdir)
+    except YouTubeSignInRequired:
+        raise
+    except Exception as e:  # logged by class only; a photo problem never fails the track
+        log(f"WARN artist photo failed for {sid}: {type(e).__name__}")
+        return None
+    if notes is not None:
+        notes["artist_photo"] = True
+    return images[ar]
 
 
 def process_track(song: dict, deps: Deps, existing: set, covers: dict, work: Path, dry: bool = False,
@@ -861,6 +909,7 @@ def process_track(song: dict, deps: Deps, existing: set, covers: dict, work: Pat
     try:
         al = album_id(primary_artist(song), song.get("album_name") or UNKNOWN_ALBUM)
         cover = covers.get(al)
+        spotify_cover = bool(song.get("cover_url"))
         if not cover and not song.get("cover_url"):  # no Spotify cover (Last.fm, new releases): the match may have one
             album_name = song.get("album_name")
             url, why = cover_url_from_match(None if album_name == UNKNOWN_ALBUM else album_name, primary_artist(song), m)
@@ -878,7 +927,8 @@ def process_track(song: dict, deps: Deps, existing: set, covers: dict, work: Pat
                     notes["cover_from_match"] = True
             except (IngestError, OSError, KeyError, ValueError):
                 log(f"WARN cover failed for {sid}")
-        deps.d1_batch(upsert_statements(song, size, msg["audio"]["file_id"], msg["message_id"], cover))
+        photo = None if spotify_cover else take_artist_photo(song, m, deps, tdir, sid, notes)
+        deps.d1_batch(upsert_statements(song, size, msg["audio"]["file_id"], msg["message_id"], cover, photo))
     except Exception:
         try:
             deps.delete_message(msg["message_id"])
@@ -887,6 +937,40 @@ def process_track(song: dict, deps: Deps, existing: set, covers: dict, work: Pat
         raise
     existing.add(sid)
     return "new"
+
+
+ARTIST_COLUMN_SQL = "SELECT 1 AS present FROM pragma_table_info('artists') WHERE name = 'image_file_id'"
+ARTIST_IMAGES_SQL = "SELECT id, image_file_id FROM artists WHERE image_file_id IS NOT NULL"
+
+
+def load_artist_images(query: Callable[..., list[dict]] | None = None) -> dict | None:
+    """The artist-image gate (#251). The artist upsert shares the D1 batch with the track insert, so writing
+    image_file_id before migration 0003 exists would fail EVERY track. The check is a query that cannot fail on a missing
+    column (pragma_table_info): the dict (artist id -> file_id of every stored photo) when the column exists, None
+    (feature off, one log line, nothing else changes) when it does not or when it cannot be checked."""
+    query = query or d1_query
+    try:
+        if not query(ARTIST_COLUMN_SQL):
+            log("artist photos: off, the artists.image_file_id column does not exist (migration 0003 not applied)")
+            return None
+        return {r["id"]: r["image_file_id"] for r in query(ARTIST_IMAGES_SQL)}
+    except (IngestError, OSError, KeyError, TypeError) as e:
+        log(f"WARN artist photos: off, the column check failed ({type(e).__name__})")
+        return None
+
+
+class LazyArtistImages:
+    """The gate and the stored-photo read happen once, when the first song that could get a photo (no Spotify cover: Last.fm,
+    new releases) reaches the photo step, and always before any write of image_file_id. A run with nothing of that kind
+    (the nightly playlists, a dry run, nothing new) makes no extra D1 call at all."""
+
+    def __init__(self, load: Callable[[], dict | None] | None = None):
+        self._load, self._done, self._value = load or load_artist_images, False, None
+
+    def __call__(self) -> dict | None:
+        if not self._done:
+            self._value, self._done = self._load(), True
+        return self._value
 
 
 STORED_ROWS_SQL = ("SELECT t.title AS title, ar.name AS artist, t.duration_s AS duration_s FROM tracks t "
@@ -966,7 +1050,19 @@ def real_deps(ytm, throttle: "Throttle | None" = None) -> Deps:
                             YTM_COVER_HOSTS if song.get(COVER_FROM_MATCH) else None)
         return largest_photo_file_id(tg_upload("sendPhoto", "photo", photo, "image/jpeg")["photo"])
 
-    return harden_deps(Deps(find, download, audio, cover, d1_batch, tg_delete), throttle)
+    def artist_photo(artist_id_: str):
+        try:
+            return artist_photo_url(ytm.get_artist(artist_id_))
+        except Exception as e:
+            if is_sign_in_challenge([str(e)]):  # detected and reported, never bypassed (#62)
+                raise YouTubeSignInRequired("YouTube asks to sign in (bot check)") from None
+            raise
+
+    def artist_image(url, tdir):  # the same hardened route as a cover from the match (#248)
+        photo = fetch_cover(url, tdir / "artist.jpg", YTM_COVER_HOSTS)
+        return largest_photo_file_id(tg_upload("sendPhoto", "photo", photo, "image/jpeg")["photo"])
+
+    return harden_deps(Deps(find, download, audio, cover, d1_batch, tg_delete, LazyArtistImages(), artist_photo, artist_image), throttle)
 
 
 # ---- pacing and backoff (#120) ----
@@ -978,6 +1074,7 @@ def real_deps(ytm, throttle: "Throttle | None" = None) -> Deps:
 # Nothing here bypasses a YouTube check: no cookies, proxies, PO tokens or client rotation (#62).
 DEFAULT_PACE_SECONDS = 5.0
 DEFAULT_PACE_JITTER_SECONDS = 5.0
+ARTIST_CALL_PAUSE_S = 2.0     # before each get_artist call (#251), one per new artist at most
 DEFAULT_ATTEMPTS = 3          # attempts in total per operation (1 try + 2 retries)
 BACKOFF_BASE_SECONDS = 10.0   # waits before retry n: base * 2**(n-1), at most BACKOFF_CAP_SECONDS
 BACKOFF_CAP_SECONDS = 120.0
@@ -1055,7 +1152,12 @@ def harden_deps(deps: Deps, throttle: Throttle | None) -> Deps:
         finally:
             throttle.download_finished()
 
-    return Deps(find, download, deps.upload_audio, deps.upload_cover, deps.d1_batch, deps.delete_message)
+    def artist_photo(artist_id_):
+        throttle.sleep(ARTIST_CALL_PAUSE_S)  # the extra get_artist call is paced too
+        return throttle.call(lambda: deps.artist_photo_url(artist_id_), transient_search, "YouTube Music artist")
+
+    return dataclasses.replace(deps, find_match=find, download=download,
+                               artist_photo_url=artist_photo if deps.artist_photo_url else None)
 
 
 # ---- per-run limits and local state (#119) ----
@@ -1303,7 +1405,7 @@ def run(songs: list[dict], deps: Deps, existing: set, covers: dict, work: Path, 
             counts["matched_title_only"] = counts.get("matched_title_only", 0) + 1
         if notes.get("relaxed"):  # additive (#194): counts only
             counts["matched_normalized"] = counts.get("matched_normalized", 0) + 1
-        for note in ("cover_from_match", "cover_skipped"):  # additive (#248): counts only, present when non-zero
+        for note in ("cover_from_match", "cover_skipped", "artist_photo"):  # additive (#248): counts only, present when non-zero
             if notes.get(note):
                 counts[note] = counts.get(note, 0) + 1
         if limits and status in ("new", "too_big", "dry_run"):
@@ -1335,7 +1437,8 @@ def summary(counts: dict) -> str:
             + (f", {title_only} matched by title only" if title_only else "")
             + (f", {normalized} matched after title normalization" if normalized else "")
             + (f", {counts['cover_from_match']} covers from the match" if counts.get("cover_from_match") else "")
-            + (f", {counts['cover_skipped']} without a cover" if counts.get("cover_skipped") else ""))
+            + (f", {counts['cover_skipped']} without a cover" if counts.get("cover_skipped") else "")
+            + (f", {counts['artist_photo']} artist photos" if counts.get("artist_photo") else ""))
 
 
 def run_playlists(urls: list[str], fetch_songs: Callable[[str], list[dict]], deps: Deps, existing: set,
