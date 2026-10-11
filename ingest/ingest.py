@@ -647,6 +647,8 @@ def process_track(song: dict, deps: Deps, existing: set, covers: dict, work: Pat
     m = deps.find_match(song)
     if not m:
         return "no_match"
+    if getattr(m, "relaxed", False) is True and notes is not None:  # #194: only the relaxed title pass accepted it
+        notes["relaxed"] = True
     if getattr(m, "mode", None) == MODE_TITLE_ONLY:
         if notes is not None:
             notes["title_only"] = True
@@ -1029,6 +1031,8 @@ def run(songs: list[dict], deps: Deps, existing: set, covers: dict, work: Path, 
         counts[status] += 1
         if notes.get("title_only"):  # additive, only in the title-only matcher mode (#151); counts only
             counts["matched_title_only"] = counts.get("matched_title_only", 0) + 1
+        if notes.get("relaxed"):  # additive (#194): counts only
+            counts["matched_normalized"] = counts.get("matched_normalized", 0) + 1
         if limits and status in ("new", "too_big", "dry_run"):
             limits.attempted += 1
         if state and not dry:
@@ -1042,7 +1046,8 @@ def run(songs: list[dict], deps: Deps, existing: set, covers: dict, work: Path, 
             log(f"WARN {status.replace('_', ' ')}: {label}")
         elif status in ("new", "dry_run"):
             log(f"{'ingested' if status == 'new' else 'dry-run would ingest'}: {label}"
-                + (" (matched by title only)" if notes.get("title_only") else ""))
+                + (" (matched by title only)" if notes.get("title_only") else "")
+                + (" (matched after title normalization)" if notes.get("relaxed") else ""))
     return counts
 
 
@@ -1051,9 +1056,11 @@ COUNT_KEYS = ("new", "exists", "no_match", "too_big", "failed")
 
 def summary(counts: dict) -> str:
     cooldown, title_only = counts.get("cooldown", 0), counts.get("matched_title_only", 0)
+    normalized = counts.get("matched_normalized", 0)
     return (f"{counts['new']} new, {counts['exists']} already present, {counts['no_match']} no match, "
             f"{counts['too_big']} too big, {counts['failed']} failed" + (f", {cooldown} in cooldown" if cooldown else "")
-            + (f", {title_only} matched by title only" if title_only else ""))
+            + (f", {title_only} matched by title only" if title_only else "")
+            + (f", {normalized} matched after title normalization" if normalized else ""))
 
 
 def run_playlists(urls: list[str], fetch_songs: Callable[[str], list[dict]], deps: Deps, existing: set,
@@ -1365,7 +1372,8 @@ def _result_counts(c: dict | None, not_attempted: int = 0) -> dict:
     return {"added": c.get("new", 0), "skipped": c.get("exists", 0), "no_match": c.get("no_match", 0),
             "too_big": c.get("too_big", 0), "failed": c.get("failed", 0), "not_attempted": not_attempted,
             "cooldown": c.get("cooldown", 0),
-            **({"matched_title_only": c["matched_title_only"]} if c.get("matched_title_only") else {})}
+            **({"matched_title_only": c["matched_title_only"]} if c.get("matched_title_only") else {}),
+            **({"matched_normalized": c["matched_normalized"]} if c.get("matched_normalized") else {})}
 
 
 def stop_reason(results: dict | None, interrupted: YouTubeSignInRequired | None, limits: RunLimits | None) -> str | None:
@@ -1419,6 +1427,10 @@ def build_result(urls: list[str], results: dict | None, interrupted: YouTubeSign
                      for p in (*playlists, *[x for x in (section, lastfm_section) if x]))
     if title_only:  # additive (#151): present only when the title-only matcher mode matched something
         counts["matched_title_only"] = title_only
+    normalized = sum(p.get("matched_normalized", 0)
+                     for p in (*playlists, *[x for x in (section, lastfm_section) if x]))
+    if normalized:  # additive (#194): present only when the relaxed title pass chose a match
+        counts["matched_normalized"] = normalized
     counts["playlists_unreadable"] = sum(p["status"] == "unreadable" for p in playlists)
     counts["playlists_not_attempted"] = sum(p["status"] == "not_attempted" for p in playlists)
     if exit_code == 0:
@@ -1701,7 +1713,7 @@ def execute(args: argparse.Namespace, state: dict) -> int:
     ok = [c for c in results.values() if c is not None]
     fr, lr = state["followed"], state.get("lastfm")
     total = {k: sum(c.get(k, 0) for c in [*ok, *([fr.counts] if fr else []), *([lr.counts] if lr else [])])
-             for k in (*COUNT_KEYS, "cooldown", "matched_title_only")}
+             for k in (*COUNT_KEYS, "cooldown", "matched_title_only", "matched_normalized")}
     broken = len(results) - len(ok)
     artists_failed = (fr.failed if fr else 0) + (lr.failed if lr else 0)
     phase_failed = bool(lr and lr.status == "failed")
