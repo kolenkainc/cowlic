@@ -316,6 +316,19 @@ redaction, cleaning and the final guard.
 Explore (Loki data source): `{job="cowlic-report"}`; the dashboard has a `Last.fm report (live, logs only)` panel
 for it. Set the time range to the last 15 minutes while it runs.
 
+### Watch a bootstrap session live (`scripts/run-bootstrap-local.sh`, #244)
+
+`scripts/run-bootstrap-local.sh run` and `plan` (the bootstrap command, [bootstrap.md](bootstrap.md)) ship their session
+log to the same Loki with the same shipper options as the report wrapper (`--logs-only --job cowlic-bootstrap
+--offset-file`, a final `--final` flush) and the same three keys (`INGEST_GRAFANA_LOKI_URL`, `INGEST_GRAFANA_LOKI_USER`,
+`INGEST_GRAFANA_TOKEN`; no new secret). Logs only: no metrics, no `run_summary`, no `last-run.json`, so the nightly panels
+keep meaning the 21:10 run. It ships the whole session log, like the nightly ships `ingest.log`: the engine's lines with
+artist and track names, redacted (`LASTFM_API_KEY`, the token, `COWLIC_EXTRA_SECRET`). Every `COWLIC_BOOTSTRAP_SHIP_INTERVAL`
+seconds (default 20) and at the end; best effort with a 30 s limit (`COWLIC_SHIP_TIMEOUT`), it never changes the exit
+code, the shared lock, the 21:10 guard or the signal handling. Locked (75), refused (78) or usage-failed invocations,
+`rank` and `status` ship nothing. Explore: `{job="cowlic-bootstrap"}`; details and the dashboard proposal in
+[bootstrap.md](bootstrap.md) section 5.
+
 ### Run metrics (optional)
 
 Added in #105, decided in #106. Right after the log push the same step sends ONE line of Influx line protocol

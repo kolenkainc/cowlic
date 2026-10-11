@@ -813,6 +813,38 @@ class LogsOnlyTests(Base):
         self.assertEqual(self.lines_of(f.requests[0]), ["one", "two"])
         self.assertFalse(any("run_summary" in ln for ln in self.lines_of(f.requests[0])))
 
+    def test_bootstrap_job_ships_engine_lines_as_they_are_without_secrets_or_metrics(self):
+        """#244: the bootstrap wrapper ships the session log under job cowlic-bootstrap, like the nightly ships
+        ingest.log: engine lines with names stay, the secrets (token, extra secret) do not, no metrics push."""
+        self.log.write_text(f"ingested: Some Artist - Some Song\nERROR Some Artist - Other\nuser {self.USER} key {CANARY_TOKEN}\n")
+        f = self.fake()
+        env = dict(self.env(), INGEST_GRAFANA_PROM_URL=f"https://{HOST}", INGEST_GRAFANA_PROM_USER="42")
+        with mock.patch.object(sg, "ship_metrics") as m:
+            self.logs_only(f, job="cowlic-bootstrap", env=env, extra=[self.USER])
+        m.assert_not_called()
+        self.assertEqual([r["path"] for r in f.requests], ["/loki/api/v1/push"])
+        streams = json.loads(f.requests[0]["body"])["streams"]
+        self.assertEqual({s["stream"]["job"] for s in streams}, {"cowlic-bootstrap"})
+        lines = self.lines_of(f.requests[0])
+        self.assertIn("ingested: Some Artist - Some Song", lines)
+        self.assertIn("ERROR Some Artist - Other", lines)
+        self.assertEqual({s["stream"]["level"] for s in streams}, {"info", "error"})
+        body = f.requests[0]["body"]
+        body = body.decode() if isinstance(body, bytes) else body
+        self.assertNotIn(self.USER, body)
+        self.assertNotIn(CANARY_TOKEN, body)
+
+    def test_nothing_is_sent_when_the_loki_variables_are_empty(self):
+        """#244: empty or missing variables: the shipper refuses before any request, for every job label."""
+        self.log.write_text("ingested: A - B\n")
+        f = self.fake()
+        for env in ({"UNRELATED": "1"}, dict(self.env(), INGEST_GRAFANA_LOKI_URL=""), dict(self.env(), INGEST_GRAFANA_LOKI_USER=""),
+                    dict(self.env(), INGEST_GRAFANA_TOKEN="")):
+            with self.assertRaises(sg.ShipError):
+                self.logs_only(f, job="cowlic-bootstrap", env=env)
+        self.assertEqual(f.requests, [])
+        self.assertFalse(self.off.exists())
+
     def test_main_logs_only_needs_no_last_run(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out), mock.patch.object(sg, "ship_logs_only") as m, \

@@ -327,8 +327,10 @@ something bootstrap does silently.
 - Log: what bootstrap itself writes (status, session summaries, progress file, result JSON) holds no secret, no Last.fm
   user name, no artist names and no track titles. The shared engine does write names and titles into the log and the
   terminal: `artist <name>: ...`, `ingested: <artist> - <title>`, `dry-run would ingest: <artist> - <title>`,
-  `ERROR <artist> - <title>` [V, `run_lastfm` and `run` on master]. `bootstrap.log` is local, 0600 and never shipped (the
-  wrapper's `ship_grafana --filter` only redacts secrets). A title filter would be a separate ticket (see 2.9). [R] whether
+  `ERROR <artist> - <title>` [V, `run_lastfm` and `run` on master]. `bootstrap.log` is local and 0600; since #244 the
+  wrapper also ships it, redacted and logs only, to Grafana Cloud Loki as `job="cowlic-bootstrap"`, names included,
+  exactly as the nightly ships `ingest.log` (owner request 2026-10-11; see 4.7 and `bootstrap.md` section 5). A title
+  filter would be a separate ticket (see 2.9). [R] whether
   the owner wants artist names out of the bootstrap log too: not asked yet.
 - Exit codes: `bootstrap.py` 0 ok (a cap or time stop is NOT a failure), 1 some track or artist failed, 2 bad usage,
   missing caps, no ranking, bad config, 3 sign-in stop [V for 0/1/2/3 as ingest's codes, local-ingest.md "Exit
@@ -358,8 +360,9 @@ Where the code settled a point this page left open (the code and `ingest/test_bo
   completed, cut, failed, not_started, parked, unusable). It is written only once the session got past the lock, the guard
   and the checks (no file for exit 2, 75 or 78).
 - The engine's per-track log lines (`ingested: <artist> - <title>`) are those of `run()` and are not changed or filtered;
-  `bootstrap.log` is never shipped. What bootstrap itself writes (status, summaries, progress, result) holds no names
-  and no titles.
+  `bootstrap.log` is shipped to Loki as `job="cowlic-bootstrap"` since #244 (logs only, same redaction and same
+  names as the nightly's `ingest.log`). What bootstrap itself writes (status, summaries, progress, result) holds no
+  names and no titles.
 
 ## 3. What is shared and what is separate
 
@@ -371,7 +374,7 @@ Where the code settled a point this page left open (the code and `ingest/test_bo
 | Status file | `bootstrap-last-run.json` | `last-run.json` |
 | State | `bootstrap-state.json`, `bootstrap-progress.json`, `bootstrap-ranking.json` | `ingest-state.json` (+ the new-release state file, section 4.5; reads `bootstrap-ranking.json` only) |
 | Config | local file via `--config` | `sources.yml` in the repo |
-| Grafana push | none in v1 | yes, `ship_grafana.py` |
+| Grafana push | logs only, live, `job="cowlic-bootstrap"` (#244); no metrics | logs and metrics, `job="cowlic-ingest"` |
 | Last.fm ranking | computed once by `rank`, stored | never |
 | Engine code | shared: dedupe, matcher, download, upload, D1, pacing, cooldowns, sign-in stop | same |
 | D1 and Telegram | same library, same `existing` and cross-source dedupe against stored rows | same |
@@ -527,7 +530,9 @@ about a minute [R, the figure local-ingest.md and the unit comment use]. The rea
 
 The nightly wrapper ships `ingest.log` lines to Grafana Cloud Loki [V, local-ingest.md "Shipping the run log"].
 The engine's `run_lastfm` logs `artist <name>: ...` lines for the Last.fm source [V, master], which is fine for
-the never-shipped `bootstrap.log` but would send the owner's taste to a third party from the nightly. Requirement
+`bootstrap.log` (which since #244 is shipped to the owner's own Loki as `job="cowlic-bootstrap"`, a decision of the
+owner for the session he starts, not for the unattended nightly) but would send the owner's taste from the nightly
+without his watching. Requirement
 for #171/#172 [P]: the new-release phase writes counts and hashed keys only to `ingest.log` (due, checked,
 with_new, added, failed; the 16-hex key), no artist and no release names; it must not reuse the artist-name log
 lines of the Last.fm engine. If the owner wants the phase to log names, that is a question for #165, not a
@@ -570,9 +575,12 @@ default.
 - **Separate log and status.** `bootstrap.log` (same rotation and redaction rules as `ingest.log`) and
   `bootstrap-last-run.json` (started_at, finished_at, exit_code, stop reason, counts; valid JSON always) (#169).
   The bootstrap wrapper never writes or touches `last-run.json` or `ingest.log`. [P]
-- **No Grafana push from bootstrap in v1.** The wrapper never calls `ship_grafana.py`, so the dashboard
-  "Last run" panels stay about the 21:10 run [V that the panels are built from `last-run.json` metrics, local-ingest.md
-  "Dashboard"]. Bootstrap progress is read from `status`, the status file and the log. [P]
+- **Grafana from bootstrap: logs only (#244, replaces "no push in v1").** The wrapper ships the session log live to Loki
+  under `job="cowlic-bootstrap"` with `ship_grafana.py --logs-only` (run and plan only; best effort; the same three Loki
+  keys; no new secret). It never pushes metrics and never passes `last-run.json`, so the dashboard "Last run" panels
+  stay about the 21:10 run [V that the panels are built from `last-run.json` metrics, local-ingest.md "Dashboard"].
+  Query: `{job="cowlic-bootstrap"}`. Bootstrap progress is also read from `status` and the status file. A locked or
+  refused invocation ships nothing. [V, `scripts/test-run-bootstrap-local.sh`]
 - **Not shared:** the bootstrap state and progress files; `ingest-state.json`; the new-release state file
   belongs to the nightly only. **One-way shared:** the ranking file is written by bootstrap (`rank`) and READ by
   the nightly phase to get its artist set; the atomic rename makes a read during `rank --refresh` safe. The
