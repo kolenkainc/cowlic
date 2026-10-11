@@ -24,3 +24,4 @@ CREATE TABLE tracks (
   tg_message_id INTEGER NOT NULL
 );
 CREATE INDEX idx_tracks_album ON tracks(album_id);
+-- throwaway ci verification #212
