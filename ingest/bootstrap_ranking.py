@@ -41,7 +41,7 @@ import lastfm
 from lastfm import _MBID, clean_text
 from match import normalize
 
-VERSION = 1
+VERSION = 1  # bump it when the stored fields or the tie-break rule (match.normalize) change: load checks the order
 FILE_NAME = "bootstrap-ranking.json"
 MAX_BYTES = 1024 * 1024  # a bigger file is not ours: the biggest valid one (1000 artists) is about 0.3 MB
 MAX_PLAYCOUNT = 10 ** 12  # lastfm._COUNT allows 12 digits
