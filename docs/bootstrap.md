@@ -465,3 +465,56 @@ unusable cooldown file, 3 sign-in stop, 75 locked, 78 guard or wrapper usage.
 - Not run by the author: every command of this section. The tests (`ingest/test_bootstrap_covers.py`,
   `scripts/test-run-bootstrap-local.sh`) use fakes and an in-memory SQLite copy of the real schema; no D1, Telegram,
   YouTube or Loki call was made.
+
+## 12. Scheduled mode: a session every 2 hours (#279)
+
+Instead of starting each session by hand, a user timer can start one every 2 hours. Hand-started sessions stay possible:
+the lock (shared with the 21:10 run) makes them mutually exclusive, the scheduled run then exits 75 and skips quietly.
+
+**Files.** `deploy/systemd/cowlic-bootstrap.timer` and `cowlic-bootstrap.service` (repo copies, same style as the nightly
+pair) and the launcher `scripts/run-bootstrap-scheduled.sh`. Installing the units into `~/.config/systemd/user/` and
+enabling the timer is an owner step (like #175, ticket #280); agents do not do it.
+
+**Timing.** First run 2 minutes after the timer becomes active, then 2 hours after the previous run FINISHED
+(`OnUnitInactiveSec=2h`, not wall-clock), `Persistent=false` (no catch-up after sleep), `RandomizedDelaySec=60`. The service is
+`Type=oneshot` with `TimeoutStartSec=2h`, no `Restart=`. The 2-hour interval is a unit setting. Spacing sessions adds about
+20 minutes of idle per cycle and each session pays about 2 minutes of Last.fm enumeration for the resumed artist; whether
+the gentler pattern lowers the 403 rate is NOT measured.
+
+**What the launcher does** (it takes no arguments):
+
+1. Halt marker present: exit 0 with "halted ...". Done marker present: exit 0 with "bootstrap is done".
+2. Computes the largest `--max-minutes` that passes the wrapper's 21:10 guard (now + minutes + 10 min margin + 60 s < next
+   21:10 local time), at most 100. Fewer than 15 minutes fit (roughly 19:30 to 21:10 daily): one log line, exit 0, nothing
+   started. `--max-new` is 4 per minute, at most 400.
+3. Runs `scripts/run-bootstrap-local.sh run --max-new N --max-minutes M`. The wrapper is unchanged: lock, guard,
+   redaction, `bootstrap-last-run.json`, Grafana logs (`job=cowlic-bootstrap`).
+4. Reads the outcome:
+   - exit 3 (YouTube sign-in challenge): writes the halt marker and exits 1 (the unit shows `failed` once). No retry, no
+     loop, no cookies or other workaround (rule #62).
+   - exit 75: quiet skip. Exit 78 when the time no longer fits (re-checked): skip. Any other 78 is a failure.
+   - any other non-zero exit that added no track: counted; after `COWLIC_BOOTSTRAP_MAX_FAILS` (default 3) consecutive such
+     sessions the halt marker is written and the launcher exits 1. A non-zero exit that DID add tracks (routine: failed
+     tracks make the engine exit 1) resets the counter. An ok session resets it too.
+   - exit 0 with stop reason `done` (every ranked artist done, parked or excluded): writes the done marker.
+
+**Markers** are in the state directory (`${XDG_STATE_HOME:-$HOME/.local/state}/cowlic/`), mode 0600, text with a time and a
+reason, never a name:
+
+| File | Meaning | Clear it |
+|---|---|---|
+| `bootstrap-halt` | A sign-in challenge or repeated failures; scheduled runs do nothing | Read the log first (`bootstrap.log`, `bootstrap-last-run.json`, `journalctl --user -u cowlic-bootstrap`), then `rm "${XDG_STATE_HOME:-$HOME/.local/state}/cowlic/bootstrap-halt"` |
+| `bootstrap-done` | Bootstrap finished | `rm` it only to resume on purpose (for example after a ranking refresh) |
+| `bootstrap-fails` | Consecutive-failure counter | Removed by the launcher on success |
+
+The launcher's own lines go to the journal (`journalctl --user -u cowlic-bootstrap.service`), the session output to
+`bootstrap.log` and Grafana as before.
+
+**Stop the timer** (when done, or any time): `systemctl --user disable --now cowlic-bootstrap.timer`. A running session
+is not killed by that; stop it with `systemctl --user stop cowlic-bootstrap.service` (the wrapper stops its process group).
+When done, optionally look at the covers once: `scripts/run-bootstrap-local.sh covers --count`.
+
+**Tests:** `scripts/test-run-bootstrap-scheduled.sh` (stubbed wrapper, fake clock, offline; time-fit arithmetic around
+21:10 including the day boundary and DST days of Europe/Berlin, breaker, failure halt, done, exit 75/78, no secrets, and
+mutation checks: breaker removed, fit margin off, retry on exit 3, failure halt removed).
+Not run by the author: the units under systemd and a real scheduled session.
