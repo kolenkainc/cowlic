@@ -3,8 +3,17 @@ main = "src/index.ts"
 compatibility_date = "2026-10-01"
 preview_urls = false
 
+# Workers Logs. SECURITY: invocation_logs = false is mandatory. An invocation log stores the request URL and Subsonic
+# clients send reusable credentials in its query (u, t, s). Only the explicit console logs of src/log.ts are stored
+# (route name, status, error class). The local gitignored wrangler.local.toml needs the same block for manual deploys.
 [observability]
 enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = false
 
 [[d1_databases]]
 binding = "DB"
