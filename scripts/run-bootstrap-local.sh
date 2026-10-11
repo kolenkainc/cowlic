@@ -31,8 +31,16 @@
 # - bootstrap-last-run.json next to it: removed at the start of a session (after the lock and the guard), so a killed
 #   wrapper leaves none; written after EVERY invocation that got past the lock and the guard (started_at,
 #   finished_at, subcommand, exit_code, stop_reason, log_file, result = bootstrap.py's --result-json object or null).
-#   Always valid JSON, atomic, 0600. NEVER touches last-run.json or ingest.log and never calls ship_grafana.py for
-#   shipping (only its --filter mode): no Grafana push, the owner is informed through the log only.
+#   Always valid JSON, atomic, 0600. NEVER touches last-run.json or ingest.log.
+# - Grafana (#244, run and plan only): the redacted session log is shipped LIVE to Grafana Cloud Loki under the job label
+#   cowlic-bootstrap, LOGS ONLY (ship_grafana.py --logs-only: no run_summary, no Influx push, no cowlic_ingest_* series,
+#   nothing from last-run.json). A background loop ships the new complete lines every COWLIC_BOOTSTRAP_SHIP_INTERVAL seconds
+#   (default 20; offset kept in .bootstrap-ship.offset) and once more at the end (--final), exactly like
+#   run-lastfm-report.sh. What is shipped is the whole session log as the nightly ships ingest.log: the lines the shared
+#   engine writes (artist and track names included), redacted (LASTFM_API_KEY, the Grafana token, COWLIC_EXTRA_SECRET).
+#   Best effort: timeout, stdin closed, lock descriptor not inherited, result ignored: it never changes the exit code,
+#   the lock handling or the signal handling. The Loki keys (names only) come from .env, read by the shipper itself; when
+#   they are missing the shipper says so and sends nothing. A locked, refused or usage-failed invocation ships nothing.
 # - Exit code: bootstrap.py's own (0 ok, 1 failed, 2 usage, 3 YouTube sign-in stop); 128+N when interrupted by signal N.
 #   Wrapper: 75 locked, 78 prerequisite/usage/guard.
 # - The child and its helpers run in their own process group; they are stopped when the wrapper ends or gets a signal.
@@ -105,11 +113,20 @@ LAST_RUN="$STATE_DIR/bootstrap-last-run.json"
 RESULT="$STATE_DIR/.bootstrap-result.json"  # written by bootstrap.py run (--result-json), read into last-run, removed
 VENV_PY="$ROOT/ingest/.venv/bin/python"
 BOOTSTRAP="$ROOT/ingest/bootstrap.py"
-SHIP="$ROOT/ingest/ship_grafana.py"  # only its --filter mode is used
+SHIP="$ROOT/ingest/ship_grafana.py"  # --filter (redaction) and, for run and plan, --logs-only shipping (see the header)
+OFFSET_FILE="$STATE_DIR/.bootstrap-ship.offset"
+SHIP_JOB="cowlic-bootstrap"
 LOG_MAX_BYTES="${COWLIC_LOG_MAX_BYTES:-5242880}"
 LOG_KEEP="${COWLIC_LOG_KEEP:-5}"
 case "$LOG_MAX_BYTES" in '' | *[!0-9]*) LOG_MAX_BYTES=5242880 ;; esac
 case "$LOG_KEEP" in '' | *[!0-9]* | 0*) LOG_KEEP=5 ;; esac
+# positive integers only, sane maxima (timeout 0 would mean no limit)
+SHIP_TIMEOUT_S="${COWLIC_SHIP_TIMEOUT:-30}"
+case "$SHIP_TIMEOUT_S" in '' | *[!0-9]* | 0*) SHIP_TIMEOUT_S=30 ;; esac
+[ "${#SHIP_TIMEOUT_S}" -le 3 ] && [ "$SHIP_TIMEOUT_S" -le 120 ] || SHIP_TIMEOUT_S=30
+SHIP_INTERVAL="${COWLIC_BOOTSTRAP_SHIP_INTERVAL:-20}"
+case "$SHIP_INTERVAL" in '' | *[!0-9]* | 0*) SHIP_INTERVAL=20 ;; esac
+[ "${#SHIP_INTERVAL}" -le 4 ] && [ "$SHIP_INTERVAL" -le 3600 ] || SHIP_INTERVAL=20
 
 now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { printf '%s run-bootstrap-local: %s\n' "$(now_utc)" "$*" | tee -a "$LOG"; }
@@ -164,6 +181,9 @@ write_last_run() { # exit_code
 
 PIPE_PID=""
 WATCH_PID=""
+TICK_PID=""
+SHIP_ON=0  # 1 only for run and plan, after the child was started
+LOG_OFFSET=0
 INTERRUPTED=0
 stop_group() { # pid: stop the process group led by this job
   [ -n "${1:-}" ] || return 0
@@ -171,9 +191,28 @@ stop_group() { # pid: stop the process group led by this job
   wait "$1" 2> /dev/null
   return 0
 }
-cleanup() { trap - EXIT; stop_group "$WATCH_PID"; stop_group "$PIPE_PID"; rm -f "$RESULT"; }
+cleanup() { trap - EXIT; stop_group "$TICK_PID"; stop_group "$WATCH_PID"; stop_group "$PIPE_PID"; rm -f "$RESULT" "$OFFSET_FILE"; }
 on_signal() { INTERRUPTED=$((128 + $1)); stop_group "$PIPE_PID"; }
-finish() { local rc="$1"; write_last_run "$rc"; rm -f "$RESULT"; exit "$rc"; }
+finish() { local rc="$1"; write_last_run "$rc"; rm -f "$RESULT"; ship_final; exit "$rc"; }
+
+# One shipper call (logs only, job label cowlic-bootstrap, saved offset). Never changes anything: timeout, stdin closed,
+# lock fd not inherited, stderr dropped, result ignored. COWLIC_EXTRA_SECRET (if set) reaches it through the environment.
+ship_call() { # extra shipper flags
+  timeout -k 2 "$SHIP_TIMEOUT_S" "$VENV_PY" "$SHIP" --logs-only --job "$SHIP_JOB" \
+    --log "$LOG" --offset "$LOG_OFFSET" --offset-file "$OFFSET_FILE" "$@" < /dev/null 9>&- 2> /dev/null
+}
+# Final push of whatever is left (also an unfinished last line); only its first status line is kept, reduced to a
+# harmless character set, and logged. Does nothing unless the session was started. Never changes the exit code.
+ship_final() {
+  [ "$SHIP_ON" = 1 ] || return 0
+  SHIP_ON=0
+  local out line
+  out="$(ship_call --final)" || out=""
+  rm -f "$OFFSET_FILE"
+  line="$(printf '%s\n' "$out" | head -n 1 | LC_ALL=C tr -cd 'A-Za-z0-9 .:,()_=*/-' | cut -c1-160)"
+  case "$line" in grafana:*) log "$line" ;; esac
+  return 0
+}
 
 # ---- state dir and lock ------------------------------------------------------------------------------------------
 if ! mkdir -p "$STATE_DIR" || ! chmod 700 "$STATE_DIR"; then
@@ -220,6 +259,16 @@ STARTED_AT="$(now_utc)"
 rm -f "$RESULT"
 rm -f "$LAST_RUN"  # a kill -9 (no trap runs) must not leave the previous run's record looking like this session's
 rotate_log
+case "$SUB" in
+  run | plan) # shipping starts at this session's first line (rotation happens only here, under the lock)
+    rm -f "$OFFSET_FILE"
+    LOG_OFFSET="$({ wc -c < "$LOG"; } 2> /dev/null)" || LOG_OFFSET=0
+    case "$LOG_OFFSET" in '' | *[!0-9]*) LOG_OFFSET=0 ;; esac
+    # a session killed mid-line left no newline: end that line first, or the offset would not be at a line start
+    if [ "$LOG_OFFSET" -gt 0 ] && [ "$(tail -c 1 "$LOG" | od -An -tx1 | tr -d ' ')" != 0a ]; then
+      printf '\n' >> "$LOG" && LOG_OFFSET=$((LOG_OFFSET + 1))
+    fi ;;
+esac
 log "start: $SUB (arguments are not logged; --max-new ${MAX_NEW:-none}, --max-minutes ${MAX_MINUTES:-none})"
 
 if [ ! -x "$VENV_PY" ] || [ ! -f "$BOOTSTRAP" ] || [ ! -f "$SHIP" ]; then
@@ -260,10 +309,37 @@ EXTRA=()
   exit "${PIPESTATUS[0]}"
 } 9>&- &
 PIPE_PID=$!
+WRAPPER_PID=$$
+
+# The live shipper (run and plan): its own process group, output dropped. It exits by itself as soon as the wrapper is
+# gone (kill -0 before every one-second sleep step and before every push), so even a kill -9 of the wrapper ends it within
+# about a second. Nothing here can change the session: it only reads the log. It does not hold the lock descriptor.
+case "$SUB" in
+  run | plan)
+    SHIP_ON=1
+    (
+      warned=0
+      while :; do
+        n=0
+        while [ "$n" -lt "$SHIP_INTERVAL" ]; do
+          kill -0 "$WRAPPER_PID" 2> /dev/null || exit 0
+          sleep 1
+          n=$((n + 1))
+        done
+        kill -0 "$WRAPPER_PID" 2> /dev/null || exit 0
+        out="$(ship_call)"
+        case "$out" in
+          *"secret found"*) # the final guard refused the body (e.g. a very short secret): say it once, on the terminal
+            [ "$warned" = 1 ] || echo "run-bootstrap-local: WARN grafana shipping refused by the secret guard; nothing is shipped" >&2
+            warned=1 ;;
+        esac
+      done
+    ) < /dev/null > /dev/null 9>&- &
+    TICK_PID=$! ;;
+esac
 
 # Watchdog: it keeps the lock descriptor on purpose. When the wrapper is gone (kill -9: no trap runs) it stops the group
 # (TERM, KILL after 10 s) and only then lets the lock go. It is stopped by cleanup on every normal end.
-WRAPPER_PID=$$
 (
   while kill -0 "$WRAPPER_PID" 2> /dev/null; do sleep 1; done
   kill -TERM -- "-$PIPE_PID" 2> /dev/null
@@ -282,6 +358,8 @@ if [ "$INTERRUPTED" != 0 ]; then
 fi
 stop_group "$WATCH_PID"
 WATCH_PID=""
+stop_group "$TICK_PID"
+TICK_PID=""
 PIPE_PID=""
 
 log "finished: exit code $rc, $(describe_exit "$rc")"

@@ -85,8 +85,9 @@ Files bootstrap creates (names only; no contents are described or shown here) in
 | `bootstrap-last-run.json` | the wrapper | Result of the last invocation (section 5) |
 | `ingest.lock` | wrapper and nightly | The ONE lock shared with the 21:10 timer |
 
-There is NO Grafana push from bootstrap: the dashboard keeps meaning the 21:10 run. Progress is read from `status`,
-`bootstrap-last-run.json` and `bootstrap.log`. The wrapper never touches `ingest.log` or `last-run.json`.
+Bootstrap ships LOGS ONLY to Grafana Cloud Loki (#244), see section 5: no metrics, no Influx push, no
+`cowlic_ingest_*` series, so the `cowlic-ingest` dashboard keeps meaning the 21:10 run. Progress is read from `status`,
+`bootstrap-last-run.json`, `bootstrap.log` and, live, from Loki. The wrapper never touches `ingest.log` or `last-run.json`.
 
 ## 2. Order of steps
 
@@ -144,7 +145,7 @@ from the first sessions].
 - **The lock.** If the timer's run (or another session) holds `ingest.lock`, the wrapper exits **75** at once with one
   stderr line and does nothing. Start the session after the 21:10 run finished. The reverse also holds: if a session is
   still running at 21:10, the timer's run exits 75 and does nothing that night. A night lost to the lock leaves NO
-  record in `ingest.log`, `last-run.json` or Grafana (the locked invocation touches none of them), and the dashboard
+  record in `ingest.log`, `last-run.json` or Grafana (the locked invocation touches none of them and ships nothing), and the dashboard
   only flags more than 14 days without a run. The next night continues and nothing is lost but that one night. Whether
   systemd catches up a run that exited 75 is [R], not verified; do not count on it.
 - **Things the guard cannot see.** The timer has `Persistent=true`: after a sleep, wake or login the nightly run can
@@ -221,10 +222,49 @@ step; start the next session when you want to continue.
 ## 5. Reading `bootstrap-last-run.json` and `bootstrap.log`
 
 Both are in the state directory. The log holds the output of every invocation that got past the lock and the guard
-(secrets redacted by `ingest/ship_grafana.py --filter`, which is used for redaction only: nothing is shipped). The
-engine writes artist names and track titles into it (`artist <name>: ...`, `ingested: <artist> - <title>`), so the log
-is local, mode 0600, and never shipped; do not paste it into a ticket. What bootstrap itself writes (status, summaries,
-the progress and result files) holds no names and no titles.
+(secrets redacted by `ingest/ship_grafana.py --filter`). The engine writes artist names and track titles into it
+(`artist <name>: ...`, `ingested: <artist> - <title>`), so the file is local and mode 0600; do not paste it into a
+ticket. What bootstrap itself writes (status, summaries, the progress and result files) holds no names and no titles.
+
+### Grafana Loki (logs only)
+
+`run` and `plan` also ship the session log to your Grafana Cloud Loki, live, under the label `job="cowlic-bootstrap"`
+(`rank` and `status` ship nothing). Nothing else is sent: no `run_summary` line, no Influx push, no `cowlic_ingest_*`
+series, nothing from `bootstrap-last-run.json`.
+
+- **What is shipped (decision of #244).** The whole session log from the wrapper's `start:` line to its `finished:` line,
+  exactly as the nightly ships `ingest.log` (the nightly log carries the same engine lines for playlists, with names):
+  the shared engine's lines with artist names and track titles (`artist <name>: ...`, `ingested: <artist> - <title>`,
+  `dry-run would ingest: ...`, `ERROR <artist> - <title>: ...`), the wrapper's own lines and bootstrap's summaries. No
+  stricter and no weaker filter than the nightly's. Secrets are redacted before the line reaches the log and again by
+  the shipper: `LASTFM_API_KEY`, the Grafana token, and `COWLIC_EXTRA_SECRET` (put the Last.fm user name there). Your
+  listening data goes to your own Grafana Cloud only. This differs from the earlier design for the ongoing phase
+  (`bootstrap-ongoing.md` 4.7: counts and hashed keys only in what the NIGHTLY ships): that rule stays for the nightly
+  new-release phase; bootstrap is a session you start and watch, and the owner asked for the readable log.
+- **Keys** (names only, in `.env`, read by the shipper): `INGEST_GRAFANA_LOKI_URL`, `INGEST_GRAFANA_LOKI_USER`,
+  `INGEST_GRAFANA_TOKEN`; no new secret. With any of them missing or empty the shipper logs `grafana: not configured`
+  once at the end and sends nothing.
+- **Live.** Every 20 seconds (`COWLIC_BOOTSTRAP_SHIP_INTERVAL`) the new complete lines are pushed (at most 256 KiB per
+  push), and once more at the end including an unfinished last line. Best effort: 30 s limit per push
+  (`COWLIC_SHIP_TIMEOUT`), no retry loop, an unreachable Loki or a bad token never changes the exit code, the lock, the
+  guard or the signal handling of the wrapper. The last status line (`grafana: loki push ok (HTTP 204)`, or the failure
+  class) is appended to `bootstrap.log` after the `finished:` line. A locked (75), refused (78) or usage-failed
+  invocation ships nothing.
+- **Watch a session.** Grafana, Explore, the Loki data source of your stack, time range the last 15 minutes while it runs:
+
+```logql
+{job="cowlic-bootstrap"}                                      # the whole session, newest last
+{job="cowlic-bootstrap", level=~"warn|error"}                 # problems only
+{job="cowlic-bootstrap"} |= "finished:"                       # one line per finished invocation, with its exit code
+```
+
+  A new session starts with the line `run-bootstrap-local: start: run ...`. The `level` label is set by the shipper from a
+  leading `ERROR` or `WARN` token (the engine's lines); the wrapper's own `run-bootstrap-local: ERROR ...` lines stay
+  `info` (the shipper only knows the nightly prefix), so search them with `|= "ERROR"`.
+- **Dashboard.** `deploy/grafana/cowlic-ingest-dashboard.json` is unchanged (its `Last.fm report (live, logs only)`
+  panel is the model). Proposal, not done here: one additive logs panel `Bootstrap session (live, logs only)` with the
+  query `{job="cowlic-bootstrap"}` next to that panel; it is optional, Explore is enough for a session you start
+  yourself.
 
 `bootstrap-last-run.json` is removed and rewritten by EVERY wrapper invocation that gets past the lock and the guard,
 including `status`, `rank` and `plan`: a wrapper `status` after a `run` replaces the session's result with

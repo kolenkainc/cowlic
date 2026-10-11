@@ -36,12 +36,37 @@ SH
   cat > "$R/ingest/.venv/bin/python" <<'PY'
 #!/bin/sh
 [ "${1:-}" != -I ] || exec python3 "$@"  # the wrapper validates the result JSON with `python -I -c ...`
+case "${1:-}" in */ship_grafana.py) set -- -u "$@" ;; esac  # the shipping calls come without -u: same position as the filter
 case "${2:-}" in
-  */ship_grafana.py)  # the redaction filter (the wrapper must only ever call it with --filter)
-    echo "$*" >> "$STUB_FILTER_ARGS"
-    echo "lock-held=${COWLIC_LOCK_HELD-unset}" >> "$STUB_FILTER_ARGS.env"
-    [ ! -e /proc/self/fd/9 ] || echo leaked >> "$STUB_FILTER_ARGS.fd9"
-    if [ -n "${COWLIC_EXTRA_SECRET:-}" ]; then exec sed -u "s/$COWLIC_EXTRA_SECRET/***/g"; else exec cat; fi ;;
+  */ship_grafana.py)
+    case " $* " in
+      *" --filter "*)  # the redaction filter
+        echo "$*" >> "$STUB_FILTER_ARGS"
+        echo "lock-held=${COWLIC_LOCK_HELD-unset}" >> "$STUB_FILTER_ARGS.env"
+        [ ! -e /proc/self/fd/9 ] || echo leaked >> "$STUB_FILTER_ARGS.fd9"
+        if [ -n "${COWLIC_EXTRA_SECRET:-}" ]; then exec sed -u "s/$COWLIC_EXTRA_SECRET/***/g"; else exec cat; fi ;;
+    esac
+    # the stub SHIPPER (logs-only calls): records its arguments; a --final call also copies what a real push would
+    # carry (the log from --offset on) into STUB_SHIPPED, so the test can look at the shipped bytes
+    echo "$*" >> "$STUB_SHIP_CALLS"
+    echo "lock-held=${COWLIC_LOCK_HELD-unset}" >> "$STUB_SHIP_CALLS.env"
+    [ ! -e /proc/self/fd/9 ] || echo leaked >> "$STUB_SHIP_CALLS.fd9"
+    case " $* " in
+      *" --final "*)
+        off=""; lg=""; prev=""
+        for a in "$@"; do
+          [ "$prev" = --offset ] && off="$a"
+          [ "$prev" = --log ] && lg="$a"
+          prev="$a"
+        done
+        tail -c +"$((off + 1))" "$lg" >> "$STUB_SHIPPED" ;;
+    esac
+    case "${STUB_SHIP:-ok}" in
+      ok) echo "grafana: loki push ok (HTTP 204)"; exit 0 ;;
+      fail) echo "grafana: boom"; exit 1 ;;
+      kill) kill -9 $$ ;;
+      hang) sleep 12; exit 0 ;;
+    esac ;;
   */bootstrap.py)
     shift 2  # -u and the script
     printf '%s\n' "$@" > "$STUB_ARGS"  # one argument per line
@@ -61,12 +86,13 @@ PY
   chmod +x "$R/scripts/"*.sh "$R/ingest/.venv/bin/python"
   : > "$R/ingest/bootstrap.py"; : > "$R/ingest/ship_grafana.py"  # the wrapper only checks that they exist
   export STUB_ARGS="$C/args" STUB_FILTER_ARGS="$C/filter_args" STUB_PREREQ_ARGS="$C/prereq_args"
+  export STUB_SHIP_CALLS="$C/ship_calls" STUB_SHIPPED="$C/shipped"
 }
 run() { rc=0; XDG_STATE_HOME="$S" bash "$R/scripts/run-bootstrap-local.sh" "$@" > "$C/out" 2>&1 || rc=$?; }
 LOGF() { echo "$S/cowlic/bootstrap.log"; }
 nothing_started() { [ ! -e "$STUB_ARGS" ] && [ ! -e "$S/cowlic/bootstrap.log" ] && [ ! -e "$S/cowlic/bootstrap-last-run.json" ] && echo 0 || echo 1; }
 
-# 1. success path: forwarding, lock handoff, redaction, own files, nightly files untouched, no Grafana push
+# 1. success path: forwarding, lock handoff, redaction, own files, nightly files untouched, logs-only Grafana shipping
 new_case ok
 mkdir -p "$S/cowlic"
 printf 'nightly log line\n' > "$S/cowlic/ingest.log"; printf '{"nightly": true}\n' > "$S/cowlic/last-run.json"
@@ -81,7 +107,7 @@ assert "child does not hold the lock fd 9" "$([ ! -e "$STUB_ARGS.fd9" ] && echo 
 assert "the filter does not see COWLIC_LOCK_HELD" "$(has '^lock-held=unset$' "$STUB_FILTER_ARGS.env")"
 assert "the prerequisites script does not see COWLIC_LOCK_HELD" "$(has '^lock-held=unset$' "$STUB_PREREQ_ARGS.env")"
 assert "the filter does not hold fd 9" "$([ ! -e "$STUB_FILTER_ARGS.fd9" ] && echo 0 || echo 1)"
-assert "the shipper script is only ever called with --filter" "$([ "$(grep -vc -- '--filter' "$STUB_FILTER_ARGS" || true)" = 0 ] && echo 0 || echo 1)"
+assert "the filter is only ever called with --filter" "$([ "$(grep -vc -- '--filter' "$STUB_FILTER_ARGS" || true)" = 0 ] && echo 0 || echo 1)"
 assert "prereqs called with --deno-optional" "$(has '--deno-optional' "$STUB_PREREQ_ARGS")"
 assert "log has the output (stdout and stderr)" "$(has 'stub error on stderr' "$(LOGF)")"
 assert "user name redacted in the log" "$(hasnt "$USERNAME_SECRET" "$(LOGF)")"
@@ -266,6 +292,72 @@ assert "SIGKILL: the previous bootstrap-last-run.json is gone, not mistaken for 
 assert "SIGKILL: lock released afterwards" "$(flock -n "$S/cowlic/ingest.lock" true && echo 0 || echo 1)"
 pkill -f -- "sleep $MARK" 2> /dev/null || true
 
+# 10b. Grafana shipping (#244): logs only, job cowlic-bootstrap, live, best effort; locked or refused runs ship nothing
+CANARY_KEY="SENTINEL_LASTFM_API_KEY_123"; CANARY_TOKEN="SENTINEL_GRAFANA_TOKEN_456"
+new_case ship; mkdir -p "$S/cowlic"; printf 'OLD SESSION LINE\n' > "$S/cowlic/bootstrap.log"
+printf '{"nightly": true}\n' > "$S/cowlic/last-run.json"; printf 'nightly\n' > "$S/cowlic/ingest.log"
+STUB_RC=1; export STUB_RC
+COWLIC_EXTRA_SECRET="$USERNAME_SECRET" run run --max-new 3 --max-minutes 7
+unset STUB_RC
+assert "ship: exit code of the session is untouched" "$(is "$rc" 1)"
+assert "ship: every shipper call is logs-only with job cowlic-bootstrap" "$([ -s "$STUB_SHIP_CALLS" ] && [ "$(grep -vc -e '--logs-only --job cowlic-bootstrap ' "$STUB_SHIP_CALLS" || true)" = 0 ] && echo 0 || echo 1)"
+assert "ship: the calls carry an offset file and the last one is the final flush" "$([ "$(tail -n 1 "$STUB_SHIP_CALLS" | grep -c -e '--final')" = 1 ] && grep -q -e '--offset-file' "$STUB_SHIP_CALLS" && echo 0 || echo 1)"
+assert "ship: no metrics: no --last-run, --started-at or nightly job label in any call" "$(hasnt '--last-run\|--started-at\|cowlic-ingest\|PROM' "$STUB_SHIP_CALLS")"
+assert "ship: no secret or user name in the shipper's arguments" "$(hasnt "$USERNAME_SECRET\|$CANARY_KEY\|$CANARY_TOKEN" "$STUB_SHIP_CALLS")"
+assert "ship: the shipper does not hold the lock fd and does not see COWLIC_LOCK_HELD" "$([ ! -e "$STUB_SHIP_CALLS.fd9" ] && [ "$(grep -vc '^lock-held=unset$' "$STUB_SHIP_CALLS.env" || true)" = 0 ] && echo 0 || echo 1)"
+assert "ship: the shipped bytes start at this session (earlier log content is not shipped)" "$([ "$(has 'start: run' "$STUB_SHIPPED")" = 0 ] && [ "$(hasnt 'OLD SESSION LINE' "$STUB_SHIPPED")" = 0 ] && echo 0 || echo 1)"
+assert "ship: the shipped bytes hold the session output and the finished line" "$([ "$(has 'stub error on stderr' "$STUB_SHIPPED")" = 0 ] && [ "$(has 'finished: exit code 1' "$STUB_SHIPPED")" = 0 ] && echo 0 || echo 1)"
+assert "ship: the user name is not in the shipped bytes (redacted before the log)" "$(hasnt "$USERNAME_SECRET" "$STUB_SHIPPED")"
+assert "ship: the offset file is gone at the end" "$([ ! -e "$S/cowlic/.bootstrap-ship.offset" ] && echo 0 || echo 1)"
+assert "ship: nightly ingest.log and last-run.json untouched" "$([ "$(cat "$S/cowlic/ingest.log")" = nightly ] && [ "$(cat "$S/cowlic/last-run.json")" = '{"nightly": true}' ] && echo 0 || echo 1)"
+assert "ship: bootstrap-last-run.json has the same fields as before (exit_code 1, result null)" "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["exit_code"]==1 and d["result"] is None and set(d)=={"started_at","finished_at","subcommand","exit_code","stop_reason","log_file","result"}' "$S/cowlic/bootstrap-last-run.json" > /dev/null 2>&1 && echo 0 || echo 1)"
+assert "ship: the shipper's status line is logged" "$(has 'grafana: loki push ok' "$(LOGF)")"
+
+new_case ship-plan; run plan --max-new 1 --max-minutes 1
+assert "ship: plan ships as well" "$([ "$rc" = 0 ] && grep -q -e '--logs-only --job cowlic-bootstrap' "$STUB_SHIP_CALLS" && echo 0 || echo 1)"
+new_case ship-status; run status; run rank
+assert "ship: status and rank ship nothing" "$([ ! -e "$STUB_SHIP_CALLS" ] && echo 0 || echo 1)"
+
+for mode in fail kill; do
+  new_case "ship-$mode"; STUB_SHIP="$mode"; STUB_RC=3; export STUB_SHIP STUB_RC; run run --max-new 1 --max-minutes 1; unset STUB_SHIP STUB_RC
+  assert "ship $mode: exit code 3 unchanged and recorded" "$([ "$rc" = 3 ] && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["exit_code"]==3 and d["stop_reason"]=="sign-in"' "$S/cowlic/bootstrap-last-run.json" > /dev/null 2>&1 && echo 0 || echo 1)"
+done
+new_case ship-hang; STUB_SHIP=hang STUB_RC=5 COWLIC_SHIP_TIMEOUT=1 run run --max-new 1 --max-minutes 1
+assert "ship hang: cut by the timeout, exit code 5 unchanged" "$(is "$rc" 5)"
+new_case ship-ok0; run run --max-new 1 --max-minutes 1
+assert "ship: a clean session exits 0 and records 0" "$([ "$rc" = 0 ] && python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["exit_code"]==0' "$S/cowlic/bootstrap-last-run.json" > /dev/null 2>&1 && echo 0 || echo 1)"
+
+new_case ship-live; STUB_SLEEP=4 COWLIC_BOOTSTRAP_SHIP_INTERVAL=1 run run --max-new 1 --max-minutes 1
+assert "ship live: ticks (with the offset file, without --final) while the session runs, one final flush" "$([ "$(grep -vc -e '--final' "$STUB_SHIP_CALLS" || true)" -ge 2 ] && [ "$(grep -c -e '--final' "$STUB_SHIP_CALLS")" = 1 ] && echo 0 || echo 1)"
+
+new_case ship-interval; COWLIC_BOOTSTRAP_SHIP_INTERVAL=0 run run --max-new 1 --max-minutes 1
+assert "ship: an invalid interval falls back to the default (no tight loop)" "$([ "$rc" = 0 ] && [ "$(wc -l < "$STUB_SHIP_CALLS")" -le 2 ] && echo 0 || echo 1)"
+
+new_case ship-torn; mkdir -p "$S/cowlic"; printf 'torn line without newline' > "$S/cowlic/bootstrap.log"
+run run --max-new 1 --max-minutes 1
+assert "ship: a log that ends mid-line gets its line closed, the shipped part starts at a line start" "$([ "$(has 'start: run' "$STUB_SHIPPED")" = 0 ] && [ "$(hasnt 'torn line' "$STUB_SHIPPED")" = 0 ] && echo 0 || echo 1)"
+
+# nothing ships for refused, locked or failed-before-start invocations
+new_case ship-usage; run run
+assert "ship: usage error ships nothing" "$([ "$rc" = 78 ] && [ ! -e "$STUB_SHIP_CALLS" ] && echo 0 || echo 1)"
+new_case ship-guard; run run --max-new 1 --max-minutes 600
+assert "ship: guard refusal ships nothing" "$([ "$rc" = 78 ] && [ ! -e "$STUB_SHIP_CALLS" ] && echo 0 || echo 1)"
+new_case ship-lock; mkdir -p "$S/cowlic"
+( exec 9> "$S/cowlic/ingest.lock"; flock -n 9; exec sleep 3 ) 9> /dev/null &
+holder=$!; sleep 0.4
+run run --max-new 1 --max-minutes 1
+kill "$holder" 2> /dev/null || true; wait "$holder" 2> /dev/null || true
+assert "ship: locked invocation (75) ships nothing and creates no offset file" "$([ "$rc" = 75 ] && [ ! -e "$STUB_SHIP_CALLS" ] && [ ! -e "$S/cowlic/.bootstrap-ship.offset" ] && echo 0 || echo 1)"
+new_case ship-prereq; STUB_PREREQ_FAIL=1; export STUB_PREREQ_FAIL; run run --max-new 1 --max-minutes 1; unset STUB_PREREQ_FAIL
+assert "ship: failed prerequisites (78, session never started) ship nothing" "$([ "$rc" = 78 ] && [ ! -e "$STUB_SHIP_CALLS" ] && [ ! -e "$S/cowlic/.bootstrap-ship.offset" ] && echo 0 || echo 1)"
+
+# SIGTERM during a shipping session: 143, one final flush, no stray process (loop included), lock released
+new_case ship-term
+STUB_SLEEP=30 COWLIC_BOOTSTRAP_SHIP_INTERVAL=1 XDG_STATE_HOME="$S" bash "$R/scripts/run-bootstrap-local.sh" run --max-new 1 --max-minutes 1 > "$C/out" 2>&1 &
+wp=$!; sleep 2.5; kill -TERM "$wp"; rc=0; wait "$wp" || rc=$?; sleep 1
+assert "ship SIGTERM: exit 143, one final flush, no stray process, lock free" "$([ "$rc" = 143 ] && [ "$(grep -c -e '--final' "$STUB_SHIP_CALLS")" = 1 ] && [ -z "$(pgrep -f -- "$R/scripts/run-bootstrap-local.sh|$R/ingest/.venv/bin/python" || true)" ] && flock -n "$S/cowlic/ingest.lock" true && echo 0 || echo 1)"
+assert "ship SIGTERM: the finished line reached the shipped bytes" "$(has 'finished: exit code 143' "$STUB_SHIPPED")"
+
 # 11. mutation checks: break one rule at a time in a copy of the wrapper; the scenario that guards the rule must fail
 # on the mutant and pass on the original. A scenario prints 0 when the wrapper behaves correctly.
 sc_lock() {
@@ -276,7 +368,7 @@ sc_lock() {
   kill "$h" 2> /dev/null || true; wait "$h" 2> /dev/null || true
   [ "$rc" = 75 ] && [ ! -e "$STUB_ARGS" ] && echo 0 || echo 1
 }
-sc_fd9() { new_case "m-fd9-$RANDOM"; run run --max-new 1 --max-minutes 1; [ ! -e "$STUB_ARGS.fd9" ] && [ ! -e "$STUB_FILTER_ARGS.fd9" ] && echo 0 || echo 1; }
+sc_fd9() { new_case "m-fd9-$RANDOM"; run run --max-new 1 --max-minutes 1; [ ! -e "$STUB_ARGS.fd9" ] && [ ! -e "$STUB_FILTER_ARGS.fd9" ] && [ ! -e "$STUB_SHIP_CALLS.fd9" ] && [ -s "$STUB_SHIP_CALLS" ] && echo 0 || echo 1; }
 sc_held() { new_case "m-held-$RANDOM"; run run --max-new 1 --max-minutes 1; grep -qx 'lock-held=1' "$STUB_ARGS.env" && echo 0 || echo 1; }
 sc_heldleak() { new_case "m-leak-$RANDOM"; COWLIC_LOCK_HELD=1 run run --max-new 1 --max-minutes 1; grep -qx 'lock-held=unset' "$STUB_FILTER_ARGS.env" && grep -qx 'lock-held=unset' "$STUB_PREREQ_ARGS.env" && echo 0 || echo 1; }
 sc_guard() { new_case "m-guard-$RANDOM"; run run --max-new 1 --max-minutes 600; [ "$rc" = 78 ] && [ ! -e "$STUB_ARGS" ] && echo 0 || echo 1; }
@@ -287,6 +379,34 @@ sc_caps() { new_case "m-caps-$RANDOM"; run run; [ "$rc" = 78 ] && [ ! -e "$STUB_
 sc_range() { new_case "m-range-$RANDOM"; run run --max-new 1000001 --max-minutes 1; [ "$rc" = 78 ] && [ ! -e "$STUB_ARGS" ] && echo 0 || echo 1; }
 sc_rank_caps() { new_case "m-rk-$RANDOM"; run rank --max-new 5; [ "$rc" = 78 ] && [ ! -e "$STUB_ARGS" ] && echo 0 || echo 1; }
 sc_abbrev() { new_case "m-ab-$RANDOM"; run run --max-new 5 --max-minutes 5 --max-m 99999; [ "$rc" = 78 ] && echo 0 || echo 1; }
+sc_logsonly() { # every shipper call that is not the filter is logs-only, job cowlic-bootstrap, nothing of the nightly
+  new_case "m-lo-$RANDOM"; run run --max-new 1 --max-minutes 1
+  [ -s "$STUB_SHIP_CALLS" ] && [ "$(grep -vc -e '--logs-only --job cowlic-bootstrap ' "$STUB_SHIP_CALLS" || true)" = 0 ] \
+    && ! grep -q -e '--last-run' -e '--started-at' -e 'cowlic-ingest' "$STUB_SHIP_CALLS" && echo 0 || echo 1
+}
+sc_shipped_clean() { # what the shipper would send: this session only, no user name
+  new_case "m-sc-$RANDOM"; mkdir -p "$S/cowlic"; printf 'OLD SESSION LINE\n' > "$S/cowlic/bootstrap.log"
+  COWLIC_EXTRA_SECRET="$USERNAME_SECRET" run run --max-new 1 --max-minutes 1
+  grep -q 'start: run' "$STUB_SHIPPED" && ! grep -q "$USERNAME_SECRET" "$STUB_SHIPPED" && ! grep -q 'OLD SESSION LINE' "$STUB_SHIPPED" && echo 0 || echo 1
+}
+sc_ship_rc() { new_case "m-srl-$RANDOM"; STUB_SHIP=fail STUB_RC=3 run run --max-new 1 --max-minutes 1; [ "$rc" = 3 ] && echo 0 || echo 1; }
+sc_ship_timeout() {
+  new_case "m-sto-$RANDOM"; local t=$SECONDS
+  COWLIC_SHIP_TIMEOUT=1 STUB_SHIP=hang STUB_RC=5 run run --max-new 1 --max-minutes 1
+  [ "$rc" = 5 ] && [ $((SECONDS - t)) -lt 8 ] && echo 0 || echo 1
+}
+sc_only_run_plan() { new_case "m-orp-$RANDOM"; run status; run rank; [ ! -e "$STUB_SHIP_CALLS" ] && echo 0 || echo 1; }
+sc_live() {
+  new_case "m-live-$RANDOM"; STUB_SLEEP=4 COWLIC_BOOTSTRAP_SHIP_INTERVAL=1 run run --max-new 1 --max-minutes 1
+  [ "$(grep -vc -e '--final' "$STUB_SHIP_CALLS" || true)" -ge 2 ] && echo 0 || echo 1
+}
+sc_tick_orphan() { # after kill -9 of the wrapper the live loop must end by itself: no more shipper calls
+  new_case "m-orph-$RANDOM"; STUB_SLEEP=30 COWLIC_BOOTSTRAP_SHIP_INTERVAL=1 XDG_STATE_HOME="$S" bash "$R/scripts/run-bootstrap-local.sh" run --max-new 1 --max-minutes 1 > "$C/out" 2>&1 &
+  local w=$!; sleep 2.5; kill -9 "$w"; wait "$w" 2> /dev/null || true; sleep 3
+  local c1 c2; c1="$(wc -l < "$STUB_SHIP_CALLS")"; sleep 2.5; c2="$(wc -l < "$STUB_SHIP_CALLS")"
+  pkill -f -- "$R/scripts/run-bootstrap-local.sh" 2> /dev/null || true
+  [ "$c1" -ge 1 ] && [ "$c1" = "$c2" ] && echo 0 || echo 1
+}
 sc_nightly() {
   new_case "m-night-$RANDOM"; mkdir -p "$S/cowlic"; printf 'n\n' > "$S/cowlic/last-run.json"; printf 'n\n' > "$S/cowlic/ingest.log"
   run run --max-new 1 --max-minutes 1
@@ -324,6 +444,16 @@ mutation "rank accepts --max-*" sc_rank_caps 's/rank | status) usage_fail "\$SUB
 mutation "abbreviations accepted" sc_abbrev 's/\*) usage_fail "unknown or abbreviated --m\* option"/*) true/'
 mutation "nightly last-run.json overwritten" sc_nightly 's#^LAST_RUN="\$STATE_DIR/bootstrap-last-run.json"#LAST_RUN="$STATE_DIR/last-run.json"#'
 mutation "nightly log overwritten" sc_nightly 's#^LOG="\$STATE_DIR/bootstrap.log"#LOG="$STATE_DIR/ingest.log"#'
+mutation "shipping drops --logs-only" sc_logsonly 's/--logs-only --job "\$SHIP_JOB"/--job "$SHIP_JOB"/'
+mutation "shipping pushes metrics (--last-run, nightly job)" sc_logsonly 's/--logs-only --job "\$SHIP_JOB"/--logs-only --job "$SHIP_JOB" --last-run "$LAST_RUN" --started-at "$STARTED_AT"/'
+mutation "shipping under the nightly job label" sc_logsonly 's/^SHIP_JOB="cowlic-bootstrap"/SHIP_JOB="cowlic-ingest"/'
+mutation "shipping from offset 0 (earlier sessions)" sc_shipped_clean 's/--offset "\$LOG_OFFSET"/--offset 0/'
+mutation "shipped bytes not redacted" sc_shipped_clean 's#| "\$VENV_PY" -u "\$SHIP" --filter 9>&- \\#| cat \\#'
+mutation "shipper failure changes the exit code" sc_ship_rc 's/out="\$(ship_call --final)" || out=""/out="$(ship_call --final)" || exit 9/'
+mutation "shipper without timeout" sc_ship_timeout 's/timeout -k 2 "\$SHIP_TIMEOUT_S" //'
+mutation "shipping for every subcommand" sc_only_run_plan '/^# The live shipper/,/^esac/ s/^  run | plan)$/  *)/'
+mutation "no live loop" sc_live 's/^      warned=0$/      exit 0/'
+mutation "live loop outlives the wrapper" sc_tick_orphan 's#kill -0 "\$WRAPPER_PID" 2> /dev/null || exit 0#true#'
 mutation "no watchdog" sc_watchdog 's/^  while kill -0 "\$WRAPPER_PID".*$/  sleep 100000/'
 
 if [ "$failures" -ne 0 ]; then echo "$failures FAILED"; exit 1; fi
