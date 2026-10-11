@@ -24,7 +24,9 @@ GitVersion 6.x, `workflow: GitHubFlow/v1`, `tag-prefix: 'v'`, `commit-message-in
 | `fix:`, `perf:` | patch |
 | anything else (`chore`, `docs`, `ci`, `test`, `refactor`, ...) | patch (the preset's branch increment) |
 
-Decision: chore/docs/ci/test/refactor DO increment (patch), so every master commit has a distinct, ordered version. Add `+semver: skip` to a commit message to not increment.
+Decision: chore/docs/ci/test/refactor DO increment (patch), so every master commit has a distinct, ordered version. Every commit on master, including docs and chore, increments at least the patch version. There is no opt-out: `+semver: skip` / `+semver: none` only cancel a message-driven bump, not the preset's Patch increment (verified: at tag `v3.0.0` a `docs:` commit with `+semver: skip` still gives 3.0.1-1).
+
+On a PR the version is computed from the commits of the PR branch (merged with master by GitHub), not from the PR title. The title matters after the squash merge, when it becomes the master commit message.
 
 The calculated version is printed in the job summary of the `Version / version` workflow (`.github/workflows/version.yml`) on every PR and on master. It is read-only: it never tags, releases or writes anything. The version is NOT embedded into the Worker or ingest.
 
@@ -36,7 +38,7 @@ Quirk found while verifying: with the strict `tag-prefix: 'v'`, `next-version` m
 
 ## Who tags
 
-Default (manual, no write permission anywhere in CI): after the checks of the target commit are green and the owner gives the go-ahead (it is a publish), the coordinator or an agent runs
+Nothing tags automatically. Tagging `v3.0.0` is a later step that needs the owner's approval. Default (manual, no write permission anywhere in CI): after the checks of the target commit are green and the owner gives the go-ahead (it is a publish), the coordinator or an agent runs
 
     gh release create vX.Y.Z --target <sha> --generate-notes
 

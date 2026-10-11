@@ -10,8 +10,8 @@ tag-prefix: 'v'
 commit-message-incrementing: Enabled
 
 # Conventional Commits on the squash commit (= PR title). Anything that matches none of these
-# (chore, docs, ci, test, refactor, ...) gets the branch increment of the preset (Patch) unless the
-# message contains "+semver: skip".
+# (chore, docs, ci, test, refactor, ...) gets the branch increment of the preset (Patch). Every commit on
+# master increments at least the patch version; "+semver: skip" does NOT opt out of that (verified on 6.8.2).
 major-version-bump-message: '^\w+(\([^)]*\))?!:|(^|\n)BREAKING[ -]CHANGE:'
 minor-version-bump-message: '^feat(\([^)]*\))?:'
 patch-version-bump-message: '^(fix|perf)(\([^)]*\))?:'
