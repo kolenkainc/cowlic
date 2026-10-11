@@ -5,17 +5,28 @@ with the shared ingest engine (ingest.run_lastfm) and keeps its own progress. Co
   bootstrap.py plan   --max-new N --max-minutes M [--config FILE]
   bootstrap.py run    --max-new N --max-minutes M [--config FILE] [--result-json FILE] [--reset-state] [--unpark]
   bootstrap.py status [--config FILE]
+  bootstrap.py covers --max-new N --max-minutes M [--retry-days D] [--result-json FILE]
+  bootstrap.py covers --count [--retry-days D]
 
   rank    computes the ranking once (Last.fm) and stores it (bootstrap_ranking); refuses to recompute without --refresh.
   plan    dry run: which artists the next session would reach and how many matches it would attempt. Downloads nothing,
           uploads nothing, writes no file (no state, no lock). Still reads D1 and searches YouTube Music.
   run     one session. Both caps are REQUIRED (1..1000000 tracks, 1..1440 minutes). Never computes the ranking.
   status  one or two lines, no network, no names, no titles; exit 0.
+  covers  (#250) backfill the cover of albums stored without one: per cover-less album the shared matcher on one stored
+          track, the cover guard and the hardened thumbnail fetch of #248, a Telegram photo and
+          `UPDATE albums SET cover_file_id = ? WHERE id = ? AND cover_file_id IS NULL`. No audio. Both caps are REQUIRED
+          (--max-new counts albums attempted); the work list comes from D1, so a stopped run resumes by itself; albums
+          without a match or with a mismatch rest for --retry-days (default 30) in cover-backfill.json. Takes the shared
+          lock and has the 21:10 guard. Never reads the ranking or the progress file; needs no Last.fm key and no config.
+          --count is read-only (D1 reads only, no YouTube, no Telegram, no write), takes no caps, has no 21:10 guard and
+          prints how many albums and artists lack a cover and how many rest in the cooldown. Logic: bootstrap_covers.py.
 
 Files (state directory ${XDG_STATE_HOME:-$HOME/.local/state}/cowlic/, directory 0700, files 0600, atomic writes):
   bootstrap-ranking.json   written by `rank` only (bootstrap_ranking.py)
   bootstrap-state.json     the ENGINE's own RunState (cooldowns, scan dates); this file is never written by bootstrap
                            itself, only by the engine; the nightly ingest-state.json is never read or written
+  cover-backfill.json      written by `covers` only (bootstrap_covers.py): album id -> {result no_match|mismatch, on date}
   bootstrap-progress.json  the single truth about each artist, written only here: {version, ranking_computed_at,
                            sessions, artists: {<lfm:hash>: {status, enum, truncated, tracks_added, tracks_seen,
                            failures, updated}}}; status pending | partial | done | parked, an absent key is pending.
@@ -50,6 +61,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+import bootstrap_covers
 import bootstrap_ranking
 import ingest
 import lastfm
@@ -736,6 +748,115 @@ def _write_result(args, code: int, stop: str | None, counts: dict | None, artist
                                            "counts": counts or result_counts({}), "artists": artists or {}})
 
 
+# ---- covers (#250) ----
+
+RETRY_DAYS_RANGE = bootstrap_covers.RETRY_DAYS_RANGE
+COVERS_ENV = ["TG_BOT_TOKEN", "TG_CHANNEL_ID"] + D1_ENV  # no Spotify and no Last.fm: nothing of them is used
+
+
+def cover_env(required: list[str]) -> str | None:
+    """Loads ./.env (the real environment wins) and checks the variables: a message naming them, or None."""
+    try:
+        tg_check.load_env()
+    except tg_check.EnvSyntaxError as e:
+        return str(e)
+    missing = [k for k in required if not os.environ.get(k)]
+    return f"missing env vars: {', '.join(missing)}" if missing else None
+
+
+def real_cover_backends() -> "bootstrap_covers.CoverBackends":
+    return bootstrap_covers.real_backends()
+
+
+def cover_query() -> Callable:
+    """The D1 read function of `covers` (a function so tests can replace it)."""
+    return ingest.d1_query
+
+
+def cover_usage_problem(args) -> str | None:
+    if args.count:
+        if args.max_new is not None or args.max_minutes is not None or args.result_json:
+            return "covers --count is read-only and takes no --max-new, --max-minutes or --result-json"
+    elif args.max_new is None or args.max_minutes is None:
+        return "covers needs both --max-new and --max-minutes (or --count for the dry count)"
+    return None
+
+
+def cmd_covers(args, lock_held: bool) -> int:
+    problem = cover_usage_problem(args)
+    if problem:
+        refuse(problem)
+        return EXIT_USAGE
+    directory = state_dir()
+    lock = None
+    if not lock_held:  # the count takes the lock too: it must not read while a session or the 21:10 run writes
+        try:
+            lock = take_lock(directory)
+        except Locked:
+            refuse(f"another run or session holds {LOCK_FILE}; exiting without doing anything")
+            return EXIT_LOCKED
+        except OSError as e:
+            refuse(f"cannot take the lock ({type(e).__name__})")
+            return EXIT_USAGE
+    try:
+        return _covers_locked(args, directory)
+    finally:
+        if lock is not None:
+            os.close(lock)
+
+
+def _covers_locked(args, directory: Path) -> int:
+    if not args.count:
+        problem = overlap_problem(local_now(), args.max_minutes)
+        if problem:
+            refuse(problem)
+            return EXIT_GUARD
+    problem = cover_env(D1_ENV if args.count else COVERS_ENV)
+    if problem:
+        refuse(problem)
+        return EXIT_USAGE
+    try:
+        state = bootstrap_covers.CoverState.load(directory / bootstrap_covers.STATE_FILE)
+    except bootstrap_covers.CoverStateError as e:
+        refuse(f"state file unusable: {bootstrap_covers.STATE_FILE}: {e}; move it aside by hand to start empty")
+        return EXIT_USAGE
+    query = cover_query()
+    try:
+        if args.count:
+            for line in bootstrap_covers.count_lines(query, state, today(), args.retry_days):
+                print(line)
+            return EXIT_OK
+        todo, skipped = bootstrap_covers.read_todo(query)
+    except (ingest.IngestError, OSError) as e:
+        ingest.log(f"ERROR covers: cannot read D1: {type(e).__name__}: {ingest.redact(str(e), secrets_now())}")
+        _write_result(args, EXIT_FAILED, None, None, None)
+        return EXIT_FAILED
+    try:
+        backends = real_cover_backends()
+    except (ingest.IngestError, OSError, ImportError) as e:
+        ingest.log(f"ERROR covers: cannot start: {type(e).__name__}: {ingest.redact(str(e), secrets_now())}")
+        _write_result(args, EXIT_FAILED, None, None, None)
+        return EXIT_FAILED
+    ingest.log(f"covers: {len(todo)} album(s) without a cover to work ({skipped['unknown']} unknown album skipped), "
+               f"--max-new {args.max_new}, --max-minutes {args.max_minutes}, retry cooldown {args.retry_days} days")
+    limits = make_limits(args.max_new, args.max_minutes)
+    run = bootstrap_covers.run_backfill(todo, backends, state, limits, today, args.retry_days)
+    c = run.counts
+    ingest.log("covers: " + ", ".join(f"{k} {v}" for k, v in c.items()) + f", cooldown {run.cooldown}, "
+               f"not attempted {run.not_attempted}")
+    left = len(todo) - c["covered"] - c["already"]
+    ingest.log(f"covers: {left} album(s) still without a cover")
+    if run.interrupted:
+        sign_in_stop()
+    if run.unsaved:
+        ingest.log(f"ERROR covers: {bootstrap_covers.STATE_FILE} is not fully saved; the next run repeats what is missing")
+    code = EXIT_SIGN_IN if run.interrupted else EXIT_FAILED if run.failed else EXIT_OK
+    ingest.log(f"stop reason: {run.stop_reason}")
+    counts = {**c, "cooldown": run.cooldown, "not_attempted": run.not_attempted}
+    _write_result(args, code, run.stop_reason, counts, None)
+    return code
+
+
 # ---- rank ----
 
 def rank_client(key: str, years: int):
@@ -830,6 +951,19 @@ def build_parser() -> argparse.ArgumentParser:
                      help="move the bootstrap progress and engine state files aside to <name>.bak (numbered) and start empty")
     run.add_argument("--unpark", action="store_true", help="make every parked artist pending again (failures reset)")
     command("status", "progress and end state, no network")
+    covers = command("covers", "backfill the covers of albums stored without one (no audio)", config=False)
+    covers.add_argument("--count", action="store_true",
+                        help="read-only dry count (D1 reads only): albums and artists without a cover, and the cooldown; "
+                             "takes no caps")
+    covers.add_argument("--max-new", type=_caps(MAX_NEW_RANGE), default=None, metavar="N",
+                        help="REQUIRED unless --count: stop after N albums were attempted (1..1000000)")
+    covers.add_argument("--max-minutes", type=_caps(MAX_MINUTES_RANGE), default=None, metavar="M",
+                        help="REQUIRED unless --count: start no new album after M minutes of wall clock (1..1440)")
+    covers.add_argument("--retry-days", type=_caps(RETRY_DAYS_RANGE), default=bootstrap_covers.DEFAULT_RETRY_DAYS,
+                        metavar="D", help="do not retry an album without a match or with a mismatch for D days "
+                                          f"(0 = always retry; default {bootstrap_covers.DEFAULT_RETRY_DAYS})")
+    covers.add_argument("--result-json", type=Path, metavar="FILE", default=None,
+                        help="write counts and the stop reason to FILE at the end (a repeated option: the last one wins)")
     return ap
 
 
@@ -845,6 +979,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_plan(args)
     if args.command == "run":
         return cmd_run(args, lock_held)
+    if args.command == "covers":
+        return cmd_covers(args, lock_held)
     return cmd_rank(args, lock_held)
 
 
