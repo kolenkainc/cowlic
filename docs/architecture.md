@@ -101,6 +101,8 @@ Worker только передаёт поток и не буферизует е�
 
 ## 4. Конфигурация и секреты
 
+Planned (design, not yet implemented): the Worker deploy and D1 migrations will run from GitHub Actions with a scoped Cloudflare token kept as a GitHub environment secret, see [worker-cicd.md](worker-cicd.md). The statements below about GitHub and secrets stay true for ingest; the final wording is updated by #203.
+
 Single-source rule: every secret and config value is edited only in the local gitignored `.env` (template: `.env.example`) on the owner's machine. Ingest reads it directly. The three Worker secrets (`TG_BOT_TOKEN`, `SUBSONIC_USER`, `SUBSONIC_PASSWORD`) are set once by hand with `wrangler secret put` (see below); there is no sync script. GitHub is not used for secrets any more: the ingest workflow and its `ingest` environment are gone. Never edit values in the Cloudflare UI.
 
 | `.env` key | Where it lives | Purpose |
