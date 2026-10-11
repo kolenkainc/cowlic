@@ -966,25 +966,27 @@ Log and summary (counts and ids only, never names):
 
 ## Artist photos from YouTube Music (#251)
 
-A track without a Spotify cover URL (Last.fm and new-release tracks, the same set as the album covers above) can also
-give its artist a photo: one `get_artist(artists[0].id)` call per artist and run, using the artist id of the matched
+A track without a Spotify URL (Last.fm and new-release tracks) can also give its artist a photo: one `get_artist(artists[0].id)` call per artist and run, using the artist id of the matched
 search result; the thumbnail base plus `=w800-h800-p-l90-rj` (a square crop of the banner) is fetched through the same
 hardened route as a cover (https, the two Google image hosts, no redirect, JPEG, 10 MB, 60 s) and uploaded with `sendPhoto`.
 The file id is written to `artists.image_file_id` in the track's own D1 batch with
-`COALESCE(excluded.image_file_id, artists.image_file_id)`. Spotify playlist tracks never trigger it: a nightly run with
+`COALESCE(artists.image_file_id, excluded.image_file_id)`, so a photo already stored in the row is kept by the SQL itself. Spotify tracks (any song with a Spotify URL, also one without a cover) never trigger it: a nightly run with
 only playlists makes no extra call, no extra D1 query and no extra log line.
 
 - Gate: the artist statement names `image_file_id` only when there is a photo to write, and before the first photo is
   considered the run checks `pragma_table_info('artists')` once. When the column is missing (migration 0003 not applied)
   the run logs `artist photos: off, ...` once and nothing else changes; track inserts cannot fail on the missing column.
   The stored photos are read in the same step (`SELECT id, image_file_id FROM artists WHERE image_file_id IS NOT NULL`),
-  so an artist that already has a photo costs no call and its photo is never replaced.
-- Guard: the matched result's artist names must match the track's artist (the album-cover artist check: bar 0.8,
-  article-insensitive, Latin/Cyrillic aware, plural-only differences refused). It gates only the photo, never the audio
-  match. A match without an artist id is a silent no-op.
+  so an artist that already has a photo costs no call and its photo is not replaced.
+- Guard: the id is the FIRST artist of the matched result, so only that artist's name is compared with the track's artist
+  (bar 0.8, article-insensitive, Latin/Cyrillic aware, plural-only differences refused); a feature credit first and the
+  track's artist second gives no photo (`artist photo skipped for <song id>: artist_mismatch`, the track is ingested as
+  usual and the attempt is not remembered, so a later correct match of the artist can still get the photo). Compilation
+  pseudo-artists (`Various Artists`, `Unknown Artist`, `VA`, ...) never get a photo (`pseudo_artist`). It gates only the
+  photo, never the audio match. A match without an artist id is a silent no-op.
 - Pacing and failure: 2 s pause before each `get_artist`, transient errors get at most 3 attempts in total (`--retry-attempts`), like the search. A
   failed photo is `WARN artist photo failed for <song id>: <error class>` and never fails the track; the artist is not
-  retried in the same run. A sign-in challenge in that call ends the run with exit 3 as everywhere else (never bypassed).
+  retried in the same run. A sign-in challenge in that call ends the run with exit 3 as everywhere else (never bypassed); the track in progress is then discarded like any track in progress at exit 3 (its Telegram audio message is deleted and it is retried next run), and its already uploaded cover photo message stays orphaned in the channel.
 - Log and summary: counts and ids only. The summary lines get `, N artist photos` when non-zero. Artists stored earlier
   without a photo are not filled here (the backfill is #253).
 

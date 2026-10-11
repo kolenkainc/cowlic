@@ -547,7 +547,7 @@ def upsert_statements(song: dict, size_bytes: int, tg_file_id: str, tg_message_i
                     [ar, artist]) if artist_image_file_id is None else
                    ("INSERT INTO artists (id, name, image_file_id) VALUES (?, ?, ?) "
                     "ON CONFLICT(id) DO UPDATE SET name = excluded.name, "
-                    "image_file_id = COALESCE(excluded.image_file_id, artists.image_file_id)",
+                    "image_file_id = COALESCE(artists.image_file_id, excluded.image_file_id)",
                     [ar, artist, artist_image_file_id]))
     return [
         artist_stmt,
@@ -845,7 +845,7 @@ class Deps:
 
 
 def take_artist_photo(song: dict, m, deps: Deps, tdir: Path, sid: str, notes: dict | None) -> str | None:
-    """Artist photo for a song without a Spotify cover (Last.fm, new releases): file_id or None. At most one
+    """Artist photo for a song without a Spotify URL (Last.fm, new releases): file_id or None. At most one
     get_artist call per artist and run (a failed attempt is remembered too). Never raises except for the sign-in
     challenge; the artist guard gates only this photo, never the audio match."""
     if deps.artist_images is None or deps.artist_photo_url is None or deps.upload_artist_image is None:
@@ -909,7 +909,7 @@ def process_track(song: dict, deps: Deps, existing: set, covers: dict, work: Pat
     try:
         al = album_id(primary_artist(song), song.get("album_name") or UNKNOWN_ALBUM)
         cover = covers.get(al)
-        spotify_cover = bool(song.get("cover_url"))
+        spotify_url = bool(song.get("url"))  # a song with a Spotify URL never triggers an artist photo (Last.fm and new releases have none)
         if not cover and not song.get("cover_url"):  # no Spotify cover (Last.fm, new releases): the match may have one
             album_name = song.get("album_name")
             url, why = cover_url_from_match(None if album_name == UNKNOWN_ALBUM else album_name, primary_artist(song), m)
@@ -927,7 +927,7 @@ def process_track(song: dict, deps: Deps, existing: set, covers: dict, work: Pat
                     notes["cover_from_match"] = True
             except (IngestError, OSError, KeyError, ValueError):
                 log(f"WARN cover failed for {sid}")
-        photo = None if spotify_cover else take_artist_photo(song, m, deps, tdir, sid, notes)
+        photo = None if spotify_url else take_artist_photo(song, m, deps, tdir, sid, notes)
         deps.d1_batch(upsert_statements(song, size, msg["audio"]["file_id"], msg["message_id"], cover, photo))
     except Exception:
         try:
@@ -954,7 +954,7 @@ def load_artist_images(query: Callable[..., list[dict]] | None = None) -> dict |
             log("artist photos: off, the artists.image_file_id column does not exist (migration 0003 not applied)")
             return None
         return {r["id"]: r["image_file_id"] for r in query(ARTIST_IMAGES_SQL)}
-    except (IngestError, OSError, KeyError, TypeError) as e:
+    except (IngestError, OSError, KeyError, TypeError, ValueError) as e:
         log(f"WARN artist photos: off, the column check failed ({type(e).__name__})")
         return None
 

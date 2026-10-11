@@ -254,18 +254,27 @@ def _match_artist_names(m) -> list[str]:
 
 # Artist photos (#251): get_artist returns a 2.4:1 banner; this size suffix asks for a square crop (verified 2026-10-11 for
 # one artist: HTTP 200, image/jpeg, 800x800). The browse id of the matched result's first artist is the only input of the
-# extra call, so it is checked against an allowlist shape; the same artist guard as the cover gates it (never the audio match).
+# extra call, so it is checked against an allowlist shape. The id belongs to ONE person (artists[0] of the result), so
+# unlike the album cover (any credited name may match) only THAT artist's name is compared with the track's artist; a
+# feature credit first and the track's artist second gives no photo. It never gates the audio match.
+# Compilation pseudo-artists never get a photo.
+PSEUDO_ARTISTS = frozenset({"various artists", "various", "unknown artist", "unknown", "va", "v a", "сборник", "разные исполнители"})
 ARTIST_PHOTO_SUFFIX = "=w800-h800-p-l90-rj"
 _ARTIST_ID = re.compile(r"[A-Za-z0-9_-]{8,64}")
 
 
 def artist_id_from_match(artist: str, m) -> tuple[str | None, str]:
-    """(browse id for get_artist or None, reason). Reason is a fixed class word: ok, no_artist_id, artist_mismatch."""
+    """(browse id for get_artist or None, reason). Reason is a fixed class word: ok, no_artist_id, pseudo_artist,
+    artist_mismatch."""
     aid = getattr(m, "artist_id", None)
     if not isinstance(aid, str) or not _ARTIST_ID.fullmatch(aid):
         return None, "no_artist_id"
-    names = _match_artist_names(m)
-    if not names or not artists_match(artist, names):
+    first = getattr(m, "artist_name", None)
+    if not isinstance(first, str) or not first:
+        return None, "artist_mismatch"
+    if normalize(artist) in PSEUDO_ARTISTS or normalize(first) in PSEUDO_ARTISTS:
+        return None, "pseudo_artist"
+    if not artists_match(artist, [first]):
         return None, "artist_mismatch"
     return aid, "ok"
 

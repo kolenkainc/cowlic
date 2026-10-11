@@ -23,8 +23,8 @@ def lfm(n, artist="The Killers", **kw):
                 album_artist=artist, artists=[artist], **kw)
 
 
-def candidate(artist_id="UCabcdefghij", name="The Killers"):
-    c = cand(artist_name=name, artists=name)
+def candidate(artist_id="UCabcdefghij", name="The Killers", joined=None):
+    c = cand(artist_name=name, artists=joined or name)
     c.artist_id = artist_id
     return c
 
@@ -106,6 +106,23 @@ class ArtistGuardTest(NoNetwork):
         for bad in (None, "", 7, "short", "has space  xx", "UC/../x1234567", "a" * 65, "UC;rm -rf x"):
             self.assertEqual(match.artist_id_from_match("The Killers", candidate(artist_id=bad)), (None, "no_artist_id"))
 
+    def test_only_the_first_artist_of_the_result_decides(self):
+        """The id belongs to artists[0]; a feature credit first and the track's artist second must not pass."""
+        featured_first = candidate(artist_id="UCfeatured00", name="Featured", joined="Featured, Primary")
+        self.assertEqual(match.artist_id_from_match("Primary", featured_first), (None, "artist_mismatch"))
+        primary_first = candidate(artist_id="UCprimary000", name="Primary", joined="Primary, Featured")
+        self.assertEqual(match.artist_id_from_match("Primary", primary_first), ("UCprimary000", "ok"))
+        self.assertEqual(match.artist_id_from_match("Featured", primary_first), (None, "artist_mismatch"))
+
+    def test_pseudo_artists_never_get_a_photo(self):
+        for name in ("Various Artists", "various artists", "Various", "Unknown Artist", "Unknown", "VA", "V.A.", "Сборник",
+                     "Разные исполнители", "  VARIOUS   ARTISTS "):
+            self.assertEqual(match.artist_id_from_match(name, candidate(name=name)), (None, "pseudo_artist"), name)
+        # either side: a real track artist whose match is a compilation entry, and the other way round
+        self.assertEqual(match.artist_id_from_match("The Killers", candidate(name="Various Artists"))[1], "pseudo_artist")
+        self.assertEqual(match.artist_id_from_match("Various Artists", candidate())[1], "pseudo_artist")
+        self.assertEqual(match.artist_id_from_match("Vanilla", candidate(name="Vanilla"))[1], "ok")  # not a substring rule
+
     def test_a_match_without_names_is_a_mismatch(self):
         m = candidate()
         m.artist_name, m.artists = None, ""
@@ -163,11 +180,24 @@ class GateTest(NoNetwork):
         self.assertIn("image_file_id IS NOT NULL", ingest.ARTIST_IMAGES_SQL)
 
     def test_a_failing_check_switches_the_feature_off(self):
-        def boom(sql, params=None):
-            raise ingest.IngestError("D1 API error 500")
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertIsNone(ingest.load_artist_images(boom))
-        self.assertIn("WARN", out.getvalue())
+        for err in (ingest.IngestError("D1 API error 500"), OSError("x"), ValueError("not json"), KeyError("k"), TypeError("t")):
+            def boom(sql, params=None):
+                raise err
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertIsNone(ingest.load_artist_images(boom))
+            self.assertIn("WARN", out.getvalue())
+            self.assertNotIn("not json", out.getvalue())
+
+    def test_a_non_json_answer_is_memoized_as_off(self):
+        calls = []
+
+        def bad():
+            calls.append(1)
+            return ingest.load_artist_images(lambda sql, params=None: (_ for _ in ()).throw(ValueError("x")))
+        lazy = ingest.LazyArtistImages(bad)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual((lazy(), lazy()), (None, None))
+        self.assertEqual(calls, [1])
 
     def test_default_query_is_d1_query_looked_up_at_call_time(self):
         with mock.patch.object(ingest, "d1_query", lambda sql, params=None: []), \
@@ -218,12 +248,24 @@ class UpsertTest(NoNetwork):
     def test_with_an_image_the_write_is_coalesced_and_parameterized(self):
         stmts = ingest.upsert_statements(SONG, 1, "f", 1, None, "ph")
         sql, params = stmts[0]
-        self.assertIn("COALESCE(excluded.image_file_id, artists.image_file_id)", sql)
+        self.assertIn("COALESCE(artists.image_file_id, excluded.image_file_id)", sql)
         self.assertEqual(sql.count("?"), len(params))
         self.assertEqual(params, [ingest.artist_id("A"), "A", "ph"])
         self.assertNotIn("ph", sql)
         self.assertEqual(len(stmts), 3)
         self.assertEqual(stmts[1:], ingest.upsert_statements(SONG, 1, "f", 1, None)[1:])
+
+    def test_the_sql_keeps_an_existing_photo_and_fills_a_missing_one(self):
+        con = sqlite3.connect(":memory:")
+        con.executescript((MIGRATIONS / "0001_init.sql").read_text() + (MIGRATIONS / "0003_artist_images.sql").read_text())
+        for photo in ("PH1", "PH2"):
+            for sql, params in ingest.upsert_statements(SONG, 1, "f", 1, None, photo):
+                con.execute(sql, params)
+        self.assertEqual(con.execute("SELECT image_file_id FROM artists").fetchall(), [("PH1",)])  # PH2 did not replace it
+        con.execute("UPDATE artists SET image_file_id = NULL")
+        for sql, params in ingest.upsert_statements(SONG, 1, "f", 1, None, "PH3"):
+            con.execute(sql, params)
+        self.assertEqual(con.execute("SELECT image_file_id FROM artists").fetchall(), [("PH3",)])
 
     def test_coalesce_keeps_a_stored_photo_when_no_new_one_is_given(self):
         con = sqlite3.connect(":memory:")
@@ -237,7 +279,7 @@ class UpsertTest(NoNetwork):
             con.execute(sql, params)
         self.assertEqual(con.execute("SELECT image_file_id FROM artists").fetchall(), [("first",)])
         con.execute("INSERT INTO artists (id, name, image_file_id) VALUES (?, 'A', NULL) ON CONFLICT(id) DO UPDATE SET name = excluded.name, "
-                    "image_file_id = COALESCE(excluded.image_file_id, artists.image_file_id)", [ingest.artist_id("A")])
+                    "image_file_id = COALESCE(artists.image_file_id, excluded.image_file_id)", [ingest.artist_id("A")])
         self.assertEqual(con.execute("SELECT image_file_id FROM artists").fetchall(), [("first",)])
 
 
@@ -301,6 +343,53 @@ class ProcessTrackPhotoTest(NoNetwork):
             self.assertEqual(h.track(lfm(2), m=object()), "new")
         self.assertEqual(h.calls, [])
         self.assertNotIn("artist photo", h.log[0])
+
+    def test_featured_first_result_gives_no_call_no_photo_and_an_unchanged_statement(self):
+        with tempfile.TemporaryDirectory() as d:
+            h, notes = Harness(d), {}
+            m = candidate(artist_id="UCfeatured00", name="Featured", joined="Featured, The Killers")
+            self.assertEqual(h.track(lfm(1), m=m, notes=notes), "new")
+        self.assertEqual(h.calls, [])
+        self.assertNotIn("artist_photo", notes)
+        self.assertEqual(h.fakes.batches[0][0], ingest.upsert_statements(lfm(1), 10, "f", 1, "cov")[0])
+        self.assertIn("artist photo skipped", h.log[0])
+        self.assertIn("artist_mismatch", h.log[0])
+        self.assertNotIn("Featured", h.log[0])
+
+    def test_primary_first_result_calls_with_the_primary_id(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = Harness(d)
+            m = candidate(artist_id="UCprimary000", name="The Killers", joined="The Killers, Featured")
+            self.assertEqual(h.track(lfm(1), m=m), "new")
+        self.assertEqual(h.calls[0], ("get_artist", "UCprimary000"))
+
+    def test_a_featured_first_miss_does_not_block_a_later_correct_match(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = Harness(d)
+            h.track(lfm(1), m=candidate(artist_id="UCfeatured00", name="Featured", joined="Featured, The Killers"))
+            h.track(lfm(2), m=candidate(artist_id="UCprimary000"))
+        self.assertEqual([c for c in h.calls if c[0] == "get_artist"], [("get_artist", "UCprimary000")])
+
+    def test_a_pseudo_artist_track_gets_no_call(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = Harness(d)
+            self.assertEqual(h.track(lfm(1, artist="Various Artists"), m=candidate(name="Various Artists")), "new")
+        self.assertEqual(h.calls, [])
+        self.assertIn("pseudo_artist", h.log[0])
+
+    def test_a_spotify_song_without_a_cover_url_is_not_a_candidate(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = Harness(d)
+            s = dict(song(1, cover_url=None, album_name="Hot Fuss", album_artist="The Killers"), url="https://open.spotify.com/track/x")
+            self.assertEqual(h.track(s), "new")
+        self.assertEqual((h.calls, h.loads), ([], 0))
+
+    def test_a_song_without_a_url_is_a_candidate_even_with_a_cover_url(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = Harness(d)
+            s = dict(lfm(1), cover_url="https://i.scdn.co/image/x")
+            self.assertEqual(h.track(s), "new")
+        self.assertEqual([c[0] for c in h.calls], ["get_artist", "upload"])
 
     def test_spotify_sourced_songs_are_untouched_and_the_gate_is_not_even_read(self):
         with tempfile.TemporaryDirectory() as d:
