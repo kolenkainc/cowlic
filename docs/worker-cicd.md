@@ -276,6 +276,7 @@ Notes:
 - Environment protection (approval) for `production-destructive` is evaluated when the `migrate` job is about to start; the job waits for the owner [V behaviour of required reviewers, general GitHub feature; exact UI [R]].
 - `deploy` is not run when `migrate` fails or is skipped by failure (`needs:` default).
 - All shell steps pass any non-constant value through `env:`; no `${{ github.event... }}` text inside `run:` [P].
+- #272: `plan` also reads the subject line of the commit (step "Commit title", `gh api commits/<sha>`, only the default read permission), reduces it to `[A-Za-z0-9 ._,:;()#/+-]` and at most 100 characters and exposes it as the output `commit_title`; `deploy` re-validates it and passes `--tag=<short sha>` and `--message="GitHub Actions run <run id>: <title>"` to `wrangler deploy`. Details, limits and the logs setting of the same ticket: [worker-deploy-runbook.md](worker-deploy-runbook.md) section 11.
 
 ### 12.3 CI-safe smoke (spec for #197)
 

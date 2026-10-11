@@ -16,7 +16,7 @@ Before the merge: `Worker CI / ci` (typecheck, migration lint, immutability, CI-
 | --- | --- | --- | --- |
 | `plan` | none, no secrets | Fails unless the ref is master. Skips (green, summary "Worker deploy skipped") when a NEWER master commit changes `worker/` (that commit has its own run); deploys an older commit when nothing under `worker/` changed after it; fails closed when it cannot tell. Resolves BASE (below), fails if an already applied migration was modified, renamed or deleted, lints the migrations ADDED since BASE, checks the label for destructive ones, picks the environment | Commit sha, BASE sha and where it came from, new migration files, destructive files (if any), the environment `migrate` will use |
 | `migrate` | `production`, or `production-destructive` (the owner approves first) | Lists the migrations pending on the REMOTE database (the authority; `plan`'s list is advisory), re-lints exactly those files, reads a Time Travel bookmark, applies them, checks that nothing is pending. Nothing pending is a green no-op | "No pending migrations", or the bookmark with the restore command, then "D1 migrations applied" (names, bookmark); on failure "D1 migrations FAILED" |
-| `deploy` | `production` | Starts only after `migrate` succeeded. Writes a runner-local wrangler config, masks the Worker URL, `wrangler deploy`, reads the version id, health check `GET /rest/ping?f=json` without credentials (expects HTTP 200 and Subsonic error 40, 5 tries) | "Worker deployed": version id, git SHA, health result; on failure after the deploy: the rollback command (without a version id, section 4) |
+| `deploy` | `production` | Starts only after `migrate` succeeded. Writes a runner-local wrangler config, masks the Worker URL, `wrangler deploy`, reads the version id, health check `GET /rest/ping?f=json` without credentials (expects HTTP 200 and Subsonic error 40, 5 tries) | "Worker deployed": version id, git SHA, version tag and message (section 11), health result; on failure after the deploy: the rollback command (without a version id, section 4) |
 
 BASE = the commit of the last successful deployment to the environment `production`; fallback on the first run or an API error: the `before` commit of the push, or the parent of the commit for a dispatch [V]. It is advisory; `migrate` decides.
 
@@ -240,3 +240,45 @@ A leaked value (it shows up in a log scan, a ticket, a PR, or an unexpected depl
 | The deploy summary does not record the previous version id (the design intended it, #263 left it out, note on #203) | [V]; follow-up #267 |
 | Time Travel restore and the reconcile steps in 5.2 (re-ingest, `--reset-state`, orphan Telegram messages, migrations pending again) | [V] code reading, never run; [R] as a procedure |
 | The dead end for a recorded migration that must be retired | [V] workflow logic, [R] untested |
+| Version tag and message, Workers Logs behaviour, and the log contents on the first push-triggered run (section 11) | [V] wrangler source and local tests; [R] what the dashboard and `versions list` show until the first run |
+
+## 11. Version tag and message, and Workers Logs (#272)
+
+### 11.1 What a version shows
+
+The `deploy` step calls `wrangler deploy -c wrangler.ci.toml --tag=<short sha> --message="GitHub Actions run <run id>: <commit title>"` [V `wrangler deploy --help` of 4.149.0: "--tag: A tag for this Worker Version", "--message: A descriptive message for this Worker Version"; the source stores them as the version annotations `workers/tag` and `workers/message` and uses the message for the deployment too]. Both also appear in the run summary ("Version tag", "Version message").
+
+- Tag: the first 7 characters of `github.sha`. The step first checks that the checked-out commit IS `github.sha` (the commit the guard of `plan` accepted), so the tag is the deployed commit.
+- Message: the commit title is untrusted text. `plan` (step "Commit title") reads only the first line through the API (same source for a push and a `workflow_dispatch`), replaces every character outside `[A-Za-z0-9 ._,:;()#/+-]` by a space (quotes, backticks, `$`, newlines, control and non-ASCII characters), squeezes and trims spaces and cuts to 100 characters; an empty result becomes `(no title)`, an unreadable commit `(title unavailable)` (the deploy is not blocked by cosmetic data). The text travels only through `env` and job outputs, never through `${{ }}` inside a `run:` block, `deploy` validates it again, and it is passed as one quoted `--message=...` argument (a title that starts with a dash cannot become a flag). Tested with hostile titles (quotes, newlines, `$()`, backticks, unicode, 5000 characters, empty, leading dash, workflow commands, output injection, invalid UTF-8) against the extracted run blocks with stub `gh`, `git` and `npx` [V local].
+- Limits [V Cloudflare API reference, "Create a Worker version", read 2026-10-11 with a page-summarising fetch tool: `workers/tag` "Maximum 100 bytes", `workers/message` "Truncated to 1000 bytes if longer"]. The values here stay far below both. No secret is part of either value.
+- Check: `npx wrangler versions list -c wrangler.local.toml` and `deployments list` show Tag and Message; the dashboard version list too [R until the first run].
+- Limit: Source stays `Unknown (version_upload)`: the pipeline uploads the version with the API, it is not a Cloudflare-built version. Cloudflare's own Git integration (Workers Builds) would show the repository natively, but it is a different mechanism with its own build token and a different security model, and it was NOT chosen. The tag and message are what says "this came from GitHub Actions, run N, commit X".
+
+### 11.2 Workers Logs
+
+`worker/wrangler.toml` (the placeholder file the pipeline copies to `wrangler.ci.toml`) has:
+
+```
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = false
+```
+
+[V keys and types checked against the config schema and the validator of wrangler 4.149.0, `wrangler deploy --dry-run` accepts the file [V local]; `invocation_logs` is documented at https://developers.cloudflare.com/workers/observability/logs/workers-logs/ "Invocation logs can be disabled in wrangler by adding the `invocation_logs = false` configuration", read 2026-10-11.]
+
+**Why invocation logs are off.** Subsonic clients send the credentials in the URL query (`u`, `t` = md5(password + salt), `s`, or `p`). The token is valid for ever with the same salt, so it is a reusable credential. The Workers Logs page says "Fetch requests will have a message describing the request method and the request URL" [V, 2026-10-11] and does not say that the query string is left out, so it cannot be proven that the stored line has no query: invocation logs are disabled, and only the explicit console logs of the Worker are stored. (Wrangler 4.149.0 has a `redact_query_string` option in its schema that the public pages read for this ticket do not describe; it is not used [R].)
+
+**What the Worker logs** (`worker/src/log.ts`, one JSON object per line, no other console output): `event` (`request`, `auth_failed`, `upstream_error`, `unhandled_error`), `route` (the Subsonic method name from the PATH only, from an allowlist; `other` for an unknown name, `not_rest` outside `/rest/`), `status`, `code` (Subsonic error code), `errorClass` (class name of a caught exception, never its message). Never: the URL or query string, headers, cookies, tokens, user names, bodies, ids, Telegram file ids or the bot token path. `worker/scripts/log-check.mjs` (part of `npm run smoke:ci`) spies on `console` and fails if any logged value contains the query string, a credential, a Range or other header value, a file id or the URL, including requests with fake `u`/`t`/`s`, a clear-text `p`, credentials in a POST body and a Range request to `/rest/stream`.
+
+**Limits and retention** [V https://developers.cloudflare.com/workers/observability/logs/workers-logs/, read 2026-10-11 with a page-summarising fetch tool; the plan of the owner's account is not in this repository, so which row applies is [R]]: Workers Free 200,000 log events per day, retention 3 days; Workers Paid 20 million events per month included (then a per-million price), retention 7 days; head sampling default 1 (100 percent); an account-wide cap of 5 billion log events per day. Each request writes one `request` line, plus one more for an auth failure or an upstream error.
+
+**Manual deploys.** The owner's gitignored `worker/wrangler.local.toml` is not in the repository: if the owner ever deploys by hand with it, it needs the same `[observability]` and `[observability.logs]` block with `invocation_logs = false`. A deploy without the block disables observability again (wrangler 4.149.0 sends "disabled" when the config has none [V source]); with only `enabled = true` the invocation logs would be on again.
+
+**The setting before this change.** The file already had `[observability] enabled = true` (since #18) and no `invocation_logs` line, which means invocation logs were on for the versions deployed with it, if the platform default is "on" [R: the default is not stated on the pages read]. If so, requests since then may have stored their full URL, query included, for up to the retention above. That is the owner's call: check Observability -> Logs in the dashboard for a stored URL with `t=`; if one is there, rotating `SUBSONIC_PASSWORD` (and the client login) makes the stored tokens useless (section 8).
+
+**First push-triggered run.** Merging a change under `worker/` starts the pipeline by itself. Watch: `plan` (the guard sha is the head; "Commit title" step), `migrate` ("No migrations to apply" when nothing is pending), `deploy` (the summary shows the version id, the tag = the first 7 characters of the commit and the message), health check, then a log scan for leaks (section 2 step 5). After the run: `wrangler versions list` shows Tag and Message, the dashboard shows logs, and one `GET /rest/ping?u=x&t=y&s=z&f=json` with fake credentials leaves a stored line without a query string [R, owner check].
