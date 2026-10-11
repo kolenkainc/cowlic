@@ -98,6 +98,38 @@ const albumPage = (innerWhere: string, order: string) => `${ALBUM_SELECT}
 
 const likePattern = (q: string) => `%${q.replace(/[\\%_]/g, "\\$&")}%`;
 
+// Artist photos (migration 0003, artists.image_file_id). The artist's coverArt id is "ar-<artist id>"; ids without
+// the prefix only ever read albums, so album and artist ids cannot collide (design cover-art.md 6(b) point 3).
+const ARTIST_COVER_PREFIX = "ar-";
+
+interface ArtistRow {
+  id: string;
+  name: string;
+  album_count?: number;
+  image_file_id?: string | null;
+}
+
+const artistJson = (a: ArtistRow) => ({
+  id: a.id,
+  name: a.name,
+  ...(a.album_count === undefined ? {} : { albumCount: a.album_count }),
+  ...(a.image_file_id ? { coverArt: `${ARTIST_COVER_PREFIX}${a.id}` } : {}),
+});
+
+// The Worker must work before migration 0003 is applied (deploy order). Each artist query exists in two forms,
+// with and without the image column; the plain form runs only when D1 reports exactly that column missing.
+// Normal case: one query, no extra read. Any other error is rethrown.
+const isMissingImageColumn = (e: unknown) => e instanceof Error && /no such column:\s*(\w+\.)?image_file_id/i.test(e.message);
+
+async function withImageColumn<T>(withColumn: () => Promise<T>, withoutColumn: () => Promise<T>): Promise<T> {
+  try {
+    return await withColumn();
+  } catch (e) {
+    if (!isMissingImageColumn(e)) throw e;
+    return withoutColumn();
+  }
+}
+
 async function getAlbumRows(db: D1Database, artistId: string): Promise<AlbumRow[]> {
   const r = await db
     .prepare(`${ALBUM_SELECT} WHERE ar.id = ? GROUP BY al.id ORDER BY al.year, al.name`)
@@ -108,20 +140,22 @@ async function getAlbumRows(db: D1Database, artistId: string): Promise<AlbumRow[
 
 // getArtists (ID3) and getIndexes (folder view) share the same grouped-by-letter shape.
 export async function getArtists(db: D1Database, p: URLSearchParams, key: "artists" | "indexes" = "artists"): Promise<Response> {
-  const r = await db
-    .prepare(
-      `SELECT ar.id, ar.name, COUNT(al.id) AS album_count
-       FROM artists ar LEFT JOIN albums al ON al.artist_id = ar.id
-       GROUP BY ar.id ORDER BY ar.name COLLATE NOCASE`,
-    )
-    .all<{ id: string; name: string; album_count: number }>();
+  const list = (cols: string) =>
+    db
+      .prepare(
+        `SELECT ar.id, ar.name${cols}, COUNT(al.id) AS album_count
+         FROM artists ar LEFT JOIN albums al ON al.artist_id = ar.id
+         GROUP BY ar.id ORDER BY ar.name COLLATE NOCASE`,
+      )
+      .all<ArtistRow>();
+  const r = await withImageColumn(() => list(", ar.image_file_id"), () => list(""));
 
   const groups = new Map<string, unknown[]>();
   for (const a of r.results) {
     const first = a.name.trim().charAt(0).toUpperCase();
     const letter = /[A-Z]/.test(first) ? first : "#";
     const list = groups.get(letter) ?? [];
-    list.push({ id: a.id, name: a.name, albumCount: a.album_count });
+    list.push(artistJson(a));
     groups.set(letter, list);
   }
   const index = [...groups].map(([name, artist]) => ({ name, artist }));
@@ -132,10 +166,11 @@ export async function getArtists(db: D1Database, p: URLSearchParams, key: "artis
 export async function getArtist(db: D1Database, p: URLSearchParams): Promise<Response> {
   const id = p.get("id");
   if (!id) return fail(p, 10, "Required parameter is missing: id");
-  const ar = await db.prepare("SELECT id, name FROM artists WHERE id = ?").bind(id).first<{ id: string; name: string }>();
+  const one = (cols: string) => db.prepare(`SELECT id, name${cols} FROM artists WHERE id = ?`).bind(id).first<ArtistRow>();
+  const ar = await withImageColumn(() => one(", image_file_id"), () => one(""));
   if (!ar) return fail(p, 70, "Artist not found");
   const albums = (await getAlbumRows(db, id)).map(albumJson);
-  return ok(p, { artist: { id: ar.id, name: ar.name, albumCount: albums.length, album: albums } });
+  return ok(p, { artist: { ...artistJson(ar), albumCount: albums.length, album: albums } });
 }
 
 export async function getAlbum(db: D1Database, p: URLSearchParams): Promise<Response> {
@@ -184,14 +219,18 @@ export async function search3(db: D1Database, p: URLSearchParams): Promise<Respo
 
   // Artists stay a plain grouped query: there are few of them (hundreds) and this shape is cheap with or without
   // the albums(artist_id) index.
-  const artists = await db
-    .prepare(
-      `SELECT ar.id, ar.name, COUNT(al.id) AS album_count FROM artists ar
-       LEFT JOIN albums al ON al.artist_id = ar.id WHERE ar.name LIKE ? ESCAPE '\\'
-       GROUP BY ar.id ORDER BY ar.name COLLATE NOCASE LIMIT ? OFFSET ?`,
-    )
-    .bind(like, lim("artistCount", 20), off("artistOffset"))
-    .all<{ id: string; name: string; album_count: number }>();
+  const artistCount = lim("artistCount", 20);
+  const artistOffset = off("artistOffset");
+  const artistPage = (cols: string) =>
+    db
+      .prepare(
+        `SELECT ar.id, ar.name${cols}, COUNT(al.id) AS album_count FROM artists ar
+         LEFT JOIN albums al ON al.artist_id = ar.id WHERE ar.name LIKE ? ESCAPE '\\'
+         GROUP BY ar.id ORDER BY ar.name COLLATE NOCASE LIMIT ? OFFSET ?`,
+      )
+      .bind(like, artistCount, artistOffset)
+      .all<ArtistRow>();
+  const artists = await withImageColumn(() => artistPage(", ar.image_file_id"), () => artistPage(""));
   const albums = await db
     .prepare(albumPage("WHERE al.name LIKE ? ESCAPE '\\'", "al.name COLLATE NOCASE, al.rowid"))
     .bind(like, lim("albumCount", 20), off("albumOffset"))
@@ -209,15 +248,27 @@ export async function search3(db: D1Database, p: URLSearchParams): Promise<Respo
 
   return ok(p, {
     searchResult3: {
-      artist: artists.results.map((a) => ({ id: a.id, name: a.name, albumCount: a.album_count })),
+      artist: artists.results.map(artistJson),
       album: albums.results.map(albumJson),
       song: songs.results.map(songJson),
     },
   });
 }
 
-// Returns the Telegram file_id of an album cover. Accepts an album id (what we hand out as coverArt).
+// Returns the Telegram file_id of a cover. "ar-<artist id>" reads artists.image_file_id (one read, parameterized);
+// any other id reads albums exactly as before and never touches the artists table.
 export async function coverFileId(db: D1Database, id: string): Promise<string | null> {
+  if (id.startsWith(ARTIST_COVER_PREFIX)) {
+    const artistId = id.slice(ARTIST_COVER_PREFIX.length);
+    // Column not migrated yet: no artist has an image, so "not found" is the correct answer (no fallback query).
+    try {
+      const a = await db.prepare("SELECT image_file_id FROM artists WHERE id = ?").bind(artistId).first<{ image_file_id: string | null }>();
+      return a?.image_file_id ?? null;
+    } catch (e) {
+      if (!isMissingImageColumn(e)) throw e;
+      return null;
+    }
+  }
   const r = await db.prepare("SELECT cover_file_id FROM albums WHERE id = ?").bind(id).first<{ cover_file_id: string | null }>();
   return r?.cover_file_id ?? null;
 }
