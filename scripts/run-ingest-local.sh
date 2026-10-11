@@ -136,6 +136,8 @@ cd "$ROOT" || { echo "run-ingest-local: cannot cd to $ROOT" >&2; exit "$EXIT_PRE
 
 # The nightly run must never run the Last.fm ranking (it is slow and bootstrap-only). Plain whole-line grep, no YAML
 # parse, `enabled` is never read: a section with `enabled: false` trips it too; commented-out lines do not.
+# This is enough only because ingest's strict parser rejects every other spelling of the key (indent, tab, quotes,
+# BOM): such a file fails in ingest, it never runs the ranking silently.
 # stderr only and before the lock: nothing is logged and last-run.json is not touched.
 if grep -qE '^lastfm_artists:' "$ROOT/sources.yml" 2>/dev/null; then
   echo "$(now_utc) run-ingest-local: ERROR sources.yml has a lastfm_artists: section; the Last.fm ranking belongs to the bootstrap command, see docs/bootstrap-ongoing.md; remove or comment out the lastfm_artists section, enabled: false is not enough" >&2

@@ -828,7 +828,9 @@ from/to range.
 Added in #152 (the report that gates it is the section above). `sources.yml` can have a `lastfm_artists:` section. A run
 then also takes your top artists by listening over the last years from Last.fm and ingests their tracks through the
 same pipeline as a playlist (cap, state file, pacing and the YouTube sign-in stop apply unchanged). It is opt-in:
-a file without the section, or with `enabled: false`, behaves exactly as before. It may be combined with playlists
+a file without the section behaves exactly as before. Since #174 the nightly wrapper (`scripts/run-ingest-local.sh`)
+refuses any `sources.yml` that has the key, also with `enabled: false` (exit 78); `enabled: false` only helps when
+calling `ingest.py` by hand. It may be combined with playlists
 and with `followed_artists`; the playlists run first, then the followed artists, then the Last.fm artists.
 
 ```yaml
@@ -855,7 +857,9 @@ JSON gets an additive `lastfm_artists` object (counts only, including `dropped_s
 counted in `matched_title_only` and logged as `(matched by title only)`.
 
 The 21:10 nightly timer must not use the `lastfm_artists` section (the first run is slow and unbounded by default);
-a separate bootstrap process comes in Release 3 (#163, #168). Do not enable the section in the nightly `sources.yml`
+the wrapper enforces it (#174, see "The cap and the 21:10 timer"): the `lastfm_artists:` key must be absent or
+commented out in the nightly `sources.yml`, `enabled: false` is not enough. The bootstrap process (#163, #168) uses its
+own config, a separate local file outside the repo. Do not add the section to the nightly `sources.yml`
 to try it: measure first with the report above, and take the dry run and the first capped session from the bootstrap
 runbook when it exists (#170).
 
