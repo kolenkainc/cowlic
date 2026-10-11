@@ -11,6 +11,9 @@
 #   describe_ingest_exit). The wrapper's own failures use the codes in the block below.
 # - After last-run.json: best-effort push of this run's redacted log to Grafana Cloud Loki (ship_grafana(); never
 #   changes the exit code, see docs/local-ingest.md).
+# - Guard: refuses to run (exit 78, one ERROR line on stderr, no log, no last-run.json) when sources.yml has a
+#   whole-line `lastfm_artists:` key, even with `enabled: false`: the ranking belongs to the bootstrap command
+#   (docs/bootstrap-ongoing.md). Plain grep, the section is never parsed.
 # - COWLIC_INGEST_ARGS (optional): allowlisted ingest caps (--max-new, --max-minutes, --pace-seconds), see parse_ingest_args.
 # Test: scripts/test-run-ingest-local.sh
 set +x
@@ -130,6 +133,14 @@ if ! mkdir -p "$STATE_DIR" || ! chmod 700 "$STATE_DIR"; then
 fi
 
 cd "$ROOT" || { echo "run-ingest-local: cannot cd to $ROOT" >&2; exit "$EXIT_PREREQ"; }
+
+# The nightly run must never run the Last.fm ranking (it is slow and bootstrap-only). Plain whole-line grep, no YAML
+# parse, `enabled` is never read: a section with `enabled: false` trips it too; commented-out lines do not.
+# stderr only and before the lock: nothing is logged and last-run.json is not touched.
+if grep -qE '^lastfm_artists:' "$ROOT/sources.yml" 2>/dev/null; then
+  echo "$(now_utc) run-ingest-local: ERROR sources.yml has a lastfm_artists: section; the Last.fm ranking belongs to the bootstrap command, see docs/bootstrap-ongoing.md; remove or comment out the lastfm_artists section, enabled: false is not enough" >&2
+  exit "$EXIT_PREREQ"
+fi
 
 if ! command -v flock >/dev/null 2>&1; then
   log "ERROR flock not found; install util-linux (see scripts/check-local-prereqs.sh)"
