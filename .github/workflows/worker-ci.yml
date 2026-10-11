@@ -67,7 +67,8 @@ jobs:
           fi
           echo "BASE_SHA=$base" >> "$GITHUB_ENV"
 
-      # worker_changed = any file under worker/ or this workflow differs from the base. Fail closed: no base or a
+      # worker_changed = any file under worker/ or this workflow or worker-deploy.yml (checked by the "Workflow checks"
+# step, #272) differs from the base. Fail closed: no base or a
       # git failure means true. The pathspecs are :(top)-anchored because the job runs in worker/.
       - name: Detect worker changes
         id: changes
@@ -77,7 +78,7 @@ jobs:
             echo "worker_changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if ! git diff --name-only "$BASE_SHA"...HEAD -- ':(top)worker' ':(top).github/workflows/worker-ci.yml' > "$RUNNER_TEMP/changed.txt"; then
+          if ! git diff --name-only "$BASE_SHA"...HEAD -- ':(top)worker' ':(top).github/workflows/worker-ci.yml' ':(top).github/workflows/worker-deploy.yml' > "$RUNNER_TEMP/changed.txt"; then
             echo "git diff failed: treating worker as changed"
             echo "worker_changed=true" >> "$GITHUB_OUTPUT"
             exit 0
@@ -141,3 +142,9 @@ jobs:
       - name: Smoke test
         if: steps.changes.outputs.worker_changed == 'true'
         run: npm run smoke:ci
+
+      # #272: regression test of the run blocks of worker-deploy.yml (hostile commit titles, tampered inputs, no
+      # expression in run blocks, in-memory mutations that must be caught). No network, no secrets.
+      - name: Workflow checks
+        if: steps.changes.outputs.worker_changed == 'true'
+        run: node scripts/workflow-check.mjs
