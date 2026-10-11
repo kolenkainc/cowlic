@@ -1,0 +1,17 @@
+# GitVersion 6.x configuration (tool pinned in .github/workflows/version.yml). Docs: docs/releasing.md
+workflow: GitHubFlow/v1
+
+# Intermittent use only: remove this line in the PR that follows the first v3.0.0 tag (docs/releasing.md).
+next-version: v3.0.0
+
+# Explicit on purpose: the tag `release-2` (pre-GitVersion) is not a version and must stay ignored.
+tag-prefix: 'v'
+
+commit-message-incrementing: Enabled
+
+# Conventional Commits on the squash commit (= PR title). Anything that matches none of these
+# (chore, docs, ci, test, refactor, ...) gets the branch increment of the preset (Patch). Every commit on
+# master increments at least the patch version; "+semver: skip" does NOT opt out of that (verified on 6.8.2).
+major-version-bump-message: '^\w+(\([^)]*\))?!:|(^|\n)BREAKING[ -]CHANGE:'
+minor-version-bump-message: '^feat(\([^)]*\))?:'
+patch-version-bump-message: '^(fix|perf)(\([^)]*\))?:'

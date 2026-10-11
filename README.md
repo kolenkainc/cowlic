@@ -27,6 +27,7 @@ Self-hosted, serverless аналог Spotify для прослушивания �
 - [docs/architecture.md](docs/architecture.md) — компоненты, схема данных, API, ограничения и риски
 - [docs/poc-plan.md](docs/poc-plan.md) — план POC/MVP по шагам с критериями готовности
 - [docs/local-ingest.md](docs/local-ingest.md) — local ingest runbook: run, systemd timer, logs, failures
+- [docs/releasing.md](docs/releasing.md) — GitVersion + GitHub Flow, release naming (Release 3 = v3.0.0)
 
 ## Статус
 
