@@ -161,16 +161,17 @@ through), `bootstrap-state.json` (the engine's own state: cooldowns, side-effect
 
 ```json
 {"version": 1, "computed_at": "2026-10-11T18:00:00Z", "years": 5, "max_artists": 100,
- "artists": [{"name": "Example Band", "playcount": 1234}]}
+ "artists": [{"name": "Example Band", "playcount": 1234,
+              "mbid": "5b11f4ce-a62d-471e-81fc-a69a8278c7da"}]}
 ```
 
-- Fields: `version`, `computed_at` (UTC), `years`, `max_artists`, and a list of `{name, playcount}` and nothing
-  else [V, #167]. Names are cleaned with the existing `lastfm.clean_text`. `mbid` is NOT stored (#167 lists only
-  name and playcount), so later enumeration is by name with `autocorrect`. `top_artists` returns the mbid and
-  `artist_tracks(client, name, mbid)` accepts it [V, `ingest/lastfm.py`, `ingest/lastfm_tracks.py`], so dropping
-  it is a real risk, not a neutral choice: an ambiguous name can enumerate the wrong artist and add wrong tracks
-  to the library. Open point for #167 and the planner: store `mbid` when present (validated with the existing
-  `_MBID` pattern). [P] The cost of not storing it is unmeasured [R].
+- Fields: `version`, `computed_at` (UTC), `years`, `max_artists`, and a list of `{name, playcount, mbid?}` and
+  nothing else [V, #167]. Names are cleaned with the existing `lastfm.clean_text`. `mbid` is stored when Last.fm
+  gave one: optional, validated with the existing `_MBID` pattern and stored lowercase, omitted (never an empty
+  string) when absent or invalid; `load` refuses any other form. Decision recorded in #167: `top_artists` returns
+  the mbid and `artist_tracks(client, name, mbid)` accepts it [V, `ingest/lastfm.py`,
+  `ingest/lastfm_tracks.py`], and dropping it lets an ambiguous name enumerate the wrong artist and add wrong
+  tracks to the library. [V, `ingest/bootstrap_ranking.py`]
 - Order in the stored list is the priority order (2.5), already sorted; `load` validates types and sizes strictly
   and reports any problem as "no ranking".
 - Written once by `rank`. `rank --refresh` replaces it; the old file stays when the new compute fails. [V, #167]

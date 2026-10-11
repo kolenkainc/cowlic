@@ -1274,36 +1274,77 @@ def lastfm_artist_key(name: str) -> str:
 LASTFM_ARTIST_CALLS = 150  # lastfm_tracks.CALL_BUDGET (requests per artist); a test keeps the two equal
 
 
-def real_lastfm_enumerator(client) -> Callable[[dict], list[dict]]:
+def real_lastfm_enumerator(client, full: bool = False) -> Callable[[dict], "list[dict] | object"]:
     """ranked artist ({name, mbid, playcount}) -> song records. One client for the run: its pacing is continuous and
-    each artist has its own request budget (lastfm_tracks.CALL_BUDGET)."""
+    each artist has its own request budget (lastfm_tracks.CALL_BUDGET). With full=True (#166, the bootstrap) it
+    returns the whole lastfm_tracks.ArtistTracks instead, so run_lastfm can hand its `status` (ok | unknown_artist |
+    no_albums | unusable_artist) and `albums_truncated` to the per-artist hook; an unknown artist or one without
+    albums is a status, not an exception."""
     import lastfm_tracks
 
-    def enumerate_artist(artist: dict) -> list[dict]:
-        return lastfm_tracks.artist_tracks(client, artist["name"], artist.get("mbid"), out=log).records
+    def enumerate_artist(artist: dict):
+        res = lastfm_tracks.artist_tracks(client, artist["name"], artist.get("mbid"), out=log)
+        return res if full else res.records
     return enumerate_artist
 
 
+@dataclass
+class ArtistReport:
+    """What the per-artist hook of run_lastfm (#166) receives after each artist. Counts and words only, no names."""
+    key: str                  # lastfm_artist_key(name), the key of the engine state
+    outcome: str              # done | cut | failed
+    enum: str | None          # ok | unknown_artist | no_albums | unusable_artist; None when the enumeration failed
+    truncated: bool           # more than lastfm_tracks.MAX_ALBUMS albums existed (ArtistTracks.albums_truncated)
+    counts: dict              # track counts of this artist (COUNT_KEYS, plus what run() counted)
+    reason: str | None = None  # outcome `cut`: cap | time | sign-in
+
+
+def lastfm_session_client(key: str, planned: int, ranking_calls: int = 0, **client_kwargs):
+    """A Last.fm client whose request budget fits a bootstrap session (#166): LASTFM_ARTIST_CALLS per planned artist
+    plus `ranking_calls` when the session also reads a ranking. Refuses (IngestError, one line) instead of falling
+    back on the client default MAX_CALLS of 400, which is far too small for a list of artists."""
+    import lastfm
+    for label, v, low in (("planned artists", planned, 1), ("ranking calls", ranking_calls, 0)):
+        if isinstance(v, bool) or not isinstance(v, int) or v < low:
+            raise IngestError(f"lastfm session budget: {label} must be an integer of at least {low}, got {v!r}")
+    return lastfm.LastfmClient(key, max_calls=planned * LASTFM_ARTIST_CALLS + ranking_calls, **client_kwargs)
+
+
 def run_lastfm(lr: LastfmRun, cfg: LastfmConfig, artists: list[dict],
-               enumerate_artist: Callable[[dict], list[dict]], stored_rows: list[tuple], deps: Deps, existing: set,
-               covers: dict, work: Path, dry: bool, limits: RunLimits | None, state: RunState) -> None:
+               enumerate_artist: Callable[[dict], "list[dict] | object"], stored_rows: list[tuple], deps: Deps,
+               existing: set, covers: dict, work: Path, dry: bool, limits: RunLimits | None, state: RunState,
+               on_artist: Callable[[dict, ArtistReport], None] | None = None,
+               rescan_days: int | None = None) -> None:
     """Works through `artists` ([{"name", "mbid", "playcount"}, ...] in ranking order) and records in `lr`, with the
     guarantees of run_followed: excluded names and artists scanned less than cfg.rescan_days ago are skipped, a failed
     enumeration is logged and counted while the others go on, a sign-in challenge ends the run (raised after `lr` is
-    updated), a limit ends the phase, and a scan is recorded only when it reached the last track (never in a dry run)."""
+    updated), a limit ends the phase, and a scan is recorded only when it reached the last track (never in a dry run).
+    `artists` is the ranking and `state` the state object, so a caller (the bootstrap, #168) injects its own ranking
+    and its own state file; the `lastfm_artists:` section passes the live ranking and the nightly state.
+    #166, both optional (None = behaviour as before): `rescan_days` replaces cfg.rescan_days (0 = the caller's list is
+    what is worked, the scan dates of `state` decide nothing); `on_artist(artist, ArtistReport)` is called right after
+    each artist (after the state write, before a stop is raised or returned), for an unusable name too. The
+    enumerator may return the lastfm_tracks.ArtistTracks (real_lastfm_enumerator(full=True)): its status and
+    truncation then reach the hook; a plain list counts as status ok. An exception of the hook is not caught."""
     import dedupe as dedupe_mod
     import lastfm
+    if rescan_days is not None and (isinstance(rescan_days, bool) or not isinstance(rescan_days, int) or rescan_days < 0):
+        raise ValueError("rescan_days must be a non-negative integer")
+    days = cfg.rescan_days if rescan_days is None else rescan_days
+    zero = {k: 0 for k in COUNT_KEYS}
     first: dict[str, dict] = {}
     for a in artists:
         if not normalize(a["name"]):  # "!!!" and "???" would share one state key: skipped and counted
             lr.unusable += 1
+            if on_artist:
+                on_artist(a, ArtistReport(lastfm_artist_key(a["name"]), "done", "unusable_artist", False, dict(zero)))
             continue
         first.setdefault(lastfm_artist_key(a["name"]), a)  # first (best ranked) occurrence wins
     lr.listed = len(first)
     excluded = {normalize(x) for x in cfg.exclude}
     wanted = {k: a for k, a in first.items() if normalize(a["name"]) not in excluded}
     lr.excluded = len(first) - len(wanted)
-    due = [(k, a) for k, a in wanted.items() if state.artist_due(k, cfg.rescan_days)]
+    due = [(k, a) for k, a in wanted.items() if state.artist_due(k, days)]
     lr.recent = len(wanted) - len(due)
     for n, (key, a) in enumerate(due):
         left = len(due) - n
@@ -1315,12 +1356,16 @@ def run_lastfm(lr: LastfmRun, cfg: LastfmConfig, artists: list[dict],
             return
         label = printable(a["name"]).replace("::", ":?")  # no "::" in a log line from outside data
         try:
-            songs = enumerate_artist(a)
+            got = enumerate_artist(a)
+            songs = got.records if hasattr(got, "records") else got
+            enum, truncated = (got.status, got.albums_truncated) if hasattr(got, "records") else ("ok", False)
             result = dedupe_mod.collapse(songs, collect_pairs=True)
         except (lastfm.LastfmError, IngestError, OSError, ValueError, TypeError) as e:
             detail = f": {e}" if isinstance(e, (lastfm.LastfmError, IngestError)) else ""
             log(f"ERROR artist {label}: enumeration failed: {type(e).__name__}{detail}")
             lr.failed += 1
+            if on_artist:
+                on_artist(a, ArtistReport(key, "failed", None, False, dict(zero)))
             continue
         present = {kept for gone, kept in result.pairs if gone in existing}
         kept = [r for r in result.kept if r["song_id"] not in present]
@@ -1335,6 +1380,8 @@ def run_lastfm(lr: LastfmRun, cfg: LastfmConfig, artists: list[dict],
             lr.status, lr.not_started, lr.not_attempted = "interrupted", left - 1, e.tracks_not_attempted + 1
             log(f"artist {label}: interrupted by youtube-sign-in: {summary(e.counts or {k: 0 for k in COUNT_KEYS})}; "
                 f"{left - 1} artist(s) not started")
+            if on_artist:
+                on_artist(a, ArtistReport(key, "cut", enum, truncated, {**zero, **(e.counts or {})}, "sign-in"))
             raise
         counts["exists"] += len(result.kept) - len(feed)
         lr.add(counts)
@@ -1342,10 +1389,14 @@ def run_lastfm(lr: LastfmRun, cfg: LastfmConfig, artists: list[dict],
         if limits and limits.stop_reason:  # a limit ended the artist early: not recorded, the next run resumes here
             lr.status, lr.not_started, lr.not_attempted = "stopped", left - 1, limits.not_attempted
             log_limit_stop_artists(limits, left - 1)
+            if on_artist:
+                on_artist(a, ArtistReport(key, "cut", enum, truncated, dict(counts), limits.stop_reason))
             return
         lr.scanned += 1
         if not dry:
             state.record_artist(key)
+        if on_artist:
+            on_artist(a, ArtistReport(key, "done", enum, truncated, dict(counts)))
 
 
 def lastfm_summary(lr: LastfmRun) -> str:
