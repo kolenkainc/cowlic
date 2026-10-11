@@ -70,6 +70,8 @@ jobs:
       deploy: ${{ steps.guard.outputs.deploy }}
       # `production` or `production-destructive`; only these two literals are ever written (see "Classify")
       environment: ${{ steps.classify.outputs.environment }}
+      # Subject line of the commit, already reduced to a safe charset (see "Commit title"); the `deploy` job re-checks it
+      commit_title: ${{ steps.title.outputs.title }}
     defaults:
       run:
         shell: bash
@@ -321,6 +323,33 @@ jobs:
             echo "- The classification is advisory: \`migrate\` lists the pending migrations of the remote DB and re-lints them"
           } >> "$GITHUB_STEP_SUMMARY"
           echo "migrate environment: $environment"
+
+      # #272: the subject line of the commit for the message of the Worker version ("GitHub Actions run <id>: <title>").
+      # The title is UNTRUSTED text (anyone who can merge writes it; a squash merge takes it from the PR title). It is read
+      # with the API (same source for push and workflow_dispatch; the push payload has no commit for a dispatch), only
+      # the first line is kept, then every character outside [A-Za-z0-9 ._,:;()#/+-] is replaced by a space (this removes
+      # quotes, backticks, $, newlines, control characters and all non-ASCII), runs of spaces are squeezed, the result is
+      # trimmed and cut to 100 characters. It travels through env and GITHUB_OUTPUT only: never into a run block through
+      # ${{ }}, never into a command line unquoted. Cosmetic data: a failure to read it does not stop the deploy.
+      - name: Commit title
+        id: title
+        if: steps.guard.outputs.deploy == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          title=""
+          if raw=$(gh api "repos/$REPO/commits/$EVENT_SHA" --jq '(.commit.message // "") | split("\n")[0] // ""'); then
+            title=$(printf '%s' "$raw" | LC_ALL=C tr -c 'A-Za-z0-9 ._,:;()#/+-' ' ' | LC_ALL=C tr -s ' ' | LC_ALL=C cut -c1-100 | sed -e 's/^ //' -e 's/ $//')
+          else
+            echo "::warning::cannot read the commit title: the version message will say so"
+            title="(title unavailable)"
+          fi
+          if [ -z "$title" ]; then
+            title="(no title)"
+          fi
+          echo "title=$title" >> "$GITHUB_OUTPUT"
 
   # Migrations (#202, design sections 5 and 12.2). Runs in the environment that `plan` computed: `production` (the
   # new migrations are not destructive) or `production-destructive` (the owner is a required reviewer: the job
@@ -685,14 +714,51 @@ jobs:
 
       # The token is in the env of this step only. WRANGLER_OUTPUT_FILE_PATH makes wrangler write a machine-readable
       # record (NDJSON); only the version id is read from it, validated as a UUID, and the file is not printed.
+      #
+      # #272: the version carries --tag (the short git SHA) and --message ("GitHub Actions run <run id>: <commit title>"),
+      # so that `wrangler versions list`, `deployments list` and the dashboard show where it came from. (Source stays
+      # "Unknown (version_upload)": Cloudflare's Workers Builds Git integration is a different mechanism with its own
+      # build token and security model and is not used.) Limits of the API: tag 100 bytes, message 1000 bytes; the
+      # values here are at most 7 and about 150 characters. Every value is checked against an allowlist HERE again (the
+      # title comes from `plan` through a job output) and passed to wrangler as ONE quoted `--flag=value` argument, so
+      # nothing can be split or read as another flag. No secret is ever part of them. The commit that is checked out must
+      # be github.sha (the head of master per the guard): the tag is then the SHA that is deployed.
       - name: Deploy
         id: deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-output.ndjson
+          GIT_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          COMMIT_TITLE: ${{ needs.plan.outputs.commit_title }}
         run: |
-          npx wrangler deploy -c wrangler.ci.toml
+          case "$GIT_SHA" in
+            "" | *[!0-9a-f]*) echo "::error::unexpected github.sha"; exit 1 ;;
+          esac
+          if [ "${#GIT_SHA}" -ne 40 ]; then
+            echo "::error::unexpected github.sha"
+            exit 1
+          fi
+          case "$RUN_ID" in
+            "" | *[!0-9]*) echo "::error::unexpected run id"; exit 1 ;;
+          esac
+          if [ "$(git rev-parse HEAD)" != "$GIT_SHA" ]; then
+            echo "::error::the checked-out commit is not github.sha: nothing is deployed"
+            exit 1
+          fi
+          title="$COMMIT_TITLE"
+          unsafe='[^A-Za-z0-9 ._,:;()#/+-]'
+          if [ -z "$title" ] || [ "${#title}" -gt 100 ] || [[ "$title" =~ $unsafe ]]; then
+            title="(no title)"
+          fi
+          tag="${GIT_SHA:0:7}"
+          message="GitHub Actions run $RUN_ID: $title"
+          {
+            echo "tag=$tag"
+            echo "message=$message"
+          } >> "$GITHUB_OUTPUT"
+          npx wrangler deploy -c wrangler.ci.toml --tag="$tag" --message="$message"
 
       # Separate step (no secrets) so that a parse failure is visible as such while the deploy itself stays "success":
       # the failure summary below then still prints the rollback text.
@@ -755,18 +821,23 @@ jobs:
           process.exit(1);
           EOF
 
-      # Nothing secret: version id (validated UUID) and the git SHA.
+      # Nothing secret: version id (validated UUID), the git SHA, and the tag and message of the version (written by
+      # the Deploy step from validated values: [0-9a-f] and the allowlisted charset, so no backtick can occur).
       - name: Summary
         if: success()
         env:
           VERSION_ID: ${{ steps.version.outputs.version_id }}
           GIT_SHA: ${{ github.sha }}
+          VERSION_TAG: ${{ steps.deploy.outputs.tag }}
+          VERSION_MESSAGE: ${{ steps.deploy.outputs.message }}
         run: |
           {
             echo "### Worker deployed"
             echo
             echo "- Version id: \`$VERSION_ID\`"
             echo "- Git SHA: \`$GIT_SHA\`"
+            echo "- Version tag: \`$VERSION_TAG\`"
+            echo "- Version message: \`$VERSION_MESSAGE\`"
             echo "- Health check: passed (limited: does not exercise D1 or credentials)"
           } >> "$GITHUB_STEP_SUMMARY"
 
