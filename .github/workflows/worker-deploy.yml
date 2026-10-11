@@ -1,0 +1,269 @@
+# Worker deploy (#201). Contract: docs/worker-cicd.md (sections 3, 4, 6, 8, 12.2). Code only: D1 migrations are added
+# in front of the deploy by #202 (job `migrate`, plus the migration-aware parts of `plan`); runbook and rollback docs by #203.
+#
+# Triggers: push to master touching worker/** (NOT this file, NOT docs: a workflow edit alone must not redeploy;
+# use workflow_dispatch for that) and workflow_dispatch (emergency / first run). Never pull_request, never
+# pull_request_target: pull request builds get no secrets and no deploy. workflow_dispatch is accepted from master only
+# (checked in `plan`; the environment's branch policy "master" refuses every other ref as well).
+# The check of the master ruleset is "ci" of worker-ci.yml: jobs here are named plan/deploy, so this workflow can
+# never satisfy or shadow the required check, and it must not be added to the ruleset.
+#
+# Secrets exist only as environment secrets of `production` (CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID,
+# D1_DATABASE_ID, WORKER_URL) and are consumed in exactly these steps of the `deploy` job:
+#   - "Write runner-local wrangler config": D1_DATABASE_ID
+#   - "Mask the Worker URL": WORKER_URL
+#   - "Deploy": CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID
+#   - "Health check": WORKER_URL
+# `npm ci` runs with no secrets in its environment. Nothing prints an id, no `set -x`, the generated config is never
+# printed, committed or uploaded (no upload-artifact in this file).
+#
+# The Worker's own secrets (TG_BOT_TOKEN, SUBSONIC_*) are never touched: `wrangler deploy` only, no `secret put`,
+# and worker/wrangler.toml has no [vars].
+name: Worker deploy
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "worker/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deploy at a time, a running deploy is never cancelled (section 3 rule 5). A pending run replaced by a newer one
+# is fine: the newer run deploys a later master commit that contains the older one.
+concurrency:
+  group: worker-deploy
+  cancel-in-progress: false
+
+jobs:
+  # Guard (section 3 rule 5): an older run that was queued must not deploy after a newer commit landed on master.
+  # No secrets, no environment, no checkout. #202 extends this job (BASE, migration lint, environment routing).
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      deploy: ${{ steps.guard.outputs.deploy }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Guard (master ref, sha is the master head)
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # github.sha / github.ref / github.repository are not user-controlled text, but they go through env anyway.
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_REF: ${{ github.ref }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ "$EVENT_REF" != "refs/heads/master" ]; then
+            echo "::error::this workflow deploys from master only"
+            exit 1
+          fi
+          # Fail closed: if the head of master cannot be read, nothing is deployed.
+          if ! head_sha=$(gh api "repos/$REPO/git/ref/heads/master" --jq .object.sha); then
+            echo "::error::cannot read the head of master"
+            exit 1
+          fi
+          case "$head_sha" in
+            *[!0-9a-f]*) echo "::error::unexpected master head value"; exit 1 ;;
+          esac
+          if [ "${#head_sha}" -ne 40 ]; then
+            echo "::error::unexpected master head value"
+            exit 1
+          fi
+          if [ "$head_sha" = "$EVENT_SHA" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            echo "commit $EVENT_SHA is the head of master"
+          else
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::skipped: $EVENT_SHA is not the head of master any more; the run for the newer commit deploys"
+            {
+              echo "### Worker deploy skipped"
+              echo
+              echo "Commit \`$EVENT_SHA\` is no longer the head of master. A newer commit deploys instead."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  deploy:
+    name: deploy
+    needs: plan
+    if: needs.plan.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    defaults:
+      run:
+        shell: bash
+        working-directory: worker
+    steps:
+      # Pins: section 6 audit table (full commit SHAs).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          package-manager-cache: false # no cache at all (section 6)
+
+      # No secrets in this step's environment: install scripts of dependencies never see the token.
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      # Section 4.2. Validate first (allowlist, whole value, nothing echoed), mask second, substitute third.
+      # wrangler.toml keeps its placeholder; wrangler.ci.toml (gitignored) lives next to it because wrangler resolves
+      # `main` and `migrations_dir` relative to the config file. Mode 600. Never printed.
+      - name: Write runner-local wrangler config
+        env:
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+        run: |
+          node --input-type=module - <<'EOF'
+          const id = process.env.D1_DATABASE_ID ?? "";
+          if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) {
+            console.error("::error::D1_DATABASE_ID is missing or not a lowercase UUID");
+            process.exit(1);
+          }
+          EOF
+          echo "::add-mask::$D1_DATABASE_ID"
+          node --input-type=module - <<'EOF'
+          import { readFileSync, writeFileSync } from "node:fs";
+          const placeholder = "REPLACE_AFTER_d1_create";
+          const src = readFileSync("wrangler.toml", "utf8");
+          if (src.split(placeholder).length !== 2) {
+            console.error("::error::wrangler.toml must contain the D1 placeholder exactly once");
+            process.exit(1);
+          }
+          const out = src.replace(placeholder, () => process.env.D1_DATABASE_ID);
+          if (out.includes(placeholder)) {
+            console.error("::error::placeholder still present");
+            process.exit(1);
+          }
+          writeFileSync("wrangler.ci.toml", out, { mode: 0o600 });
+          console.log("runner-local config written");
+          EOF
+
+      # Section 4.3. GitHub masks the exact secret string only, and wrangler may print the bare host or the account
+      # subdomain, so the URL, its host and the account subdomain label are registered as separate masks BEFORE the
+      # deploy step. Validated first (https, no credentials, no path, no query), nothing is echoed except the masks.
+      - name: Mask the Worker URL
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+        run: |
+          node --input-type=module - <<'EOF'
+          const raw = process.env.WORKER_URL ?? "";
+          if (!/^https:\/\/[a-z0-9]([a-z0-9.-]*[a-z0-9])?\/?$/.test(raw)) {
+            console.error("::error::WORKER_URL is missing or not a plain https base URL");
+            process.exit(1);
+          }
+          const host = new URL(raw).hostname;
+          const masks = new Set([raw, raw.replace(/\/$/, ""), raw.replace(/\/?$/, "/"), host]);
+          // <worker>.<account-subdomain>.workers.dev -> the subdomain label
+          const m = /^[a-z0-9-]+\.([a-z0-9-]+)\.workers\.dev$/.exec(host);
+          if (m) masks.add(m[1]);
+          for (const v of masks) console.log("::add-mask::" + v);
+          EOF
+
+      # The token is in the env of this step only. WRANGLER_OUTPUT_FILE_PATH makes wrangler write a machine-readable
+      # record (NDJSON); only the version id is read from it, validated as a UUID, and the file is not printed.
+      - name: Deploy
+        id: deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-output.ndjson
+        run: |
+          npx wrangler deploy -c wrangler.ci.toml
+          node --input-type=module - <<'EOF'
+          import { appendFileSync, readFileSync } from "node:fs";
+          const lines = readFileSync(process.env.WRANGLER_OUTPUT_FILE_PATH, "utf8").split("\n").filter(Boolean);
+          let id = "";
+          for (const l of lines) {
+            try {
+              const o = JSON.parse(l);
+              if (o.type === "deploy" && typeof o.version_id === "string") id = o.version_id;
+            } catch {
+              // not a JSON line: ignored, the check below decides
+            }
+          }
+          if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) {
+            console.error("::error::could not read the deployed version id from the wrangler output");
+            process.exit(1);
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, "version_id=" + id + "\n");
+          EOF
+
+      # Section 8. No credentials. Passes only on HTTP 200 with the Subsonic envelope status "failed" and error code 40.
+      # Prints fixed texts only (no URL, no host, no response body).
+      # Known limitation: it does NOT exercise D1, the Subsonic credentials or Telegram. Error 40 is also what the Worker
+      # answers when its own secrets are missing (auth fails closed), so a deploy that lost them still passes: the owner
+      # checks `wrangler secret list` after the first run.
+      - name: Health check
+        id: health
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+        run: |
+          node --input-type=module - <<'EOF'
+          const url = new URL("/rest/ping?f=json", process.env.WORKER_URL);
+          const tries = 5;
+          for (let i = 1; i <= tries; i++) {
+            let verdict;
+            try {
+              const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+              const body = await res.json();
+              const sr = body && body["subsonic-response"];
+              if (res.status === 200 && sr && sr.status === "failed" && sr.error && sr.error.code === 40) {
+                console.log("health check passed (attempt " + i + "): Subsonic error 40 as expected");
+                process.exit(0);
+              }
+              verdict = "unexpected response (HTTP " + res.status + ")";
+            } catch {
+              verdict = "request failed or the body was not JSON";
+            }
+            console.log("attempt " + i + "/" + tries + ": " + verdict);
+            if (i < tries) await new Promise((r) => setTimeout(r, 5000));
+          }
+          console.error("::error::health check failed after " + tries + " attempts");
+          process.exit(1);
+          EOF
+
+      # Nothing secret: version id (validated UUID) and the git SHA.
+      - name: Summary
+        if: success()
+        env:
+          VERSION_ID: ${{ steps.deploy.outputs.version_id }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          {
+            echo "### Worker deployed"
+            echo
+            echo "- Version id: \`$VERSION_ID\`"
+            echo "- Git SHA: \`$GIT_SHA\`"
+            echo "- Health check: passed (limited: does not exercise D1 or credentials)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # No automatic rollback (a rollback is a production change and needs a human decision). Runs only when the
+      # deploy itself succeeded and the health check failed.
+      - name: Summary (health check failed)
+        if: always() && steps.deploy.outcome == 'success' && steps.health.outcome == 'failure'
+        env:
+          VERSION_ID: ${{ steps.deploy.outputs.version_id }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          {
+            echo "### Worker deployed, HEALTH CHECK FAILED"
+            echo
+            echo "- Version id: \`$VERSION_ID\`"
+            echo "- Git SHA: \`$GIT_SHA\`"
+            echo
+            echo "Roll back by hand (owner, from \`worker/\` on the owner's machine), then check the Symfonium login:"
+            echo
+            echo '```'
+            echo 'npx wrangler rollback --message "health check failed" -c wrangler.local.toml'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
