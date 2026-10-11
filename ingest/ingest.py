@@ -10,6 +10,8 @@ Spotify are ingested too, no playlist is created. Needs SPOTIFY_USER_REFRESH_TOK
 login); without a usable login the run ends with exit code 2 before doing any work.
 sources.yml may also have a `lastfm_artists:` section (#152): the tracks of your top Last.fm artists of the last years are
 ingested too. Needs LASTFM_API_KEY in the environment; without a usable key or profile the run ends with exit code 2.
+sources.yml may also have a `new_releases:` section (#172): after everything else a bounded check of the artists of the
+stored bootstrap ranking for releases that are not in the library (docs/local-ingest.md). Off unless present.
 Limits (off unless given) and the local state file (cooldown for no_match/failed tracks): docs/local-ingest.md.
 
 Env (or ./.env): TG_BOT_TOKEN, TG_CHANNEL_ID, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET,
@@ -288,10 +290,21 @@ class LastfmConfig:
 
 
 @dataclass(frozen=True)
+class NewReleasesConfig:
+    """The `new_releases:` section of sources.yml (#172): the nightly check for missing releases of the artists of the
+    stored bootstrap ranking. Off unless the section is present and enabled; the defaults are the caps accepted in #165."""
+    enabled: bool = True
+    max_artists: int = 10               # due artists checked per night
+    recheck_days: int = 7               # a checked artist is due again after this many days
+    max_new: int = 20                   # tracks added by this phase per night
+
+
+@dataclass(frozen=True)
 class SourceConfig:
     urls: list[str]
     followed: FollowedConfig | None     # None: no section (a plain playlist file)
     lastfm: LastfmConfig | None = None  # None: no lastfm_artists section
+    new_releases: NewReleasesConfig | None = None  # None: no new_releases section
 
 
 FOLLOWED_HEADER = "followed_artists:"
@@ -321,6 +334,21 @@ def _lastfm_value(key: str, value: str):
             raise ValueError("user must be a Last.fm user name: 2-15 letters, digits, _ or - (not a URL)")
         return value
     low, high = {"years": (1, 10), "max_artists": (1, 10000), "rescan_days": (0, 3650)}[key]
+    if not INT_VALUE.fullmatch(value) or not low <= int(value) <= high:
+        raise ValueError(f"{key} must be a whole number from {low} to {high}")
+    return int(value)
+
+
+NEW_RELEASES_HEADER = "new_releases:"
+NEW_RELEASES_KEYS = ("enabled", "max_artists", "recheck_days", "max_new")
+NEW_RELEASES_RANGES = {"max_artists": (1, 1000), "recheck_days": (1, 365), "max_new": (1, 1000)}
+
+
+def _new_releases_value(key: str, value: str):
+    """Typed value of one `key: value` line of the new_releases section; rejects, never rewrites."""
+    if key == "enabled":
+        return _followed_value(key, value)
+    low, high = NEW_RELEASES_RANGES[key]
     if not INT_VALUE.fullmatch(value) or not low <= int(value) <= high:
         raise ValueError(f"{key} must be a whole number from {low} to {high}")
     return int(value)
@@ -380,15 +408,19 @@ def parse_source_config(text: str) -> SourceConfig:
           exclude:
             - <artist name, as is>
 
+        new_releases:            (#172; keys: enabled max_artists recheck_days max_new; no list)
+          max_artists: 10
+
     A section ends at the next line without indent. Unknown or repeated keys, a malformed value, a repeated
     excluded entry and anything else is an error. A file without a section behaves exactly as before."""
     urls: list[str] = []
     cur: str | None = None  # name of the section being read
-    seen: dict[str, bool] = {"followed_artists": False, "lastfm_artists": False}
-    fields: dict[str, dict] = {"followed_artists": {}, "lastfm_artists": {}}
+    seen: dict[str, bool] = {"followed_artists": False, "lastfm_artists": False, "new_releases": False}
+    fields: dict[str, dict] = {"followed_artists": {}, "lastfm_artists": {}, "new_releases": {}}
     exclude: dict[str, list[str]] = {"followed_artists": [], "lastfm_artists": []}
-    keys = {"followed_artists": FOLLOWED_KEYS, "lastfm_artists": LASTFM_KEYS}
-    headers = {FOLLOWED_HEADER: "followed_artists", LASTFM_HEADER: "lastfm_artists"}
+    keys = {"followed_artists": FOLLOWED_KEYS, "lastfm_artists": LASTFM_KEYS, "new_releases": NEW_RELEASES_KEYS}
+    headers = {FOLLOWED_HEADER: "followed_artists", LASTFM_HEADER: "lastfm_artists",
+               NEW_RELEASES_HEADER: "new_releases"}
     in_exclude = False
     for no, raw in enumerate(text.splitlines(), 1):
         line = raw.rstrip()
@@ -396,8 +428,10 @@ def parse_source_config(text: str) -> SourceConfig:
             continue
         if cur and line[0] in " \t":
             where = f"sources line {no} ({cur})"
-            item_rx = FOLLOWED_ITEM if cur == "followed_artists" else LASTFM_ITEM
+            item_rx = FOLLOWED_ITEM if cur in ("followed_artists", "new_releases") else LASTFM_ITEM
             if m := item_rx.fullmatch(line):
+                if cur == "new_releases":
+                    raise IngestError(f"{where}: this section takes no list")
                 if not in_exclude:
                     raise IngestError(f"{where}: a list item is only allowed under 'exclude:'")
                 if cur == "followed_artists":
@@ -414,6 +448,8 @@ def parse_source_config(text: str) -> SourceConfig:
                 continue
             m = FOLLOWED_KEY.fullmatch(line)
             if not m:
+                if cur == "new_releases":
+                    raise IngestError(f"{where}: expected '  <key>: <value>' (two spaces)")
                 what = "artist id" if cur == "followed_artists" else "artist name"
                 raise IngestError(f"{where}: expected '  <key>: <value>' (two spaces) or '    - <{what}>'")
             key, value = m[1], m[2]
@@ -431,7 +467,9 @@ def parse_source_config(text: str) -> SourceConfig:
                 raise IngestError(f"{where}: key {key!r} has no value")
             else:
                 try:
-                    fields[cur][key] = (_followed_value if cur == "followed_artists" else _lastfm_value)(key, value)
+                    parse_value = {"followed_artists": _followed_value, "lastfm_artists": _lastfm_value,
+                                   "new_releases": _new_releases_value}[cur]
+                    fields[cur][key] = parse_value(key, value)
                 except ValueError as e:
                     raise IngestError(f"{where}: {e}") from None
             continue
@@ -450,7 +488,9 @@ def parse_source_config(text: str) -> SourceConfig:
             urls.append(validate_playlist_url(m[1]))
         except IngestError as e:
             raise IngestError(f"sources line {no}: {e}") from None
-    followed = lastfm = None
+    followed = lastfm = new_releases = None
+    if seen["new_releases"]:  # not a source of tracks to ingest: it does not count for the "no playlists" check below
+        new_releases = NewReleasesConfig(**fields["new_releases"])
     if seen["followed_artists"]:
         fields["followed_artists"]["exclude"] = tuple(exclude["followed_artists"])
         followed = FollowedConfig(**fields["followed_artists"])
@@ -463,7 +503,7 @@ def parse_source_config(text: str) -> SourceConfig:
         present = [n for n, c in (("followed_artists", followed), ("lastfm_artists", lastfm)) if c]
         raise IngestError("sources file lists no playlists" + (f" and {' and '.join(present)} "
                           f"{'is' if len(present) == 1 else 'are'} not enabled" if present else ""))
-    return SourceConfig(list(dict.fromkeys(urls)), followed, lastfm)
+    return SourceConfig(list(dict.fromkeys(urls)), followed, lastfm, new_releases)
 
 
 def parse_sources(text: str) -> list[str]:
@@ -696,6 +736,20 @@ STORED_ROWS_SQL = ("SELECT t.title AS title, ar.name AS artist, t.duration_s AS 
 def read_stored_rows(query: Callable[[str], list[dict]] = d1_query) -> list[tuple]:
     """(title, artist, duration_s) of every stored track: one read-only parameterless SELECT, once per run."""
     return [(r["title"], r["artist"], r["duration_s"]) for r in query(STORED_ROWS_SQL)]
+
+
+STORED_ALBUMS_SQL = ("SELECT ar.name AS artist, al.name AS album, al.year AS year FROM albums al "
+                     "JOIN artists ar ON ar.id = al.artist_id")
+
+
+def read_stored_albums(query: Callable[[str], list[dict]] = d1_query) -> dict[str, list[tuple]]:
+    """normalize(artist) -> [(album name, year or None)] of every stored album (#172): one read-only parameterless
+    SELECT, once per run; the per-artist filtering is done here in Python, never by string-built SQL."""
+    out: dict[str, list[tuple]] = {}
+    for r in query(STORED_ALBUMS_SQL):
+        if isinstance(r["artist"], str) and isinstance(r["album"], str):
+            out.setdefault(normalize(r["artist"]), []).append((r["album"], r["year"]))
+    return out
 
 
 def drop_stored_lastfm(records: list[dict], stored_rows: list[tuple]) -> list[dict]:
@@ -1004,16 +1058,51 @@ class RunLimits:
         self.stop_reason, self.not_attempted = reason, not_attempted
 
 
+class PhaseLimits(RunLimits):
+    """The limits of one phase that has caps of its own (#172: at most max_new tracks and 20 minutes) on top of the
+    run's: exhausted() is true when the run's limits or the phase's are. Every attempt counts for both. A stop caused by
+    the run's own limit is passed on to the run, so its stop reason is the same as if the phase were not there."""
+
+    def __init__(self, parent: RunLimits, max_new: int, max_minutes: float):
+        self.parent, self._attempted = parent, 0
+        super().__init__(max_new, max_minutes, parent.clock)
+
+    @property
+    def attempted(self) -> int:
+        return self._attempted
+
+    @attempted.setter
+    def attempted(self, value: int) -> None:
+        self.parent.attempted += value - self._attempted
+        self._attempted = value
+
+    def exhausted(self) -> str | None:
+        return self.parent.exhausted() or super().exhausted()
+
+    def stop(self, reason: str, not_attempted: int = 0) -> None:
+        super().stop(reason, not_attempted)
+        if own := self.parent.exhausted():
+            self.parent.stop(own, not_attempted)
+
+
 def run(songs: list[dict], deps: Deps, existing: set, covers: dict, work: Path, dry: bool,
-        limits: RunLimits | None = None, state: RunState | None = None) -> dict:
+        limits: RunLimits | None = None, state: RunState | None = None, outcomes: dict | None = None,
+        quiet: bool = False) -> dict:
+    """`outcomes` (optional, #172) receives sid -> new | exists | no_match | too_big | dry_run | failed | cooldown for
+    every track that was looked at. `quiet` (optional, #172) is for a feed whose log must hold no artist or title: a
+    track is named by its song id and an error by its class only."""
     counts = {"new": 0, "exists": 0, "no_match": 0, "too_big": 0, "dry_run": 0, "failed": 0, "cooldown": 0}
     unique = dedupe(songs)
     for i, song in enumerate(unique):
         label = f"{(song.get('artists') or ['?'])[0]} - {song.get('name', '?')}"
         sid = song.get("song_id") or ""
+        if quiet:
+            label = sid
         if sid not in existing:
             if state and state.in_cooldown(sid):  # does not use the cap
                 counts["cooldown"] += 1
+                if outcomes is not None:
+                    outcomes[sid] = "no_match" if state.entries[sid]["status"] == "no_match" else "cooldown"
                 log(f"skipped (cooldown, retry later): {label}")
                 continue
             reason = limits.exhausted() if limits else None
@@ -1027,15 +1116,19 @@ def run(songs: list[dict], deps: Deps, existing: set, covers: dict, work: Path, 
             e.counts, e.tracks_not_attempted = counts, len(unique) - i - 1
             raise  # ends the run, not just this track
         except (IngestError, OSError, KeyError, ValueError, IndexError, TypeError) as e:
-            detail = f": {e}" if isinstance(e, IngestError) else ""
+            detail = f": {e}" if isinstance(e, IngestError) and not quiet else ""
             log(f"ERROR {label}: {type(e).__name__}{detail}")
             counts["failed"] += 1
+            if outcomes is not None:
+                outcomes[sid] = "failed"
             if limits:
                 limits.attempted += 1
             if state and not dry:
                 state.record(sid, "failed")
             continue
         counts[status] += 1
+        if outcomes is not None:
+            outcomes[sid] = status
         if notes.get("title_only"):  # additive, only in the title-only matcher mode (#151); counts only
             counts["matched_title_only"] = counts.get("matched_title_only", 0) + 1
         if notes.get("relaxed"):  # additive (#194): counts only
@@ -1408,6 +1501,158 @@ def lastfm_summary(lr: LastfmRun) -> str:
     return f"lastfm artists: {', '.join(parts)}; tracks: {summary(lr.counts)}"
 
 
+# ---- nightly new-release phase (#172) ----
+# After the playlists: a bounded check of the artists of the STORED bootstrap ranking (bootstrap_ranking.read, never
+# computed here, never the lastfm_artists section) that are due, with the detector of ingest/new_releases.py (#171),
+# and the download of the tracks it finds through the same run() as a playlist. Contract: docs/bootstrap-ongoing.md
+# section 4. The shipped ingest.log gets COUNTS and hashed keys only: no artist, no release, no track title (run() is
+# called with quiet=True, the detector logs the 16-hex key). Imported lazily: a run without the section never loads
+# new_releases.py, bootstrap_ranking.py or the Last.fm modules they import.
+
+NEW_RELEASES_PHASE_MINUTES = 20  # wall clock of the phase per night (accepted in #165), within the run's --max-minutes
+NEW_RELEASES_TRACK_STATUS = {"new": "stored", "exists": "present", "no_match": "no_match", "too_big": "too_big"}
+
+
+@dataclass
+class NewReleasesRun:
+    """What the new-release phase did; filled while it runs, so it is complete after a sign-in stop too. Counts only.
+    due = the artists the night planned (due, cut to max_artists): checked + skipped + failed + not_started == due."""
+    counts: dict = field(default_factory=lambda: {"new": 0, "exists": 0, "no_match": 0, "too_big": 0, "dry_run": 0,
+                                                  "failed": 0, "cooldown": 0})
+    due: int = 0
+    checked: int = 0            # checked, the check went through (also with nothing new)
+    with_new: int = 0           # checked and found tracks that are not stored
+    skipped: int = 0            # not resolvable on the source (no exact name, several artists) or unusable
+    failed: int = 0             # the check failed or was refused (backs off in the state of the detector)
+    not_started: int = 0        # not started: a limit, a refusal or a sign-in stop; they stay due
+    not_attempted: int = 0      # tracks of the artist in progress that were not looked at
+    status: str = "done"        # done | stopped | interrupted | failed | no_ranking
+
+    def add(self, counts: dict) -> None:
+        for k, v in counts.items():
+            self.counts[k] = self.counts.get(k, 0) + v
+
+    def line(self) -> str:
+        return (f"new releases: {self.due} due, {self.checked} checked, {self.with_new} with new, "
+                f"{self.counts['new']} added, {self.failed} failed, {self.skipped} skipped, "
+                f"{self.not_started} not started; tracks: {summary(self.counts)}")
+
+
+def _new_releases_stop(nr: NewReleasesRun, not_started: int, what: str) -> None:
+    nr.status, nr.not_started = "stopped", nr.not_started + not_started
+    log(f"stopped: new releases: {what}; {not_started} artist(s) not started; the next run continues")
+
+
+def run_new_releases_phase(nr: NewReleasesRun, cfg: NewReleasesConfig, source, deps: Deps, existing: set,
+                           covers: dict, work: Path, dry: bool, limits: RunLimits, track_state: RunState,
+                           state_path: Path, ranking_path: Path | None, pacer=None) -> None:
+    """Ranking -> due artists -> per artist: check, then run() on the new tracks. Every failure that is not a sign-in
+    challenge is counted and logged by class (no names) and does not stop the playlists, which are done by now. A
+    sign-in challenge ends the run (raised after the state of the detector and `nr` are updated). `pacer` is the
+    detector's pacer (None: its shared one, at least 1 s between source calls). Dry run: checks only, no state is
+    written. An artist whose tracks were cut by a limit stays due (checked_at is put back), so the next night resumes."""
+    import bootstrap_ranking
+    import new_releases
+    ranking, why = bootstrap_ranking.read(ranking_path)
+    if ranking is None:  # nothing to do: the nightly never computes the ranking
+        nr.status = "no_ranking"
+        log(f"new releases: no usable stored ranking ({why}); nothing to do (run the bootstrap command first)")
+        return
+    try:
+        nrstate = new_releases.load_state(state_path)
+    except new_releases.NewReleasesStateError as e:  # names the file, never an artist; the file is not replaced
+        nr.status = "failed"
+        log(f"ERROR new releases: {e}")
+        return
+    today = track_state.today()
+    selected, _ = new_releases.select_due([a["name"] for a in ranking["artists"]], nrstate, today, cfg.max_artists,
+                                          cfg.recheck_days)
+    nr.due = len(selected)
+    if not selected:
+        return
+    if limits.stop_reason is None and (reason := limits.exhausted()):
+        limits.stop(reason)
+    if limits.stop_reason:  # a heavy playlist night left no budget: the artists stay due
+        _new_releases_stop(nr, len(selected), f"{limits.stop_reason}: limit reached before the phase started")
+        return
+    try:
+        stored_rows, stored_albums = read_stored_rows(d1_query), read_stored_albums(d1_query)
+    except (IngestError, OSError, KeyError, TypeError, ValueError) as e:
+        nr.status = "failed"
+        log(f"ERROR new releases: cannot read the stored library ({type(e).__name__})")
+        return
+    pl = PhaseLimits(limits, cfg.max_new, NEW_RELEASES_PHASE_MINUTES)
+    for n, name in enumerate(selected):
+        left = len(selected) - n
+        if pl.stop_reason is None and (reason := pl.exhausted()):
+            pl.stop(reason)
+        if pl.stop_reason:
+            _new_releases_stop(nr, left, f"{pl.stop_reason}: limit reached")
+            break
+        key = new_releases.artist_key(name)
+        before = dict(nrstate["artists"].get(key) or {})
+        try:
+            res = new_releases.check_artist(source, name, nrstate, stored_rows,
+                                            stored_albums.get(normalize(name), []), today=today, pacer=pacer,
+                                            recheck_days=cfg.recheck_days, out=log)
+        except Exception as e:  # noqa: BLE001 - a bug or a surprise of the detector must not end the run after the playlists
+            log(f"ERROR new releases {key}: the check failed ({type(e).__name__})")
+            nr.failed += 1
+            continue
+        if res.status == new_releases.OK:
+            nr.checked += 1
+            nr.with_new += bool(res.records)
+        elif res.status in (new_releases.FAILED, new_releases.REFUSED):
+            nr.failed += 1
+        else:
+            nr.skipped += 1
+        outcomes: dict = {}
+        interrupted: YouTubeSignInRequired | None = None
+        crashed = False
+        if res.records:
+            try:
+                nr.add(run(res.records, deps, existing, covers, work, dry, pl, track_state, outcomes, quiet=True))
+            except YouTubeSignInRequired as e:
+                interrupted = e
+                nr.add(e.counts or {})
+            except Exception as e:  # noqa: BLE001 - a surprise must not end the run after the playlists; class only, no text
+                crashed = True
+                nr.failed += 1
+                log(f"ERROR new releases {key}: tracks failed unexpectedly ({type(e).__name__}); phase ended")
+        if not dry:
+            statuses = {sid: NEW_RELEASES_TRACK_STATUS.get(o, "failed") for sid, o in outcomes.items()}
+            new_releases.mark_outcomes(nrstate, res, statuses)
+            if pl.stop_reason or interrupted:  # cut: the artist stays due, its unfinished releases are not evaluated
+                entry = nrstate["artists"].get(key)
+                if entry is not None and res.status == new_releases.OK:
+                    if before.get("checked_at"):
+                        entry["checked_at"] = before["checked_at"]
+                    else:
+                        entry.pop("checked_at", None)
+            try:
+                new_releases.save_state(state_path, nrstate)
+            except (new_releases.NewReleasesStateError, OSError) as e:
+                log(f"ERROR new releases: cannot write the state file ({type(e).__name__}); phase ended")
+                if not interrupted and not crashed:
+                    nr.status, nr.not_started = "failed", nr.not_started + left - 1
+                    break
+        if crashed:  # state is saved above; the rest of the artists stay due
+            nr.status, nr.not_started = "failed", nr.not_started + left - 1
+            break
+        if interrupted:
+            nr.status, nr.not_started = "interrupted", nr.not_started + left - 1
+            nr.not_attempted = interrupted.tracks_not_attempted + 1
+            log(f"new releases {key}: interrupted by youtube-sign-in; {left - 1} artist(s) not started")
+            raise interrupted
+        if res.status == new_releases.REFUSED:  # the source's first refusal ends the phase: no retry, no bypass
+            _new_releases_stop(nr, left - 1, "the source refused the request")
+            break
+        if pl.stop_reason:  # a limit ended the artist early
+            nr.not_attempted = pl.not_attempted
+            _new_releases_stop(nr, left - 1, f"{pl.stop_reason}: limit reached")
+            break
+
+
 # ---- structured result (--result-json, read by scripts/run-ingest-local.sh into last-run.json) ----
 # Only counts, class names, status words and playlist URLs WITHOUT query (already validated); never an id, token or
 # a message text. failure_class: none | partial (some track/playlist failed) | config (bad sources/env, nothing
@@ -1422,6 +1667,9 @@ def lastfm_summary(lr: LastfmRun) -> str:
 # shape, artists: {listed, excluded, skipped_recent, scanned, failed, not_started, dropped_stored, unusable}; status
 # `failed` when the ranking or the stored-rows read failed (exit 1, or 2 for a refusal only the owner can fix); its counts (and
 # its `matched_title_only`) are also part of `counts`.
+# Added in #172 (additive, only when sources.yml has an enabled new_releases section): `new_releases` = {status: done |
+# stopped | interrupted | failed | no_ranking, due, checked, with_new, added, skipped, failed, not_started}: counts of
+# artists (added = tracks stored); the track counts of the phase are also part of `counts`. No name, no id.
 RESULT_COUNT_KEYS = ("added", "skipped", "no_match", "too_big", "failed", "not_attempted", "cooldown")
 
 
@@ -1445,7 +1693,7 @@ def stop_reason(results: dict | None, interrupted: YouTubeSignInRequired | None,
 
 def build_result(urls: list[str], results: dict | None, interrupted: YouTubeSignInRequired | None,
                  exit_code: int, limits: RunLimits | None = None, followed: FollowedRun | None = None,
-                 lastfm: LastfmRun | None = None) -> dict:
+                 lastfm: LastfmRun | None = None, new_releases: NewReleasesRun | None = None) -> dict:
     """Result dict for --result-json. `results` is url -> counts (None = unreadable playlist); with `interrupted`
     the finished playlists come from interrupted.results, the one after them is the interrupted one."""
     done = interrupted.results if interrupted else (results or {})
@@ -1481,12 +1729,24 @@ def build_result(urls: list[str], results: dict | None, interrupted: YouTubeSign
                                       "failed": lastfm.failed, "not_started": lastfm.not_started,
                                       "dropped_stored": lastfm.dropped_stored, "unusable": lastfm.unusable}}
         counts = {k: counts[k] + lastfm_section[k] for k in RESULT_COUNT_KEYS}
+    nr_section = None
+    if new_releases:  # additive (#172): only counts, never an artist name or id
+        nr_counts = _result_counts(new_releases.counts, new_releases.not_attempted)
+        nr_section = {"status": new_releases.status, "due": new_releases.due, "checked": new_releases.checked,
+                      "with_new": new_releases.with_new, "added": new_releases.counts["new"],
+                      "skipped": new_releases.skipped, "failed": new_releases.failed,
+                      "not_started": new_releases.not_started}
+        counts = {k: counts[k] + nr_counts[k] for k in RESULT_COUNT_KEYS}
     title_only = sum(p.get("matched_title_only", 0)
                      for p in (*playlists, *[x for x in (section, lastfm_section) if x]))
+    if new_releases:
+        title_only += nr_counts.get("matched_title_only", 0)
     if title_only:  # additive (#151): present only when the title-only matcher mode matched something
         counts["matched_title_only"] = title_only
     normalized = sum(p.get("matched_normalized", 0)
                      for p in (*playlists, *[x for x in (section, lastfm_section) if x]))
+    if new_releases:
+        normalized += nr_counts.get("matched_normalized", 0)
     if normalized:  # additive (#194): present only when the relaxed title pass chose a match
         counts["matched_normalized"] = normalized
     counts["playlists_unreadable"] = sum(p["status"] == "unreadable" for p in playlists)
@@ -1507,6 +1767,8 @@ def build_result(urls: list[str], results: dict | None, interrupted: YouTubeSign
         result["followed_artists"] = section
     if lastfm_section:
         result["lastfm_artists"] = lastfm_section
+    if nr_section:
+        result["new_releases"] = nr_section
     return result
 
 
@@ -1549,11 +1811,13 @@ def main() -> int:
     args = ap.parse_args()
     if bool(args.playlist_url) == bool(args.sources):
         ap.error("give exactly one of PLAYLIST_URL or --sources FILE")
-    state: dict = {"urls": [], "results": None, "interrupted": None, "limits": None, "followed": None, "lastfm": None}
+    state: dict = {"urls": [], "results": None, "interrupted": None, "limits": None, "followed": None, "lastfm": None,
+                   "new_releases": None}
     code = execute(args, state)
     if args.result_json:
         write_result(args.result_json, build_result(state["urls"], state["results"], state["interrupted"], code,
-                                                    state["limits"], state["followed"], state["lastfm"]))
+                                                    state["limits"], state["followed"], state["lastfm"],
+                                                    state["new_releases"]))
     return code
 
 
@@ -1600,8 +1864,9 @@ def prepare_lastfm(cfg: LastfmConfig, sources: Path | None):
         return lastfm.LastfmClient(key, max_calls=budget, out=log), 0
     except lastfm.LastfmError as e:
         log(f"ERROR lastfm_artists is enabled in {sources} but cannot run: {e}; set LASTFM_API_KEY in .env "
-            f"(docs/local-ingest.md) and check `user`, or set `enabled: false` in the lastfm_artists section; "
-            f"exit code {EXIT_CONFIG}")
+            f"(docs/local-ingest.md) and check `user`, or remove or comment out the lastfm_artists section "
+            f"(for a manual ingest.py run `enabled: false` also works; the nightly wrapper refuses the section, the "
+            f"ranking run goes through the bootstrap command, docs/bootstrap-ongoing.md); exit code {EXIT_CONFIG}")
         return None, EXIT_CONFIG
 
 
@@ -1657,7 +1922,9 @@ def run_lastfm_phase(lr: LastfmRun, cfg: LastfmConfig, client, deps: Deps, exist
         if lastfm_config_problem(e):
             lr.config_error = True
             log(f"ERROR cannot read the Last.fm ranking: {text}; check LASTFM_API_KEY, the user name and that the "
-                f"profile is public, or set `enabled: false` in the lastfm_artists section; exit code {EXIT_CONFIG}")
+                f"profile is public, or remove or comment out the lastfm_artists section (for a manual ingest.py run "
+                f"`enabled: false` also works; the ranking run goes through the bootstrap command, "
+                f"docs/bootstrap-ongoing.md); exit code {EXIT_CONFIG}")
         else:
             log(f"ERROR cannot read the Last.fm ranking: {text}; the playlists are not affected; the next run tries again")
         return
@@ -1721,6 +1988,8 @@ def execute(args: argparse.Namespace, state: dict) -> int:
         if code:
             return code
 
+    nr_cfg = config.new_releases if config.new_releases and config.new_releases.enabled else None
+
     from ytmusicapi import YTMusic
     existing = {r["spotify_id"] for r in d1_query("SELECT spotify_id FROM tracks")}
     covers = {r["id"]: r["cover_file_id"] for r in d1_query("SELECT id, cover_file_id FROM albums")}
@@ -1741,7 +2010,8 @@ def execute(args: argparse.Namespace, state: dict) -> int:
         track_state = RunState.load(args.state_file or default_state_path(),
                                     {"no_match": args.retry_no_match_days, "failed": args.retry_failed_days})
         try:
-            deps = real_deps(YTMusic(), throttle)
+            ytm = YTMusic()
+            deps = real_deps(ytm, throttle)
             results = run_playlists(urls, fetch_songs, deps, existing, covers, work, args.dry_run, limits, track_state)
             if followed_cfg:
                 fr = state["followed"] = FollowedRun()
@@ -1760,6 +2030,17 @@ def execute(args: argparse.Namespace, state: dict) -> int:
                 except YouTubeSignInRequired as e:
                     e.results, e.playlists_not_attempted = results, 0
                     raise
+            if nr_cfg:  # last: after the playlists (and the followed/lastfm phases), bounded by its own caps
+                nr = state["new_releases"] = NewReleasesRun()
+                state_file = args.state_file or default_state_path()
+                try:
+                    import bootstrap_ranking
+                    run_new_releases_phase(nr, nr_cfg, ytm, deps, existing, covers, work, args.dry_run, limits,
+                                           track_state, state_file.with_name("new-releases-state.json"),
+                                           state_file.with_name(bootstrap_ranking.FILE_NAME))
+                except YouTubeSignInRequired as e:
+                    e.results, e.playlists_not_attempted = results, 0
+                    raise
         except YouTubeSignInRequired as e:
             state["interrupted"] = e
             log(f"ERROR {FAILURE_YOUTUBE_SIGN_IN}: YouTube asks to sign in (bot check); skipping the rest of the "
@@ -1769,23 +2050,30 @@ def execute(args: argparse.Namespace, state: dict) -> int:
             return EXIT_YOUTUBE_SIGN_IN
     state["results"] = results
     ok = [c for c in results.values() if c is not None]
-    fr, lr = state["followed"], state.get("lastfm")
-    total = {k: sum(c.get(k, 0) for c in [*ok, *([fr.counts] if fr else []), *([lr.counts] if lr else [])])
+    fr, lr, nr = state["followed"], state.get("lastfm"), state.get("new_releases")
+    total = {k: sum(c.get(k, 0) for c in [*ok, *([fr.counts] if fr else []), *([lr.counts] if lr else []),
+                                          *([nr.counts] if nr else [])])
              for k in (*COUNT_KEYS, "cooldown", "matched_title_only", "matched_normalized")}
     broken = len(results) - len(ok)
-    artists_failed = (fr.failed if fr else 0) + (lr.failed if lr else 0)
+    enum_failed = (fr.failed if fr else 0) + (lr.failed if lr else 0)
+    artists_failed = enum_failed + (nr.failed if nr else 0)
     phase_failed = bool(lr and lr.status == "failed")
+    nr_failed = bool(nr and nr.status == "failed")
     if fr:
         log(followed_summary(fr))
     if lr:
         log(lastfm_summary(lr))
+    if nr and nr.status != "no_ranking":  # no ranking: the one line of the phase was logged already
+        log(nr.line())
     log(f"done: {summary(total)}" + (f"; {broken} playlist(s) could not be read" if broken else "")
-        + (f"; {artists_failed} artist(s) could not be enumerated" if artists_failed else "")
-        + ("; the Last.fm phase failed" if phase_failed else ""))
+        + (f"; {enum_failed} artist(s) could not be enumerated" if enum_failed else "")
+        + (f"; {nr.failed} new-release check(s) failed" if nr and nr.failed else "")
+        + ("; the Last.fm phase failed" if phase_failed else "")
+        + ("; the new-release phase failed" if nr_failed else ""))
     log(f"stop reason: {stop_reason(results, None, limits)}")
     if lr and lr.config_error:  # the playlists ran and are reported; the owner must fix the Last.fm side
         return EXIT_CONFIG
-    return 1 if broken or total["failed"] or artists_failed or phase_failed else 0
+    return 1 if broken or total["failed"] or artists_failed or phase_failed or nr_failed else 0
 
 
 if __name__ == "__main__":
