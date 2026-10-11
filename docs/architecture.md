@@ -101,9 +101,9 @@ Worker только передаёт поток и не буферизует е�
 
 ## 4. Конфигурация и секреты
 
-Planned (design, not yet implemented): the Worker deploy and D1 migrations will run from GitHub Actions with a scoped Cloudflare token kept as a GitHub environment secret, see [worker-cicd.md](worker-cicd.md). The statements below about GitHub and secrets stay true for ingest; the final wording is updated by #203.
+The Worker deploy and D1 migrations are meant to run from GitHub Actions on a merge to master touching `worker/**` (`.github/workflows/worker-deploy.yml`, merged in PRs #263 and #266; it has not run yet and waits for its first production run, see [worker-deploy-runbook.md](worker-deploy-runbook.md) section 2), with the owner's Cloudflare token kept as a GitHub ENVIRONMENT secret (environments `production` and `production-destructive`; design in [worker-cicd.md](worker-cicd.md)). Migration 0002 was applied by hand (#122), and 0003 may be too (#261); after the pipeline's first run a hand-applied migration is only the documented fallback. The statements below about GitHub and secrets are about ingest and the Worker's own secrets.
 
-Single-source rule: every secret and config value is edited only in the local gitignored `.env` (template: `.env.example`) on the owner's machine. Ingest reads it directly. The three Worker secrets (`TG_BOT_TOKEN`, `SUBSONIC_USER`, `SUBSONIC_PASSWORD`) are set once by hand with `wrangler secret put` (see below); there is no sync script. GitHub is not used for secrets any more: the ingest workflow and its `ingest` environment are gone. Never edit values in the Cloudflare UI.
+Single-source rule: every secret and config value is edited only in the local gitignored `.env` (template: `.env.example`) on the owner's machine. Ingest reads it directly. The three Worker secrets (`TG_BOT_TOKEN`, `SUBSONIC_USER`, `SUBSONIC_PASSWORD`) are set once by hand with `wrangler secret put` (see below); there is no sync script. Ingest uses no GitHub secrets and the Worker's own secrets are never given to GitHub: the ingest workflow is gone, but the old environment `ingest` still holds seven secrets until owner ticket #75 (nothing uses them, none may be added). The only GitHub secrets the repository needs are the environment secrets of the Worker deploy (`CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `D1_DATABASE_ID`, `WORKER_URL` in `production`; the first three in `production-destructive`). Three organisation secrets remain visible to the repository by the owner's decision of 2026-10-11 (#264): `CLOUDFLARE_ACCOUNT_ID` (not a credential), `NPM_TOKEN`, `SENTRY_AUTH_TOKEN`. Never edit values in the Cloudflare UI.
 
 | `.env` key | Where it lives | Purpose |
 |---|---|---|
@@ -114,7 +114,7 @@ Single-source rule: every secret and config value is edited only in the local gi
 | `INGEST_CLOUDFLARE_API_TOKEN` | local `.env` | Narrow token (D1:Edit only) for ingest writing to D1 over the REST API. The only Cloudflare token ingest reads: no fallback to `CLOUDFLARE_API_TOKEN`; if it is missing the run stops with an error naming this key. |
 | `CLOUDFLARE_ACCOUNT_ID`, `D1_DATABASE_ID` | local `.env` | D1 REST API addressing |
 | `SUBSONIC_USER`, `SUBSONIC_PASSWORD` | local `.env`, Worker secrets | Client login |
-| `CLOUDFLARE_API_TOKEN` (optional) | local `.env` only | Broad personal token for local wrangler/deploy/ad-hoc work only. Ingest never reads it and hides it from the spotdl subprocess. |
+| `CLOUDFLARE_API_TOKEN` (optional) | local `.env`, and the GitHub environment secrets `production` and `production-destructive` | Broad personal token for local wrangler/ad-hoc work and the Worker deploy workflow. Ingest never reads it and hides it from the spotdl subprocess. Rotate it in all places, see worker-cicd.md section 3 rule 10. |
 
 The ingest values are not copied anywhere. The GitHub environment secrets of the former workflow (`TG_BOT_TOKEN`, `TG_CHANNEL_ID`, `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `D1_DATABASE_ID` in the environment `ingest`) are unnecessary and can be removed by the owner together with the environment (ticket #75).
 
