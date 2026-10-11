@@ -171,8 +171,14 @@ All in `ingest/`:
    [V `ingest/match.py` `Candidate`], so the match must also carry the result's album name, album id, first artist id and
    artist names. Before `cover_url` is set, apply the guard: the result's album name must be similar to the song's
    `album_name` (the project's `similarity`), the song must have a real album name (`UNKNOWN_ALBUM` or an empty name never
-   gets a cover from a match), and the result's artist names must match `primary_artist(song)` (the artist check the matcher
-   already uses). Without it a wrong cover would be shared through `covers[al]` and kept forever by the COALESCE [V
+   gets a cover from a match), and the result's artist names must match `primary_artist(song)`. This artist check is NEW, it
+   is NOT something the matcher already does in the default duration mode: there `score` only adds `0.3 * a_sim` and the
+   comment says "Artist only breaks ties; it must not veto" [V `ingest/match.py:~193`]; only `score_title_only` has a
+   mandatory artist check. The new check gates ONLY the cover, never the audio match (the match and the download stay
+   exactly as they are). It uses `artist_similarity` over the song's artist and its `transliterate_to_cyrillic` variant
+   against the joined result artists and each single name, as `score_title_only` does, with a threshold to be chosen and
+   tested in the ticket; `Candidate` carries the result's artist names for it. Without it, a cover act with the same
+   title and duration could get its cover stored. Without it a wrong cover would be shared through `covers[al]` and kept forever by the COALESCE [V
    `ingest.py:540-549, 802-806`]. A song that fails the guard simply gets no cover (counted, logged without names).
 2. `fetch_cover` hardening for URLs from the YouTube route [V today it only checks https and size, and `urlopen` follows
    redirects, `ingest.py:748-757`]: a host allowlist (`yt3.googleusercontent.com`, `lh3.googleusercontent.com`) checked
@@ -233,20 +239,25 @@ deploy, which is the acceptance step of ticket 6.
   accept rules) and take the thumbnail of the chosen result. No audio download. Cost per album about 1 to 3 search calls, plus
   one `get_artist` per cover-less artist [R, the count of such albums was not read from D1 here].
 - **Mismatch guard.** The same guard as ticket 1 (shared code): accept the cover only if the result's `album.name` is
-  similar (the project's `similarity`) to the stored album name and the result's artist matches the stored artist;
+  similar (the project's `similarity`) to the stored album name and the result's artist matches the stored artist
+  (the new cover-only artist check of 6(a) item 1, `artist_similarity` plus the Cyrillic variant; not the matcher's tie-break);
   otherwise skip the album and count it `album_mismatch` (it stays NULL and is reported). A stored album named
   `UNKNOWN_ALBUM` is never filled. Compilation or deluxe covers differ little for the same album, but a different album
   must not be used [P].
 - **Command.** A new subcommand next to `rank/plan/run/status` of `ingest/bootstrap.py`, for instance `bootstrap.py covers`
-  (with a `covers-plan` dry count, below). It is NOT free through the wrapper: `scripts/run-bootstrap-local.sh` hard-codes the
+  (with its dry count `covers --count`, below). It is NOT free through the wrapper: `scripts/run-bootstrap-local.sh` hard-codes the
   subcommand list `rank | plan | run | status` (line 55), the cap check (line 91) and the 21:10 guard (around line 194)
   are keyed on `run | plan` [V read]. So the ticket changes the wrapper, `scripts/test-run-bootstrap-local.sh` and
   `docs/bootstrap.md`. What it then reuses: the shared `ingest.lock`, the 21:10
   guard (`now + --max-minutes + 10 min + 60 s` must stay before the next 21:10), the required caps `--max-new N`
   (here: albums attempted) and `--max-minutes M`, the exit codes (75 locked, 78 usage or guard), and exit 3 on a sign-in
-  challenge with no bypass [V `docs/bootstrap.md` section 4/5, read, not run]. **Dry count first:** a plan-like mode
-  (`covers-plan`, read-only, no YouTube call) that reads D1 and prints how many albums (and artists) lack an image, and how
-  many a run of the given caps would cover, so the owner sees the size before the first real run. Pacing: at least 1.5 s between YouTube Music
+  challenge with no bypass [V `docs/bootstrap.md` section 4/5, read, not run]. **Dry count first:** `covers --count`
+  (read-only: D1 reads only, no YouTube call, no Telegram, no write) prints how many albums (and artists) lack an image and
+  how many are in the cooldown file, so the owner sees the size before the first real run. It needs no `--max-new` and
+  `--max-minutes`, and the 21:10 guard does not apply to it (it ends in seconds). The wrapper DOES need a case entry
+  for it: the wrapper takes the shared lock for every subcommand, `status` included [V `docs/bootstrap.md` line 158 and
+  the lock header of the wrapper], so `covers --count` exits 75 while a session or the 21:10 run holds the lock; the
+  wrapper's cap check must require the caps for `covers` without `--count` and reject them with `--count`. Pacing: at least 1.5 s between YouTube Music
   calls plus jitter, bounded retries only for transient errors, never for sign-in [P]; search calls are not the 300 videos
   per hour class of downloads but their limit is undocumented [R].
 - **Resumable without a state file.** The work list is `SELECT ... FROM albums WHERE cover_file_id IS NULL` (artists:
@@ -274,11 +285,11 @@ All tickets that touch `ingest/ingest.py` run serially. Order and sizes (S under
 
 | # | Ticket | Size | Notes |
 |---|---|---|---|
-| 1 | Album covers in ingest for new tracks: `Candidate` carries the result's album name/id, artist id and names; wrong-cover guard (album-name similarity, real album name, artist match) before `cover_url` is set; `fetch_cover` hardening (host allowlist on first URL and every redirect or no redirects, `image/jpeg`, `FF D8`, 10 MB, https); offline tests including a hostile test, mutation checks, nightly byte-identical check | M | no Worker, no migration; touches `ingest.py` and `match.py`; the guard code is shared with 2 and 4b |
-| 2 | Album backfill: `bootstrap.py covers` and `covers-plan` (dry count), wrapper `scripts/run-bootstrap-local.sh` (subcommand list, cap check, 21:10 guard), `scripts/test-run-bootstrap-local.sh`, `docs/bootstrap.md`, cooldown file, exit 3 | M to L (Python plus bash plus runbook) | after 1; serial with other `ingest.py` work; not during a bootstrap session |
+| 1 | Album covers in ingest for new tracks: `Candidate` carries the result's album name/id, artist id and names; wrong-cover guard (album-name similarity, real album name, artist match) before `cover_url` is set; `fetch_cover` hardening (host allowlist on first URL and every redirect or no redirects, `image/jpeg`, `FF D8`, 10 MB, https); offline tests including a hostile test and a Latin vs Cyrillic artist-name test (the new cover-only artist check uses `artist_similarity` plus the `transliterate_to_cyrillic` variant and never gates the audio match), mutation checks, nightly byte-identical check | M | no Worker, no migration; touches `ingest.py` and `match.py`; the guard code is shared with 2 and 4b |
+| 2 | Album backfill: `bootstrap.py covers` and `covers --count` (dry count), wrapper `scripts/run-bootstrap-local.sh` (subcommand list, cap check, 21:10 guard, `--count` case), `scripts/test-run-bootstrap-local.sh`, `docs/bootstrap.md`, cooldown file, exit 3 | M to L (Python plus bash plus runbook) | after 1; serial with other `ingest.py` work; not during a bootstrap session |
 | 3 | Worker plus migration: `0003_artist_images.sql` (additive), `getCoverArt` accepts `ar-<id>`, `coverArt` = `ar-<id>` on artist entries (`getArtists`, `getIndexes`, `getArtist`, `search3`), smoke fixture, `tsc`, `smoke:ci`. Acceptance includes: an `ar-<id>` resolves to the artist image, a plain album id still resolves as before, an artist without an image has no `coverArt`. Production change: migration applied by the deploy workflow on merge or by the owner; the owner confirms in the ticket | M | independent of 1 and 2; must be deployed before 4a |
 | 4a | Artist images, ingest side: `get_artist` per new artist, artist-name guard, artist upsert with COALESCE, `artist_images` dict, column-presence startup check (feature off when missing), hardened fetch, tests | M | after 1 and after 3 is deployed (otherwise every track insert fails): merge gate |
-| 4b | Artist backfill: extend `covers` and `covers-plan` to artists (`image_file_id IS NULL`), one search plus one `get_artist` per artist | M | after 2 and 4a |
+| 4b | Artist backfill: extend `covers` and `covers --count` to artists (`image_file_id IS NULL`), one search plus one `get_artist` per artist | M | after 2 and 4a |
 | 5 | (optional) CAA fallback for albums without a YouTube match | S | only if the backfill report shows many `no_match` |
 | 6 | Spot-check in Symfonium on real data (one album, one artist), record results on #245; if the artist photo does not show, fill `getArtistInfo2` | S | after 4a and 3 (and 2/4b for old data) |
 
