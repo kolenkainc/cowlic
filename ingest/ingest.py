@@ -28,6 +28,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -645,6 +646,7 @@ def spotdl_run(args: list[str], cwd: Path) -> tuple[list[str], str]:
 # ID3 tags. Same bot-check rules as everywhere (#62): no cookies, proxies, PO tokens or client rotation; yt-dlp runs
 # with --ignore-config so no config file of the user's can add any of them.
 YTDLP_CMD = [sys.executable, "-m", "yt_dlp"]  # tests replace this with a fake
+YTDLP_TIMEOUT_S = 600  # one download; a hung yt-dlp is killed and the track fails
 YTDLP_AUDIO_FILE = "audio"  # output name stem inside the track's temp dir
 VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 TAG_TEXT_MAX = 300
@@ -664,15 +666,24 @@ def ytdlp_run(video_id: str, tdir: Path) -> tuple[list[str], str]:
     yt-dlp exits non-zero when the download failed. The sign-in challenge raises YouTubeSignInRequired."""
     cmd = [*YTDLP_CMD, *ytdlp_args(video_id, tdir)]
     env = {k: v for k, v in os.environ.items() if k not in tg_check.ENV_FROM_FILE and k not in SPOTDL_HIDDEN_ENV}
-    r = subprocess.run(cmd, cwd=tdir.parent, capture_output=True, text=True, env=env)
-    lines = clean_lines(r.stdout + "\n" + r.stderr, [])
+    # own process group: a hung yt-dlp is killed together with the ffmpeg it started
+    proc = subprocess.Popen(cmd, cwd=tdir.parent, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+                            start_new_session=True)
+    try:
+        stdout, stderr = proc.communicate(timeout=YTDLP_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.communicate()
+        raise IngestError(f"yt-dlp timed out after {YTDLP_TIMEOUT_S} s") from None
+    lines = clean_lines(stdout + "\n" + stderr, [])
     tail = "\n".join(lines[-TAIL_LINES:])
     causes = [*cause_lines(lines), *[ln for ln in lines if ln.startswith("ERROR:")][-MAX_CAUSES:]]
     causes = list(dict.fromkeys(causes))[-MAX_CAUSES:]
-    if is_sign_in_challenge(lines):
+    failed = proc.returncode != 0 or not any(tdir.glob("*.mp3"))  # a bot-check WARNING beside a good mp3 is no stop
+    if failed and is_sign_in_challenge(lines):
         raise YouTubeSignInRequired("YouTube asks to sign in (bot check)")
-    if r.returncode != 0:
-        raise IngestError(f"yt-dlp failed with exit code {r.returncode}"
+    if proc.returncode != 0:
+        raise IngestError(f"yt-dlp failed with exit code {proc.returncode}"
                           + (f"; yt-dlp error: {' | '.join(causes)}" if causes else "")
                           + (f"; yt-dlp output (last lines):\n{tail}" if tail else ""))
     return causes, tail
@@ -695,8 +706,11 @@ def write_id3_tags(path: Path, song: dict) -> None:
     """ID3v2.3 tags the way spotdl writes them for playlist tracks (title, artists, album, album artist, track, disc,
     year); mutagen (a dependency of spotdl, already installed) writes the file directly: no shell, no ffmpeg
     arguments. Replaces whatever tags yt-dlp/ffmpeg left in the file (the YouTube video title, for one)."""
-    from mutagen.id3 import ID3, TALB, TIT2, TPE1, TPE2, TPOS, TRCK, TYER
-    from mutagen import MutagenError
+    try:
+        from mutagen.id3 import ID3, TALB, TIT2, TPE1, TPE2, TPOS, TRCK, TYER
+        from mutagen import MutagenError
+    except ImportError:  # not caught per track by run(): fail this track, not the session
+        raise IngestError("the mutagen package is not installed (ImportError)") from None
     artists = [a for a in (tag_text(x) for x in song.get("artists") or []) if a]
     year = tag_number(song.get("year"))
     frames = [(TIT2, tag_text(song.get("name"))), (TPE1, artists or None), (TALB, tag_text(song.get("album_name"))),

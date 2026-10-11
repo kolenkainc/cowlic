@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -584,6 +585,18 @@ elif mode == "ok_tagged":  # what ffmpeg leaves behind: the YouTube video title 
     from mutagen.id3 import ID3, TIT2
     open(out, "wb").write(b"\xff\xfb\x90\x00" * 100)
     t = ID3(); t.add(TIT2(encoding=3, text="Some Video (Official)")); t.save(out, v2_version=3)
+elif mode == "ok_tsse":  # a frame we never write: it must be gone afterwards
+    from mutagen.id3 import ID3, TSSE
+    open(out, "wb").write(b"\xff\xfb\x90\x00" * 100)
+    t = ID3(); t.add(TSSE(encoding=3, text="Lavf-test")); t.save(out, v2_version=3)
+elif mode == "warn_ok":  # bot-check text as a warning, yet a good mp3 and exit 0
+    print("WARNING: [youtube] abcdefghijk: Sign in to confirm you're not a bot. Some formats are missing", file=sys.stderr)
+    open(out, "wb").write(b"\xff\xfb\x90\x00" * 100)
+elif mode == "hang":
+    import subprocess, time
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    open(os.environ["FAKE_PIDS"], "w").write(f"{os.getpid()} {child.pid}")
+    time.sleep(60)
 elif mode == "big":
     open(out, "wb").write(b"\0" * 2048)
 elif mode == "two":
@@ -671,11 +684,49 @@ class UrllessDownloadTest(unittest.TestCase):
         self.assertEqual(json.loads(self.record.read_text())["env"], {})  # TG_BOT_TOKEN unset here; secret filtered
 
     def test_bad_video_id_is_refused_before_running_anything(self):
-        for vid in ("--exec", "a b", "x;y", "", "short"):
+        bad = ("--exec", "a b", "x;y", "", "short", "abcdefghi;k", "abcdefghi k", "abcdefghijk\n", "abcdefgh$()", "abcdefghij\u00e9",
+               "abcdefghij", "abcdefghijkl", "abcdefghijk;id")
+        for vid in bad:
             with self.subTest(vid):
                 with self.assertRaises(ingest.IngestError):
                     self.download(vid=vid)
         self.assertFalse(self.record.exists())
+
+    def test_leading_dash_video_id_is_valid_and_sits_after_the_separator(self):
+        self.download(vid="-abcdefghij")
+        argv = json.loads(self.record.read_text())["argv"]
+        self.assertEqual(argv[-2:], ["--", "https://music.youtube.com/watch?v=-abcdefghij"])
+
+    def test_missing_mutagen_fails_the_track_not_the_session(self):
+        with mock.patch.dict(sys.modules, {"mutagen": None, "mutagen.id3": None}):
+            with self.assertRaisesRegex(ingest.IngestError, "mutagen"):
+                self.download()
+            with contextlib.redirect_stdout(io.StringIO()):
+                counts = ingest.run([LASTFM_SONG], self.deps_for(), set(), {}, self.work, False)
+        self.assertEqual(counts["failed"], 1)
+
+    def test_bot_check_warning_with_a_good_mp3_is_not_a_stop(self):
+        self.assertTrue(self.download("warn_ok").exists())
+
+    def test_leftover_frames_we_do_not_write_are_removed(self):
+        from mutagen.id3 import ID3
+        self.assertNotIn("TSSE", ID3(str(self.download("ok_tsse"))))
+
+    def test_a_hung_ytdlp_is_killed_with_its_children(self):
+        pids = self.work / "pids"
+        os.environ["FAKE_PIDS"] = str(pids)
+        with mock.patch.object(ingest, "YTDLP_TIMEOUT_S", 2):
+            with self.assertRaisesRegex(ingest.IngestError, "timed out after 2 s"):
+                self.download("hang")
+        for pid in map(int, pids.read_text().split()):
+            for _ in range(50):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.1)
+            else:
+                self.fail(f"process {pid} still alive")
 
     def test_tags_are_written_and_replace_the_video_tags(self):
         from mutagen.id3 import ID3
