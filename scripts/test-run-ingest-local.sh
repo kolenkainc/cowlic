@@ -368,5 +368,35 @@ new_case ia_lastrun; COWLIC_INGEST_ARGS="--bogus"; export COWLIC_INGEST_ARGS; ru
 assert "ingest args rejected: last-run exit 78 class config" "$([ "$(jget exit_code)" = 78 ] && [ "$(jget failure_class)" = config ] && echo 0 || echo 1)"
 unset COWLIC_INGEST_ARGS
 
+# Guard: a whole-line lastfm_artists: key in sources.yml refuses the nightly run (exit 78) before anything is written
+guard_case() { # name, sources.yml content
+  new_case "guard_$1"; printf '%s\n' "$2" > "$R/sources.yml"; unset COWLIC_INGEST_ARGS; run
+}
+guard_refused() { # name
+  assert "guard $1: exit 78" "$([ "$rc" = 78 ] && echo 0 || echo 1)"
+  assert "guard $1: one ERROR line naming bootstrap and the rule" "$([ "$(grep -c 'ERROR' "$C/out")" = 1 ] && grep -q 'belongs to the bootstrap command, see docs/bootstrap-ongoing.md; remove or comment out the lastfm_artists section, enabled: false is not enough' "$C/out" && echo 0 || echo 1)"
+  assert "guard $1: ingest not started" "$([ ! -e "$STUB_ARGS_FILE" ] && echo 0 || echo 1)"
+  assert "guard $1: no log and no last-run.json" "$([ ! -e "$(LOGF)" ] && [ ! -e "$S/cowlic/last-run.json" ] && echo 0 || echo 1)"
+}
+guard_case enabled $'playlists:\n  - url: https://example.invalid/x\nlastfm_artists:\n  enabled: true\n  user: someone'
+guard_refused enabled
+guard_case disabled $'lastfm_artists:\n  enabled: false'
+guard_refused disabled
+guard_case commented $'playlists:\n  - url: https://example.invalid/x\n# lastfm_artists:\n#   enabled: true\n  # lastfm_artists:'
+assert "guard commented-out: runs normally" "$([ "$rc" = 0 ] && [ -s "$STUB_ARGS_FILE" ] && echo 0 || echo 1)"
+guard_case absent $'playlists:\n  - url: https://example.invalid/x'
+assert "guard absent: runs normally" "$([ "$rc" = 0 ] && [ -s "$STUB_ARGS_FILE" ] && echo 0 || echo 1)"
+new_case guard_nofile; run
+assert "guard: no sources.yml in the fake root is not a trip" "$([ "$rc" = 0 ] && echo 0 || echo 1)"
+# the committed sources.yml itself has no lastfm_artists: section
+assert "committed sources.yml has no lastfm_artists: section" "$(grep -qE '^lastfm_artists:' "$ROOT/sources.yml" && echo 1 || echo 0)"
+unit_args="$(grep -E '^Environment="COWLIC_INGEST_ARGS=' "$ROOT/deploy/systemd/cowlic-ingest.service" || true)"
+assert "committed unit sets the lean caps" "$([ "$unit_args" = 'Environment="COWLIC_INGEST_ARGS=--max-new 30 --max-minutes 30"' ] && echo 0 || echo 1)"
+assert "committed unit TimeoutStartSec is 1h" "$(grep -qx 'TimeoutStartSec=1h' "$ROOT/deploy/systemd/cowlic-ingest.service" && echo 0 || echo 1)"
+# the unit's caps pass the wrapper's own validation
+new_case unitcaps; COWLIC_INGEST_ARGS="${unit_args#Environment=\"COWLIC_INGEST_ARGS=}"; COWLIC_INGEST_ARGS="${COWLIC_INGEST_ARGS%\"}"; export COWLIC_INGEST_ARGS; run
+assert "the unit's caps are accepted by the wrapper" "$([ "$rc" = 0 ] && grep -q -- '--max-new 30 --max-minutes 30$' "$STUB_ARGS_FILE" && echo 0 || echo 1)"
+unset COWLIC_INGEST_ARGS
+
 if ((failures)); then echo "$failures check(s) failed"; exit 1; fi
 echo "All checks passed."

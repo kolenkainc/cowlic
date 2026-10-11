@@ -137,11 +137,13 @@ To start one run now through systemd (to test the unit): `systemctl --user start
   without linger nothing runs while logged out and the run is caught up at next login; with linger the user
   manager stays up permanently. It is only needed if runs are wanted while logged out.
 
-### Optional hardening and the 2 hour limit
+### Optional hardening and the 1 hour limit
 
-- `TimeoutStartSec=2h` stops a hung run. A very large first backlog (many new tracks, each about a minute) may
-  need longer: run the first import by hand with `scripts/run-ingest-local.sh` (no time limit), or raise the
-  value in the copied unit, then `systemctl --user daemon-reload`. A run killed by the timeout writes no
+- `TimeoutStartSec=1h` stops a hung run. The unit also caps a run at `--max-new 30 --max-minutes 30` (see "The cap
+  and the 21:10 timer"), so 1 h is a margin for one stuck download. A big backlog or the Last.fm ranking does not
+  belong to the timer: use the bootstrap command (`docs/bootstrap-ongoing.md`). Changing the unit in the repo has no
+  effect on the machine until you copy it again (owner step, #175) and run `systemctl --user daemon-reload`.
+  A run killed by the timeout writes no
   `last-run.json` (the previous file stays); look at the log.
 - `NoNewPrivileges=yes` can be added to the `[Service]` section of the copied unit. It is optional and untested
   here: the wrapper and ingest need no privilege escalation, but run `systemctl --user start cowlic-ingest.service`
@@ -672,18 +674,23 @@ the fix and exits with code 2 (class `config`; before any playlist is run, so fi
 
 ### The cap and the 21:10 timer
 
-Without `COWLIC_INGEST_ARGS` the timer run has NO cap and no time limit: with the section enabled and a big
-followed list, the first night would try to ingest everything (about 5-10 s pause plus the download per track; the
-unit stops at `TimeoutStartSec=2h`, and a run killed by that timeout writes no `last-run.json`). Set the caps in
-the unit, or set `max_artists` small in `sources.yml`. Progress is kept either way: a killed run keeps what the
-state file and D1 already hold, and the next run continues.
+The committed unit sets `COWLIC_INGEST_ARGS=--max-new 30 --max-minutes 30` and `TimeoutStartSec=1h`, so the 21:10 run
+stays lean (the playlist flow takes about 1 minute). Without `COWLIC_INGEST_ARGS` (for example a hand run, or a unit
+copy from before #174) a run has NO cap and no time limit; a run killed by the unit timeout writes no `last-run.json`.
+Progress is kept either way: a killed run keeps what the state file and D1 already hold, and the next run continues.
+Changing the unit in the repo has NO effect on the owner's machine until the owner copies it (owner step #175).
+
+Guard: the wrapper refuses to run when `sources.yml` has a whole-line `lastfm_artists:` key, even with
+`enabled: false` (a plain grep, `enabled` is never read; only commented-out lines pass). It prints one ERROR line to
+stderr and exits 78 before ingest starts and before the log or `last-run.json` is written. The ranking belongs to the
+bootstrap command, see `docs/bootstrap-ongoing.md`: remove or comment out the section.
 
 `scripts/run-ingest-local.sh` appends the optional environment variable `COWLIC_INGEST_ARGS` to the ingest command
-line, for example in the unit (`systemctl --user edit cowlic-ingest.service`, or the commented line in
+line, for example in the unit (`systemctl --user edit cowlic-ingest.service`, or the line in
 `deploy/systemd/cowlic-ingest.service`):
 
 ```ini
-Environment="COWLIC_INGEST_ARGS=--max-new 200 --max-minutes 90"
+Environment="COWLIC_INGEST_ARGS=--max-new 30 --max-minutes 30"
 ```
 
 Rules (a violation ends the run with exit 78 before ingest starts, with one log line that does not repeat the value):
@@ -821,7 +828,9 @@ from/to range.
 Added in #152 (the report that gates it is the section above). `sources.yml` can have a `lastfm_artists:` section. A run
 then also takes your top artists by listening over the last years from Last.fm and ingests their tracks through the
 same pipeline as a playlist (cap, state file, pacing and the YouTube sign-in stop apply unchanged). It is opt-in:
-a file without the section, or with `enabled: false`, behaves exactly as before. It may be combined with playlists
+a file without the section behaves exactly as before. Since #174 the nightly wrapper (`scripts/run-ingest-local.sh`)
+refuses any `sources.yml` that has the key, also with `enabled: false` (exit 78); `enabled: false` only helps when
+calling `ingest.py` by hand. It may be combined with playlists
 and with `followed_artists`; the playlists run first, then the followed artists, then the Last.fm artists.
 
 ```yaml
@@ -848,7 +857,9 @@ JSON gets an additive `lastfm_artists` object (counts only, including `dropped_s
 counted in `matched_title_only` and logged as `(matched by title only)`.
 
 The 21:10 nightly timer must not use the `lastfm_artists` section (the first run is slow and unbounded by default);
-a separate bootstrap process comes in Release 3 (#163, #168). Do not enable the section in the nightly `sources.yml`
+the wrapper enforces it (#174, see "The cap and the 21:10 timer"): the `lastfm_artists:` key must be absent or
+commented out in the nightly `sources.yml`, `enabled: false` is not enough. The bootstrap process (#163, #168) uses its
+own config, a separate local file outside the repo. Do not add the section to the nightly `sources.yml`
 to try it: measure first with the report above, and take the dry run and the first capped session from the bootstrap
 runbook when it exists (#170).
 
