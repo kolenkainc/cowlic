@@ -1,21 +1,35 @@
-# Worker deploy (#201). Contract: docs/worker-cicd.md (sections 3, 4, 6, 8, 12.2). Code only: D1 migrations are added
-# in front of the deploy by #202 (job `migrate`, plus the migration-aware parts of `plan`); runbook and rollback docs by #203.
+# Worker deploy (#201) with D1 migrations in front of the code deploy (#202).
+# Contract: docs/worker-cicd.md (sections 3, 4, 5, 6, 8, 12.2, 12.4). Runbook and rollback docs: #203.
+#
+# Job graph (ORDER RULE, enforced by `needs`): plan -> migrate -> deploy. Migrate first, deploy second: a failed,
+# rejected or cancelled migrate job means `deploy` never starts. The Worker that is live between migrate and deploy
+# is the OLD code on the NEW schema, and a rollback of the Worker leaves the NEW schema under OLD code, so every
+# migration must work with and without the code that uses it (design section 5.1 rule 2, as the indexes of #122).
+#   plan    no secrets, no environment. Guard (master head), BASE, immutability of applied migrations, lint of the
+#           migrations added since BASE, label check for destructive ones, output `environment`.
+#   migrate environment `production` (nothing destructive) or `production-destructive` (the owner is the required
+#           reviewer: the job waits for the approval and does NOT run when the owner rejects). Lists the pending
+#           migrations of the remote DB (authoritative), re-lints them, records a Time Travel bookmark, applies them.
+#   deploy  environment `production`, as in #201.
 #
 # Triggers: push to master touching worker/** (NOT this file, NOT docs: a workflow edit alone must not redeploy;
 # use workflow_dispatch for that) and workflow_dispatch (emergency / first run). Never pull_request, never
 # pull_request_target: pull request builds get no secrets and no deploy. workflow_dispatch is accepted from master only
 # (checked in `plan`; the environment's branch policy "master" refuses every other ref as well).
-# The check of the master ruleset is "ci" of worker-ci.yml: jobs here are named plan/deploy, so this workflow can
-# never satisfy or shadow the required check, and it must not be added to the ruleset.
+# The check of the master ruleset is "ci" of worker-ci.yml: jobs here are named plan/migrate/deploy, so this workflow
+# can never satisfy or shadow the required check, and it must not be added to the ruleset.
 #
 # Secrets exist only as environment secrets of `production` (CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID,
-# D1_DATABASE_ID, WORKER_URL) and are consumed in exactly these steps of the `deploy` job:
-#   - "Write runner-local wrangler config": D1_DATABASE_ID
-#   - "Mask the Worker URL": WORKER_URL
-#   - "Deploy": CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID
-#   - "Health check": WORKER_URL
+# D1_DATABASE_ID, WORKER_URL) and `production-destructive` (the first three) and are consumed in exactly these steps:
+#   migrate: "Write runner-local wrangler config": D1_DATABASE_ID
+#            "List pending migrations", "Time Travel bookmark", "Apply migrations", "Verify nothing is pending":
+#            CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID
+#   deploy:  "Write runner-local wrangler config": D1_DATABASE_ID
+#            "Mask the Worker URL": WORKER_URL
+#            "Deploy": CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID
+#            "Health check": WORKER_URL
 # `npm ci` runs with no secrets in its environment. Nothing prints an id, no `set -x`, the generated config is never
-# printed, committed or uploaded (no upload-artifact in this file).
+# printed, committed or uploaded (no upload-artifact in this file). The `plan` job uses only the default GITHUB_TOKEN.
 #
 # The Worker's own secrets (TG_BOT_TOKEN, SUBSONIC_*) are never touched: `wrangler deploy` only, no `secret put`,
 # and worker/wrangler.toml has no [vars].
@@ -41,15 +55,21 @@ concurrency:
 
 jobs:
   # Guard (section 3 rule 5): an older run that was queued must not deploy after a newer commit landed on master.
-  # No secrets, no environment, no checkout. #202 extends this job (BASE, migration lint, environment routing).
+  # Then (#202, section 12.2): BASE, immutability of applied migrations, lint of the migrations added since BASE and
+  # the routing of `migrate` to `production` or `production-destructive`. No secrets, no environment: only the default
+  # GITHUB_TOKEN, with the two extra read permissions this job needs (deployments for BASE, pull-requests for the label).
   plan:
     name: plan
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
       contents: read
+      pull-requests: read # commits/<sha>/pulls: the label of the PR that added a destructive migration
+      deployments: read # deployments of `production`: BASE
     outputs:
       deploy: ${{ steps.guard.outputs.deploy }}
+      # `production` or `production-destructive`; only these two literals are ever written (see "Classify")
+      environment: ${{ steps.classify.outputs.environment }}
     defaults:
       run:
         shell: bash
@@ -120,9 +140,473 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      # Everything below runs only when the guard decided to deploy this commit. fetch-depth 0: BASE..sha needs history
+      # (a shallow clone has neither the base commit nor a usable `git log` over a range).
+      - name: Checkout
+        if: steps.guard.outputs.deploy == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Node
+        if: steps.guard.outputs.deploy == 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          package-manager-cache: false # no cache at all (section 6)
+
+      # BASE = the commit whose migrations are already live: the commit of the last SUCCESSFUL deployment to the
+      # environment `production` (section 12.2). Why not github.event.before or the previous master head: a replaced
+      # pending run or a failed run would drop its migrations from the next run's range, and a destructive one could
+      # then no longer be routed to the approval environment.
+      # BASE is advisory: anyone with write access can create deployment records. The authority is the `migrate` job
+      # (pending list of the remote DB, re-lint without --approved in `production`, environment approval).
+      # Fallback when there is no successful deployment yet (the first run) or the API fails: push -> the `before`
+      # commit of the event, workflow_dispatch -> the parent of the commit. BASE must exist and be an ancestor of the
+      # commit (force pushes are blocked on master), otherwise the job fails closed.
+      - name: Resolve BASE
+        id: base
+        if: steps.guard.outputs.deploy == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          REPO: ${{ github.repository }}
+        run: |
+          is_sha() {
+            case "$1" in
+              "" | *[!0-9a-f]*) return 1 ;;
+            esac
+            [ "${#1}" -eq 40 ]
+          }
+          base=""
+          source=""
+          if listing=$(gh api "repos/$REPO/deployments?environment=production&per_page=30" --jq '.[] | "\(.id) \(.sha)"'); then
+            while read -r dep_id dep_sha; do
+              case "$dep_id" in
+                "" | *[!0-9]*) continue ;;
+              esac
+              is_sha "$dep_sha" || continue
+              # statuses are newest first: the first one is the current state of the deployment
+              if state=$(gh api "repos/$REPO/deployments/$dep_id/statuses?per_page=1" --jq '.[0].state // ""') && [ "$state" = "success" ]; then
+                base="$dep_sha"
+                source="last successful deployment to production"
+                break
+              fi
+            done <<< "$listing"
+          else
+            echo "::warning::cannot read the deployments of production: using the fallback base"
+          fi
+          if [ -z "$base" ]; then
+            if [ "$EVENT_NAME" = "push" ]; then
+              base="$BEFORE_SHA"
+              source="fallback: the before commit of the push"
+            else
+              base=$(git rev-parse --verify --quiet "${EVENT_SHA}^1^{commit}") || base=""
+              source="fallback: the parent of the commit"
+            fi
+          fi
+          if ! is_sha "$base"; then
+            echo "::error::cannot determine the BASE commit"
+            exit 1
+          fi
+          if ! git cat-file -e "${base}^{commit}"; then
+            echo "::error::the BASE commit is not in the clone"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$base" "$EVENT_SHA"; then
+            echo "::error::the BASE commit is not an ancestor of the commit"
+            exit 1
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "BASE $base ($source)"
+          {
+            echo "### Worker deploy plan"
+            echo
+            echo "- Commit: \`$EVENT_SHA\`"
+            echo "- BASE: \`$base\` ($source)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Section 5.1 rule 5a, here and not only in CI: a direct push could bypass CI, and the check must fail before
+      # `migrate` is even offered for approval. Applied migrations are immutable: a file that exists in BASE and is
+      # modified, renamed, deleted or changes type fails the run. A migration that was merged but never applied is
+      # not affected (BASE..sha sees it as added and it is linted at its final content). Fix mistakes with a NEW
+      # migration. No label bypasses this. A git failure fails the step (fail closed).
+      - name: Migrations are immutable
+        if: steps.guard.outputs.deploy == 'true'
+        env:
+          BASE_SHA: ${{ steps.base.outputs.base }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          changed=$(git diff --name-status --diff-filter=MRDT "$BASE_SHA" "$EVENT_SHA" -- worker/migrations/)
+          if [ -n "$changed" ]; then
+            echo "::error::existing migration files must not be modified, renamed or deleted (add a new migration)"
+            echo "$changed"
+            exit 1
+          fi
+          echo "no applied migration changed since BASE"
+
+      # Lint exactly the migrations ADDED in BASE..sha, one file per run so that the findings of each can be told
+      # apart. Result per file: exit 0 -> fine (warnings such as ADD COLUMN are fine); exit 1 and exit 0 again with
+      # --approved -> only destructive findings (routed, below); anything else (a missing IF NOT EXISTS, a parse
+      # error, exit 2) -> the run fails. A destructive file needs the label destructive-migration-approved on the
+      # merged PR whose commit ADDED that file (a label on an unrelated PR in the range does not count); the label only
+      # selects the route, the authorisation is the owner's approval of the environment `production-destructive`.
+      # Names are matched against an allowlist before they are used or printed; the label is read from the API
+      # response with jq (never spliced into a script). Any API failure counts as "no label" (fail closed).
+      - name: Classify the new migrations
+        id: classify
+        if: steps.guard.outputs.deploy == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ steps.base.outputs.base }}
+          EVENT_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          git diff -z --name-only --diff-filter=A "$BASE_SHA" "$EVENT_SHA" -- 'worker/migrations/*.sql' > "$RUNNER_TEMP/added.z"
+          mapfile -d '' -t added < "$RUNNER_TEMP/added.z"
+          destructive=()
+          for f in "${added[@]}"; do
+            if ! [[ "$f" =~ ^worker/migrations/[A-Za-z0-9._-]+\.sql$ ]]; then
+              echo "::error::a new migration has an unexpected path (allowed: worker/migrations/<name>.sql with [A-Za-z0-9._-])"
+              exit 1
+            fi
+            rc=0
+            node worker/scripts/lint-migrations.mjs "$f" || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              continue
+            fi
+            if [ "$rc" -eq 1 ] && node worker/scripts/lint-migrations.mjs --approved "$f" > /dev/null; then
+              echo "destructive migration: $f (needs the label and the owner's approval)"
+              destructive+=("$f")
+              continue
+            fi
+            echo "::error::migration $f fails the lint with a finding that no approval can waive (exit $rc)"
+            exit 1
+          done
+          environment="production"
+          for f in "${destructive[@]}"; do
+            git log --diff-filter=A --format=%H "$BASE_SHA..$EVENT_SHA" -- "$f" > "$RUNNER_TEMP/adders.txt"
+            if ! [ -s "$RUNNER_TEMP/adders.txt" ]; then
+              echo "::error::cannot find the commit that added $f"
+              exit 1
+            fi
+            while read -r c; do
+              case "$c" in
+                "" | *[!0-9a-f]*) echo "::error::unexpected commit value"; exit 1 ;;
+              esac
+              if ! gh api "repos/$REPO/commits/$c/pulls" > "$RUNNER_TEMP/pulls.json"; then
+                echo "::error::cannot read the pull requests of commit $c"
+                exit 1
+              fi
+              labelled=$(jq --arg c "$c" 'any(.[]; .merged_at != null and .merge_commit_sha == $c and any(.labels[]; .name == "destructive-migration-approved"))' "$RUNNER_TEMP/pulls.json")
+              if [ "$labelled" != "true" ]; then
+                echo "::error::$f is destructive and the merged PR of commit $c does not carry the label destructive-migration-approved: nothing is applied, nothing is deployed"
+                exit 1
+              fi
+            done < "$RUNNER_TEMP/adders.txt"
+            environment="production-destructive"
+          done
+          echo "environment=$environment" >> "$GITHUB_OUTPUT"
+          {
+            echo "- New migration files since BASE: ${#added[@]} (destructive: ${#destructive[@]})"
+            for f in "${added[@]}"; do echo "  - \`$f\`"; done
+            if [ "${#destructive[@]}" -gt 0 ]; then
+              echo "- DESTRUCTIVE (the owner's approval of \`production-destructive\` applies \`--approved\` to ALL pending files; the approval screen lists no files, so check this list and the pending list of \`migrate\` first):"
+              for f in "${destructive[@]}"; do echo "  - \`$f\`"; done
+            fi
+            echo "- \`migrate\` runs in the environment \`$environment\`"
+            echo "- The classification is advisory: \`migrate\` lists the pending migrations of the remote DB and re-lints them"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "migrate environment: $environment"
+
+  # Migrations (#202, design sections 5 and 12.2). Runs in the environment that `plan` computed: `production` (the
+  # new migrations are not destructive) or `production-destructive` (the owner is a required reviewer: the job
+  # WAITS for the approval and does not start when the owner rejects, so nothing is applied and `deploy` is skipped).
+  # `if:` accepts exactly those two names: an environment name that does not exist would be created by GitHub
+  # without protection, so nothing else is ever passed.
+  # This job always runs when a deploy is planned, also when `plan` saw no new migration file: the pending list of
+  # the remote DB is the authority (a hand-applied migration is not pending, a merged-but-never-applied one is), and
+  # "nothing pending" is a green no-op. Pending files are re-linted explicitly: WITHOUT --approved in `production`
+  # (a destructive file that `plan` did not route fails closed), with --approved only in `production-destructive`.
+  # A Time Travel bookmark is read BEFORE applying and written to the summary with the restore command; if it cannot
+  # be read nothing is applied. wrangler 4.149.0 applies migration after migration (each file plus the insert into
+  # d1_migrations as one query) and stops at the first error: the job fails, `deploy` is skipped. Whether a file is
+  # atomic on D1 is not documented, so the bookmark is the recovery point (design section 5.2).
+  # While `migrate` waits for an approval the concurrency group is held: newer runs queue behind it (one pending run is
+  # kept) and their BASE still contains the unapproved migration, so it stays routed to the approval.
+  migrate:
+    name: migrate
+    needs: plan
+    if: needs.plan.outputs.deploy == 'true' && (needs.plan.outputs.environment == 'production' || needs.plan.outputs.environment == 'production-destructive')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment:
+      name: ${{ needs.plan.outputs.environment }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: worker
+    steps:
+      # Pins: section 6 audit table (full commit SHAs). Depth 1 is enough here: the files to lint are in the checkout.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          package-manager-cache: false # no cache at all (section 6)
+
+      # No secrets in this step's environment: install scripts of dependencies never see the token.
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      # Same step as in `deploy` (section 4.2): validate, mask, substitute. Never printed.
+      - name: Write runner-local wrangler config
+        env:
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+        run: |
+          node --input-type=module - <<'EOF'
+          const id = process.env.D1_DATABASE_ID ?? "";
+          if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) {
+            console.error("::error::D1_DATABASE_ID is missing or not a lowercase UUID");
+            process.exit(1);
+          }
+          EOF
+          echo "::add-mask::$D1_DATABASE_ID"
+          node --input-type=module - <<'EOF'
+          import { readFileSync, writeFileSync } from "node:fs";
+          const placeholder = "REPLACE_AFTER_d1_create";
+          const src = readFileSync("wrangler.toml", "utf8");
+          if (src.split(placeholder).length !== 2) {
+            console.error("::error::wrangler.toml must contain the D1 placeholder exactly once");
+            process.exit(1);
+          }
+          const out = src.replace(placeholder, () => process.env.D1_DATABASE_ID);
+          if (out.includes(placeholder)) {
+            console.error("::error::placeholder still present");
+            process.exit(1);
+          }
+          writeFileSync("wrangler.ci.toml", out, { mode: 0o600 });
+          console.log("runner-local config written");
+          EOF
+
+      # CI=true makes wrangler skip the confirmation prompt of `migrations apply` (checked in the source of the pinned
+      # wrangler 4.149.0: a prompt without a TTY or in CI takes its fallback value "yes"). GitHub sets CI itself; it is
+      # repeated here so that the behaviour does not depend on the runner image. The wrangler output goes to a file and
+      # is printed only on failure (GitHub masks the known ids; the first real run's log is scanned for leaks).
+      # `list` also creates the d1_migrations table when it is missing (idempotent).
+      - name: List pending migrations
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CI: "true"
+        run: |
+          if ! npx wrangler d1 migrations list cowlic --remote -c wrangler.ci.toml > "$RUNNER_TEMP/pending.txt" 2>&1; then
+            echo "::error::wrangler d1 migrations list failed; its output follows"
+            cat "$RUNNER_TEMP/pending.txt"
+            exit 1
+          fi
+
+      # No secrets. Parses the table of `migrations list` ("Migrations to be applied:" with one name per row) or the
+      # line "No migrations to apply!". Anything else, or both, fails closed. Every name is checked against an
+      # allowlist and must exist as a file in the checkout; names are the only values passed on.
+      - name: Read the pending migrations
+        id: pending
+        run: |
+          node --input-type=module - <<'EOF'
+          import { appendFileSync, existsSync, readFileSync } from "node:fs";
+          const text = readFileSync(process.env.RUNNER_TEMP + "/pending.txt", "utf8").replace(/\u001b\[[0-9;]*m/g, "");
+          const none = text.includes("No migrations to apply");
+          const at = text.indexOf("Migrations to be applied:");
+          const names = [];
+          if (at >= 0) {
+            // Every non-empty line after the heading must be a border line or a one-cell row. A line that is neither
+            // (a changed table layout, a warning, a row with extra separators) fails the step: a file that was
+            // silently dropped here would still be applied by wrangler, but never linted.
+            const lines = text.slice(at).split("\n").slice(1);
+            for (const raw of lines) {
+              const line = raw.trim();
+              if (line === "" || /^[┌├└][─┬┼┴]*[┐┤┘]$/.test(line)) continue;
+              const m = /^│\s*([^│]*?)\s*│$/.exec(line);
+              if (!m) {
+                console.error("::error::unexpected line in the output of wrangler d1 migrations list");
+                process.exit(1);
+              }
+              if (m[1].toLowerCase() !== "name") names.push(m[1]);
+            }
+          }
+          if (none === at >= 0 || (at >= 0 && names.length === 0)) {
+            console.error("::error::unexpected output of wrangler d1 migrations list");
+            process.exit(1);
+          }
+          for (const n of names) {
+            if (!/^[A-Za-z0-9][A-Za-z0-9._-]*\.sql$/.test(n) || !existsSync("migrations/" + n)) {
+              console.error("::error::a pending migration has an unexpected name or is not in this checkout");
+              process.exit(1);
+            }
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, "count=" + names.length + "\nnames=" + names.join(" ") + "\n");
+          if (names.length === 0) {
+            console.log("no pending migrations");
+            appendFileSync(process.env.GITHUB_STEP_SUMMARY, "### D1 migrations\n\n- No pending migrations: nothing to apply\n");
+          } else {
+            console.log("pending migrations: " + names.join(" "));
+          }
+          EOF
+
+      # Defence in depth and the real gate: the pending files are linted explicitly. `production` runs the lint
+      # WITHOUT --approved, so any destructive statement (or a missing IF NOT EXISTS) fails the job before anything is
+      # applied. Only the environment `production-destructive` (reached after the owner's approval) adds --approved.
+      # Warnings (ADD COLUMN, as in 0003) do not fail the lint and are not destructive.
+      - name: Lint the pending migrations
+        if: steps.pending.outputs.count != '0'
+        env:
+          TARGET_ENV: ${{ needs.plan.outputs.environment }}
+          PENDING: ${{ steps.pending.outputs.names }}
+        run: |
+          args=()
+          if [ "$TARGET_ENV" = "production-destructive" ]; then
+            args+=(--approved)
+          fi
+          files=()
+          for n in $PENDING; do
+            files+=("migrations/$n")
+          done
+          if ! node scripts/lint-migrations.mjs "${args[@]}" "${files[@]}"; then
+            echo "::error::lint of the pending migrations failed: nothing is applied"
+            exit 1
+          fi
+
+      # Fail closed: no bookmark, no apply. `--json` prints the API result ({"bookmark": "..."}); the shape is checked
+      # in the next step. Only stderr is shown on failure (the JSON is not printed).
+      - name: Time Travel bookmark
+        if: steps.pending.outputs.count != '0'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CI: "true"
+        run: |
+          if ! npx wrangler d1 time-travel info cowlic --json -c wrangler.ci.toml > "$RUNNER_TEMP/bookmark.json" 2> "$RUNNER_TEMP/bookmark.err"; then
+            echo "::error::cannot read the Time Travel bookmark: nothing is applied"
+            cat "$RUNNER_TEMP/bookmark.err"
+            exit 1
+          fi
+
+      - name: Record the bookmark
+        id: bookmark
+        if: steps.pending.outputs.count != '0'
+        env:
+          PENDING: ${{ steps.pending.outputs.names }}
+        run: |
+          node --input-type=module - <<'EOF'
+          import { appendFileSync, readFileSync } from "node:fs";
+          const raw = readFileSync(process.env.RUNNER_TEMP + "/bookmark.json", "utf8");
+          let bookmark = "";
+          try {
+            const o = JSON.parse(raw.slice(raw.indexOf("{"), raw.lastIndexOf("}") + 1));
+            if (o && typeof o.bookmark === "string") bookmark = o.bookmark;
+          } catch {
+            // not JSON: the check below decides
+          }
+          if (!/^[0-9A-Za-z][0-9A-Za-z-]{15,199}$/.test(bookmark)) {
+            console.error("::error::the Time Travel output has no usable bookmark: nothing is applied");
+            process.exit(1);
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, "bookmark=" + bookmark + "\n");
+          const q = String.fromCharCode(96);
+          const fence = q + q + q;
+          appendFileSync(
+            process.env.GITHUB_STEP_SUMMARY,
+            "### D1 migrations: about to apply\n\n" +
+              "- Pending: " + process.env.PENDING.split(" ").map((n) => q + n + q).join(", ") + "\n" +
+              "- Time Travel bookmark before applying: " + q + bookmark + q + "\n\n" +
+              "Restore (owner, from worker/ on the owner's machine; overwrites the database in place and asks for confirmation):\n\n" +
+              fence + "\nnpx wrangler d1 time-travel restore cowlic --bookmark=" + bookmark + " -c wrangler.local.toml\n" + fence + "\n",
+          );
+          console.log("bookmark recorded in the job summary");
+          EOF
+
+      # The apply itself. wrangler stops at the first failing migration and exits non-zero. A hung prompt would be
+      # stopped by the step timeout.
+      - name: Apply migrations
+        id: apply
+        if: steps.pending.outputs.count != '0'
+        timeout-minutes: 15
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CI: "true"
+        run: |
+          npx wrangler d1 migrations apply cowlic --remote -c wrangler.ci.toml
+
+      # Idempotency proof: right after the apply nothing may be pending any more.
+      - name: Verify nothing is pending
+        id: verify
+        if: steps.apply.outcome == 'success'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CI: "true"
+        run: |
+          if ! npx wrangler d1 migrations list cowlic --remote -c wrangler.ci.toml > "$RUNNER_TEMP/after.txt" 2>&1; then
+            echo "::error::wrangler d1 migrations list failed after the apply; its output follows"
+            cat "$RUNNER_TEMP/after.txt"
+            exit 1
+          fi
+          if ! grep -qF "No migrations to apply" "$RUNNER_TEMP/after.txt"; then
+            echo "::error::migrations are still pending after the apply"
+            exit 1
+          fi
+          echo "no migration pending after the apply"
+
+      - name: Summary (applied)
+        if: steps.verify.outcome == 'success'
+        env:
+          PENDING: ${{ steps.pending.outputs.names }}
+          BOOKMARK: ${{ steps.bookmark.outputs.bookmark }}
+          TARGET_ENV: ${{ needs.plan.outputs.environment }}
+        run: |
+          {
+            echo "### D1 migrations applied"
+            echo
+            echo "- Environment: \`$TARGET_ENV\`"
+            for n in $PENDING; do echo "- \`$n\`"; done
+            echo "- Time Travel bookmark before applying: \`$BOOKMARK\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Nothing is rolled back automatically (a restore overwrites the database, so it is a human decision).
+      # Also runs when the job is cancelled or times out while the apply or the verify was running (their outcome is
+      # then `cancelled`). It never runs when the apply was not started (outcome `skipped`), so it cannot print a
+      # restore hint for a database that was not touched.
+      - name: Summary (migration failed)
+        if: always() && (steps.apply.outcome == 'failure' || steps.apply.outcome == 'cancelled' || steps.verify.outcome == 'failure' || steps.verify.outcome == 'cancelled')
+        env:
+          PENDING: ${{ steps.pending.outputs.names }}
+          BOOKMARK: ${{ steps.bookmark.outputs.bookmark }}
+        run: |
+          {
+            echo "### D1 migrations FAILED, the Worker deploy is skipped"
+            echo
+            echo "- Pending before the apply: \`$PENDING\`"
+            echo "- Time Travel bookmark before applying: \`${BOOKMARK:-unknown}\`"
+            echo
+            echo "Some of the migrations may be applied (wrangler stops at the first error; whether one file is atomic is not documented)."
+            echo "Check from \`worker/\` on the owner's machine: \`npx wrangler d1 migrations list cowlic --remote -c wrangler.local.toml\`."
+            echo "Fix forward with a NEW migration, or restore the bookmark (design section 9.2); never edit an applied migration."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Needs `migrate` (ORDER RULE): `deploy` starts only after migrate finished successfully. A failed, rejected or
+  # cancelled migrate job skips this job; so does a skipped one (nothing here treats a skipped migrate as a no-op:
+  # when a deploy is planned `migrate` always runs and does its own "no pending migrations" no-op).
   deploy:
     name: deploy
-    needs: plan
+    needs: [plan, migrate]
     if: needs.plan.outputs.deploy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
