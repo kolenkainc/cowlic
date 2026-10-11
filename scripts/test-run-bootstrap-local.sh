@@ -149,6 +149,9 @@ reject "status with --max-minutes=5" status --max-minutes=5
 reject "status with abbreviated --max" status --max 5
 reject "--result-json supplied by the caller" run --max-new 1 --max-minutes 1 --result-json /tmp/x
 reject "abbreviated --result-j" run --max-new 1 --max-minutes 1 --resu /tmp/x
+for ab in --r --re --res --resul --result-js --result-json=/tmp/x; do reject "prefix $ab of --result-json" run --max-new 1 --max-minutes 1 "$ab" /tmp/x; done
+new_case ok-reset; run run --max-new 1 --max-minutes 1 --reset-state --refresh
+assert "--reset-state and --refresh are not mistaken for --result-json" "$(is "$rc" 0)"
 new_case maxok; run run --max-new 1000000 --max-minutes 1440
 assert "maxima 1000000 and 1440 are only refused by the guard, not by the range check" "$(has 'reaches the next 21:10' "$C/out")"
 new_case rej-out; run run --max-new 1 --max-minutes bogus-value-123
@@ -251,6 +254,7 @@ assert "SIGTERM: status file records 143" "$(python3 -c 'import json,sys; assert
 assert "SIGTERM: lock released" "$(flock -n "$S/cowlic/ingest.lock" true && echo 0 || echo 1)"
 
 sleeper_case kill9
+mkdir -p "$S/cowlic"; echo '{"stale": true}' > "$S/cowlic/bootstrap-last-run.json"
 XDG_STATE_HOME="$S" bash "$R/scripts/run-bootstrap-local.sh" run --max-new 1 --max-minutes 1 > "$C/out" 2>&1 &
 wp=$!
 sleep 2
@@ -258,6 +262,7 @@ kill -9 "$wp"
 wait "$wp" 2> /dev/null || true
 sleep 4
 assert "SIGKILL: the watchdog ended the session, no stray process" "$([ -z "$(pgrep -f -- "sleep $MARK|$R/ingest/.venv/bin/python|$R/scripts/run-bootstrap-local.sh" || true)" ] && echo 0 || echo 1)"
+assert "SIGKILL: the previous bootstrap-last-run.json is gone, not mistaken for this session" "$([ ! -e "$S/cowlic/bootstrap-last-run.json" ] && echo 0 || echo 1)"
 assert "SIGKILL: lock released afterwards" "$(flock -n "$S/cowlic/ingest.lock" true && echo 0 || echo 1)"
 pkill -f -- "sleep $MARK" 2> /dev/null || true
 

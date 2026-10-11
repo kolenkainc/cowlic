@@ -11,7 +11,7 @@
 #   no eval: the arguments are only matched by `case`, then forwarded verbatim as an array.
 # - Argument rules (checked first, nothing is touched on a violation: one stderr line, exit 78): the subcommand is one of
 #   rank|plan|run|status; run and plan REQUIRE --max-new (1..1000000) and --max-minutes (1..1440), each once, as
-#   "--opt N" or "--opt=N"; rank and status take no --max-*; any abbreviation of --max-* or --result-json is rejected
+#   "--opt N" or "--opt=N"; rank and status take no --max-*; any abbreviation of --max-* or any prefix of --result-json from --r on is rejected
 #   (argparse would accept it behind the wrapper's back); --result-json belongs to the wrapper (it is added for run).
 # - Lock: the SAME file as the nightly wrapper (ingest.lock), taken exactly like it: exec 9>, flock -n 9, exit 75 with
 #   one stderr line before anything else; a blocked invocation touches neither the log nor bootstrap-last-run.json.
@@ -28,7 +28,8 @@
 # - Output (stdout and stderr of bootstrap.py) -> ingest/ship_grafana.py --filter (redaction of LASTFM_API_KEY, the
 #   Grafana token and COWLIC_EXTRA_SECRET: put the Last.fm user name there if it must never reach the log) -> tee ->
 #   ${XDG_STATE_HOME:-$HOME/.local/state}/cowlic/bootstrap.log (0600, rotated by size like ingest.log: .1 .. .N).
-# - bootstrap-last-run.json next to it: written after EVERY invocation that got past the lock and the guard (started_at,
+# - bootstrap-last-run.json next to it: removed at the start of a session (after the lock and the guard), so a killed
+#   wrapper leaves none; written after EVERY invocation that got past the lock and the guard (started_at,
 #   finished_at, subcommand, exit_code, stop_reason, log_file, result = bootstrap.py's --result-json object or null).
 #   Always valid JSON, atomic, 0600. NEVER touches last-run.json or ingest.log and never calls ship_grafana.py for
 #   shipping (only its --filter mode): no Grafana push, the owner is informed through the log only.
@@ -69,7 +70,9 @@ i=0
 while [ "$i" -lt "$n_args" ]; do
   a="${ARGS[i]}"
   case "$a" in
-    --resu*) usage_fail "--result-json is set by the wrapper" ;;
+    --r*)
+      name="${a%%=*}"  # every prefix of --result-json (at least --r) is an abbreviation argparse could accept
+      case "--result-json" in "$name"*) usage_fail "--result-json is set by the wrapper" ;; esac ;;
     --m*)
       case "$SUB" in rank | status) usage_fail "$SUB takes no --max-* option" ;; esac
       case "$a" in
@@ -87,7 +90,7 @@ done
 case "$SUB" in
   run | plan) { [ -n "$MAX_NEW" ] && [ -n "$MAX_MINUTES" ]; } || usage_fail "$SUB requires --max-new and --max-minutes" ;;
 esac
-unset i a n_args
+unset i a n_args name
 
 # ---- paths -------------------------------------------------------------------------------------------------------
 if [ -z "${XDG_STATE_HOME:-}" ] && [ -z "${HOME:-}" ]; then
@@ -215,6 +218,7 @@ esac
 # ---- start -------------------------------------------------------------------------------------------------------
 STARTED_AT="$(now_utc)"
 rm -f "$RESULT"
+rm -f "$LAST_RUN"  # a kill -9 (no trap runs) must not leave the previous run's record looking like this session's
 rotate_log
 log "start: $SUB (arguments are not logged; --max-new ${MAX_NEW:-none}, --max-minutes ${MAX_MINUTES:-none})"
 
