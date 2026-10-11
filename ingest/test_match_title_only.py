@@ -73,6 +73,28 @@ class TitleOnlyTest(unittest.TestCase):
         self.assertIsNone(find([res("Under Pressure", ("Some Cover Band",))]))
         self.assertIsNone(find([res("Under Pressure", ())]))
 
+    def test_rejects_a_different_artist_sharing_the_article_241(self):
+        # "the kooks" vs "the motion" scored 0.63 on the full names (>= the old 0.6 bar): the article carried it
+        self.assertGreaterEqual(match.similarity("The Kooks", "The Motion"), 0.6)
+        self.assertLess(match.artist_similarity("The Kooks", "The Motion"), match.TITLE_ONLY_ARTIST_MIN_SIMILARITY)
+        self.assertIsNone(find([res("Seaside", ("The Motion",), 208)], title="Seaside", artist="The Kooks"))
+
+    def test_article_is_ignored_when_the_name_is_the_same(self):
+        for req, got in (("The Kooks", "The Kooks"), ("The Kooks", "Kooks"), ("Kooks", "The Kooks"),
+                         ("A Flock of Seagulls", "Flock of Seagulls"), ("The Who", "Who"), ("Who", "The Who")):
+            self.assertIsNotNone(find([res("Seaside", (got,), 208)], title="Seaside", artist=req), (req, got))
+
+    def test_artist_bar_is_pinned_by_behaviour(self):
+        # 0.667 after the strip: a bar of 0.65 or 0.6 would accept it
+        self.assertAlmostEqual(match.artist_similarity("Pink Floyd", "Pink Flamingos"), 0.667, places=2)
+        self.assertIsNone(find([res("Seaside", ("Pink Flamingos",), 208)], title="Seaside", artist="Pink Floyd"))
+        self.assertIsNotNone(find([res("Seaside", ("1975",), 208)], title="Seaside", artist="The 1975"))
+        self.assertIsNotNone(find([res("Seaside", ("The 1975",), 208)], title="Seaside", artist="1975"))
+
+    def test_article_only_name_is_not_emptied(self):
+        self.assertEqual(match.artist_similarity("The", "The"), 1.0)
+        self.assertEqual(match.artist_similarity("A", "A"), 1.0)
+
     def test_accepts_cyrillic_artist_spelling(self):
         c = find([res("Драма", ("Гриша Ургант",))], title="Драма", artist="Grisha Urgant")
         self.assertEqual(c.mode, "title-only")
@@ -96,7 +118,7 @@ class TitleOnlyTest(unittest.TestCase):
             self.assertEqual(find([res(title)], title=base) is not None, ok, title)
 
     def test_artist_threshold_boundary(self):
-        self.assertGreaterEqual(match.TITLE_ONLY_ARTIST_MIN_SIMILARITY, 0.6)
+        self.assertGreaterEqual(match.TITLE_ONLY_ARTIST_MIN_SIMILARITY, 0.7)
         self.assertIsNone(find([res("Under Pressure", ("Que",))], artist="Queensryche Band"))
 
     def test_rejects_out_of_range_duration(self):
