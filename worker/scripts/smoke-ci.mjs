@@ -10,6 +10,7 @@
 //   5b. the same smoke on a LEGACY database (migrations 0001+0002 only, seed fixtures/smoke-seed-pre0003.sql): proves the
 //       Worker still serves the library before migration 0003 (no artists.image_file_id) is applied
 //   6. scripts/paging-check.mjs
+//   7. scripts/log-check.mjs (#272): spies on console and asserts no log line carries credentials, query or ids
 // It never reads worker/.dev.vars or worker/wrangler.local.toml, and the children get an allowlisted environment
 // (no Cloudflare or Telegram credentials from the caller). Exit code is non-zero on any failure.
 // Cleanup: the temp dir is removed on success, on failure and on SIGINT/SIGTERM/SIGHUP. Steps run as async child
@@ -27,6 +28,8 @@ import { fileURLToPath } from "node:url";
 const EXPECTED_SKIPPED = 6; // the stream checks in smoke.mjs
 const MIN_PASS = 51; // the default suite has 51 PASS in CI mode (35 before the artist-image checks of #249); raise when checks are added
 const MIN_PASS_LEGACY = 46; // the same suite on the pre-0003 schema (46 PASS: no photo-fixture checks)
+
+const MIN_PASS_LOGCHECK = 28; // scripts/log-check.mjs (log leak check, #272)
 
 const workerDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const tmp = mkdtempSync(join(tmpdir(), "cowlic-smoke-"));
@@ -127,6 +130,12 @@ try {
   });
   verify(legacyOut, MIN_PASS_LEGACY);
   await run("paging check", ["scripts/paging-check.mjs"]);
+  // #272: no log line may carry the query string, credentials, headers, ids or the URL (stub D1 and Telegram).
+  const logOut = await run("log leak check", ["scripts/log-check.mjs"]);
+  const logLines = (word) => logOut.split("\n").filter((l) => l.startsWith(`${word} `)).length;
+  if (logLines("FAIL") !== 0 || logLines("PASS") < MIN_PASS_LOGCHECK) {
+    throw new Error(`unexpected log-check counts: PASS=${logLines("PASS")} FAIL=${logLines("FAIL")}`);
+  }
 } catch (e) {
   failed = true;
   console.error(`smoke:ci FAILED: ${e.message}`);

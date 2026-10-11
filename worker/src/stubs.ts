@@ -27,6 +27,9 @@ const EMPTY: Record<string, Record<string, unknown>> = {
 
 const NOOP = new Set(["star", "unstar", "scrobble", "setRating", "savePlayQueue", "createBookmark", "deleteBookmark"]);
 
+// Names this module answers (the route allowlist of the logs, src/log.ts).
+export const STUB_ENDPOINTS: ReadonlySet<string> = new Set([...Object.keys(EMPTY), ...NOOP, "getPlayQueue", "getPlaylist", "getUser"]);
+
 export function stubResponse(endpoint: string, params: URLSearchParams): Response | null {
   const empty = EMPTY[endpoint];
   if (empty) return ok(params, empty);

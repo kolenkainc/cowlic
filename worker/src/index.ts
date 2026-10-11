@@ -1,5 +1,6 @@
 import { authenticate, type AuthEnv } from "./auth";
 import { coverFileId, getAlbum, getAlbumList2, getArtist, getArtists, getSong, search3 } from "./library";
+import { logEvent, routeName } from "./log";
 import { fail, ok } from "./subsonic";
 import { stubResponse } from "./stubs";
 import { proxyTelegramFile, type TgEnv } from "./telegram";
@@ -22,23 +23,22 @@ interface TrackRow {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-    const endpoint = url.pathname.match(/^\/rest\/([A-Za-z0-9]+)(?:\.view)?$/)?.[1] ?? "-";
+    const route = routeName(new URL(request.url).pathname);
     let res: Response;
     try {
-      res = await handle(request, env);
+      res = await handle(request, env, route);
     } catch (e) {
-      // Error type only: messages may embed query values.
-      console.error(JSON.stringify({ method: request.method, path: url.pathname, endpoint, error: e instanceof Error ? e.name : "unknown" }));
+      // Route and error class only: the message may embed query values.
+      logEvent("unhandled_error", { route, error: e });
       throw e;
     }
-    // Never log the query string, credentials or ids.
-    console.log(JSON.stringify({ method: request.method, path: url.pathname, endpoint, status: res.status }));
+    // Never log the URL, query string, credentials, headers or ids (see src/log.ts).
+    logEvent("request", { route, status: res.status });
     return res;
   },
 };
 
-async function handle(request: Request, env: Env): Promise<Response> {
+async function handle(request: Request, env: Env, route: string): Promise<Response> {
   const url = new URL(request.url);
   const m = url.pathname.match(/^\/rest\/([A-Za-z0-9]+)(?:\.view)?$/);
   if (!m) return new Response("Not found", { status: 404 });
@@ -49,7 +49,10 @@ async function handle(request: Request, env: Env): Promise<Response> {
     new URLSearchParams(await request.clone().text()).forEach((v, k) => params.set(k, v));
   }
 
-  if (!(await authenticate(params, env))) return fail(params, 40, "Wrong username or password");
+  if (!(await authenticate(params, env))) {
+    logEvent("auth_failed", { route, status: 200, code: 40 });
+    return fail(params, 40, "Wrong username or password");
+  }
 
   switch (m[1]) {
     case "ping":
@@ -75,16 +78,16 @@ async function handle(request: Request, env: Env): Promise<Response> {
     case "search3":
       return search3(env.DB, params);
     case "getCoverArt":
-      return cover(request, params, env);
+      return cover(request, params, env, route);
     case "stream":
     case "download":
-      return stream(request, params, env);
+      return stream(request, params, env, route);
     default:
       return stubResponse(m[1], params) ?? fail(params, 0, `Not implemented: ${m[1]}`);
   }
 }
 
-async function stream(request: Request, params: URLSearchParams, env: Env): Promise<Response> {
+async function stream(request: Request, params: URLSearchParams, env: Env, route: string): Promise<Response> {
   const id = params.get("id");
   if (!id) return fail(params, 10, "Required parameter is missing: id");
 
@@ -92,14 +95,18 @@ async function stream(request: Request, params: URLSearchParams, env: Env): Prom
   if (!track) return fail(params, 70, "Song not found");
 
   const res = await proxyTelegramFile(request, track.tg_file_id, track.content_type, env);
-  return res ?? fail(params, 0, "Upstream storage error", 502);
+  if (res) return res;
+  logEvent("upstream_error", { route, status: 502, code: 0 });
+  return fail(params, 0, "Upstream storage error", 502);
 }
 
-async function cover(request: Request, params: URLSearchParams, env: Env): Promise<Response> {
+async function cover(request: Request, params: URLSearchParams, env: Env, route: string): Promise<Response> {
   const id = params.get("id");
   if (!id) return fail(params, 10, "Required parameter is missing: id");
   const fileId = await coverFileId(env.DB, id);
   if (!fileId) return fail(params, 70, "Cover art not found", 404);
   const res = await proxyTelegramFile(request, fileId, "image/jpeg", env);
-  return res ?? fail(params, 0, "Upstream storage error", 502);
+  if (res) return res;
+  logEvent("upstream_error", { route, status: 502, code: 0 });
+  return fail(params, 0, "Upstream storage error", 502);
 }
