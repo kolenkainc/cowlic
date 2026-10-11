@@ -121,9 +121,11 @@ class MusicSource(Protocol):
 class Pacer:
     """At least `interval` seconds between two source calls; clock and sleep are injected for tests."""
 
-    def __init__(self, interval: float = MIN_INTERVAL_S, clock: Callable[[], float] = time.monotonic,
-                 sleep: Callable[[float], None] = time.sleep):
-        self.interval, self.clock, self.sleep = interval, clock, sleep
+    def __init__(self, interval: float = MIN_INTERVAL_S, clock: Callable[[], float] | None = None,
+                 sleep: Callable[[float], None] | None = None):
+        self.interval = interval
+        self.clock = clock or (lambda: time.monotonic())  # looked up at call time (a test may patch `time`)
+        self.sleep = sleep or (lambda s: time.sleep(s))
         self._last: float | None = None
 
     def wait(self) -> None:
@@ -132,6 +134,9 @@ class Pacer:
             self.sleep(self.interval - (now - self._last))
             now = self.clock()
         self._last = now
+
+
+_DEFAULT_PACER = Pacer()  # shared by every check_artist call that gets no pacer: the 1 s gap holds across artists
 
 
 class GuardedSource:
@@ -241,7 +246,7 @@ def validate_state(obj) -> dict:
     for key, entry in artists.items():
         if not isinstance(key, str) or not _ARTIST_KEY.fullmatch(key):
             raise NewReleasesStateError("new-releases state: an artist key is not `lfm:` + 16 hex")
-        if not isinstance(entry, dict) or not set(entry) <= {"browse_id", "checked_at", "failures", "evaluated"}:
+        if not isinstance(entry, dict) or not set(entry) <= {"browse_id", "checked_at", "failed_at", "failures", "evaluated"}:
             raise NewReleasesStateError(f"new-releases state: entry {key} has a wrong shape")
         b = entry.get("browse_id")
         if "browse_id" in entry and not (isinstance(b, str) and _BROWSE_ID.fullmatch(b)):
@@ -249,6 +254,9 @@ def validate_state(obj) -> dict:
         c = entry.get("checked_at")
         if "checked_at" in entry and not (isinstance(c, str) and _DATE.fullmatch(c) and _parse_date(c) is not None):
             raise NewReleasesStateError(f"new-releases state: entry {key} has a malformed checked_at")
+        fa = entry.get("failed_at")
+        if "failed_at" in entry and not (isinstance(fa, str) and _DATE.fullmatch(fa) and _parse_date(fa) is not None):
+            raise NewReleasesStateError(f"new-releases state: entry {key} has a malformed failed_at")
         f = entry.get("failures", 0)
         if isinstance(f, bool) or not isinstance(f, int) or not 0 <= f <= 10**9:
             raise NewReleasesStateError(f"new-releases state: entry {key} has a malformed failures count")
@@ -320,10 +328,19 @@ def add_evaluated(evaluated: list, key: str, cap: int = MAX_EVALUATED) -> list:
 
 # ---- which artists are due ----
 
+def backoff_days(failures: int, recheck_days: int = RECHECK_DAYS) -> int:
+    """Days to wait after `failures` failed checks in a row: 1, 2, 4, ... capped at recheck_days."""
+    return min(2 ** max(0, min(failures, 10) - 1), max(1, recheck_days))
+
+
 def is_due(entry: dict | None, today: date, recheck_days: int = RECHECK_DAYS) -> bool:
     """Never checked, or the last successful check is `recheck_days` or more days ago. A checked_at in the future
     (clock skew, a wrong file) counts as due, so it cannot block an artist for good."""
-    c = entry.get("checked_at") if entry else None
+    entry = entry or {}
+    failures, failed_at = entry.get("failures", 0), _parse_date(entry.get("failed_at") or "")
+    if failures > 0 and failed_at is not None and 0 <= (today - failed_at).days < backoff_days(failures, recheck_days):
+        return False  # a failing artist backs off: it must not eat the nightly cap and starve the others
+    c = entry.get("checked_at")
     if c is None:
         return True
     d = _parse_date(c)
@@ -333,9 +350,9 @@ def is_due(entry: dict | None, today: date, recheck_days: int = RECHECK_DAYS) ->
 def select_due(names: Iterable[str], state: dict, today: date, max_artists: int,
                recheck_days: int = RECHECK_DAYS) -> tuple[list[str], int]:
     """(up to max_artists due names, number of due names). Never-checked first, then the oldest check; ties keep
-    the input order; a name that normalises to nothing or repeats an earlier one is ignored."""
+    the input order; artists whose last checks failed come after the healthy ones; a name that normalises to nothing or repeats an earlier one is ignored."""
     seen: set[str] = set()
-    due: list[tuple[str, int, str]] = []
+    due: list[tuple[bool, str, int, str]] = []
     for i, name in enumerate(names):
         key = artist_key(name)
         if key is None or key in seen:
@@ -343,32 +360,39 @@ def select_due(names: Iterable[str], state: dict, today: date, max_artists: int,
         seen.add(key)
         entry = state["artists"].get(key)
         if is_due(entry, today, recheck_days):
-            due.append(((entry or {}).get("checked_at") or "", i, name))
-    due.sort(key=lambda t: (t[0], t[1]))
-    return [n for _, _, n in due[:max(0, max_artists)]], len(due)
+            e = entry or {}
+            due.append((e.get("failures", 0) > 0, e.get("checked_at") or "", i, name))
+    due.sort(key=lambda t: t[:3])  # healthy artists first: a failing one never starves them
+    return [t[3] for t in due[:max(0, max_artists)]], len(due)
 
 
 # ---- artist link ----
 
 def resolve_browse_id(results, name: str) -> tuple[str, str | None]:
     """(OK, browse id) for exactly one distinct artist whose normalised name equals `name`; (AMBIGUOUS, None) for
-    two or more distinct ids with that name; (UNRESOLVED, None) for none. Only the name equality counts: a near
+    two or more distinct ids with that name; (UNRESOLVED, None) for none; raises SourceError when the answer is not a list or holds no usable artist item
+    (a degraded reply must not hide the artist for a week). Only the name equality counts: a near
     match is not accepted."""
     want = normalize(name)
     ids: list[str] = []
-    if isinstance(results, list):
-        for item in results[:MAX_LISTED]:
-            if not isinstance(item, dict):
-                continue
-            rtype = item.get("resultType")
-            if rtype is not None and rtype != "artist":
-                continue
-            title = clean_text(item.get("artist") if item.get("artist") is not None else item.get("title"))
-            bid = item.get("browseId")
-            if title is None or normalize(title) != want or not isinstance(bid, str) or not _BROWSE_ID.fullmatch(bid):
-                continue
-            if bid not in ids:
-                ids.append(bid)
+    usable = 0
+    if not isinstance(results, list):
+        raise SourceError("source call failed (malformed search answer)")
+    for item in results[:MAX_LISTED]:
+        if not isinstance(item, dict):
+            continue
+        rtype = item.get("resultType")
+        if rtype is not None and rtype != "artist":
+            continue
+        title = clean_text(item.get("artist") if item.get("artist") is not None else item.get("title"))
+        bid = item.get("browseId")
+        if title is None or not isinstance(bid, str) or not _BROWSE_ID.fullmatch(bid):
+            continue
+        usable += 1
+        if normalize(title) == want and bid not in ids:
+            ids.append(bid)
+    if not usable:  # an answer we cannot read is a failure, not "no exact match"
+        raise SourceError("source call failed (search answer without a usable artist)")
     if not ids:
         return UNRESOLVED, None
     return (OK, ids[0]) if len(ids) == 1 else (AMBIGUOUS, None)
@@ -452,10 +476,11 @@ def find_missing(releases: list[Release], stored_albums: Iterable[tuple], evalua
 
 # ---- records ----
 
-def build_records(artist: str, release: Release, album) -> list[dict] | None:
+def build_records(artist: str, release: Release, album, stats: dict | None = None) -> list[dict] | None:
     """Ingest records of a `get_album` answer (the shape of lastfm_tracks.make_record, duration in whole seconds or
     None, never invented). None when the answer is not a dict with a track list. A track without a clean title or id,
-    or whose listed artists do not include `artist`, is dropped; a repeated id keeps the first."""
+    or whose listed artists do not include `artist`, is dropped; a repeated id keeps the first.
+    `stats`, when given, receives `tracks` (usable tracks seen) and `foreign` (dropped by the artist rule)."""
     if not isinstance(album, dict) or not isinstance(album.get("tracks"), list):
         return None
     album_name = clean_text(album.get("title")) or release.title
@@ -463,6 +488,8 @@ def build_records(artist: str, release: Release, album) -> list[dict] | None:
     base = normalize(artist)
     records: list[dict] = []
     seen: set[str] = set()
+    st = stats if stats is not None else {}
+    st["tracks"] = st["foreign"] = 0
     for t in album["tracks"][:MAX_TRACKS]:
         if not isinstance(t, dict):
             continue
@@ -475,7 +502,9 @@ def build_records(artist: str, release: Release, album) -> list[dict] | None:
             n = clean_text(a.get("name")) if isinstance(a, dict) else None
             if n:
                 others.append(n)
+        st["tracks"] += 1
         if others and base not in {normalize(n) for n in others}:
+            st["foreign"] += 1
             continue
         seen.add(sid)
         extra: list[str] = []
@@ -513,6 +542,9 @@ class ArtistCheck:
     evaluated_hits: int = 0
     skipped_old: int = 0
     dropped_stored: int = 0  # tracks dropped by dedupe.drop_stored
+    foreign: int = 0         # tracks dropped because their artists do not include the artist (compilations)
+    empty_releases: int = 0  # releases whose album page had no usable track: left unevaluated, retried later
+    release_failures: int = 0  # get_album calls that failed (not a refusal): the release is skipped, not evaluated
     requests: int = 0
 
 
@@ -520,20 +552,22 @@ def log_line(res: ArtistCheck) -> str:
     """One line, counts and the hashed key only (it is shipped to Grafana)."""
     return (f"new releases {res.key}: {res.status}, {res.listed} listed, {res.in_library} in library, "
             f"{res.evaluated_hits} evaluated, {res.skipped_old} too old, {res.missing} missing, {res.deferred} deferred, "
-            f"{len(res.records)} new tracks, {res.dropped_stored} already stored, {res.requests} requests")
+            f"{len(res.records)} new tracks, {res.dropped_stored} already stored, {res.foreign} foreign, "
+            f"{res.empty_releases} empty, {res.release_failures} release errors, {res.requests} requests")
 
 
-def _fail(state: dict, key: str, res: ArtistCheck, status: str, browse_id: str | None) -> ArtistCheck:
+def _fail(state: dict, key: str, res: ArtistCheck, status: str, browse_id: str | None, today: date) -> ArtistCheck:
     entry = state["artists"].setdefault(key, {})
     if browse_id:
         entry["browse_id"] = browse_id  # a resolved link stays valid whatever happened next
     entry["failures"] = entry.get("failures", 0) + 1
+    entry["failed_at"] = today.isoformat()
     res.status = status
     return res
 
 
 def check_artist(source: MusicSource, artist: str, state: dict, stored_rows: Iterable[tuple],
-                 stored_albums: Iterable[tuple] = (), *, today: date, pacer: Pacer | None = None,
+                 stored_albums: Iterable[tuple], *, today: date, pacer: Pacer | None = None,
                  max_releases: int = MAX_RELEASES, recheck_days: int = RECHECK_DAYS, force: bool = False,
                  out: Callable[[str], None] = lambda s: print(s, file=sys.stderr)) -> ArtistCheck:
     """The missing releases of one artist as ingest records (ArtistCheck.records).
@@ -544,7 +578,10 @@ def check_artist(source: MusicSource, artist: str, state: dict, stored_rows: Ite
     sets checked_at and resets failures and evaluates the releases with nothing new; a failed or refused check only
     raises `failures`. The caller saves the state (`save_state`). Not due artists return NOT_DUE without any call.
     An unresolved or ambiguous artist is not a failure: it counts as checked (retried after `recheck_days`) and
-    costs no further calls. On REFUSED the caller must stop the whole phase."""
+    costs no further calls. On REFUSED the caller must stop the whole phase. A failing artist backs off (`is_due`:
+    1, 2, 4 ... days, capped at recheck_days) and sorts after the healthy ones in `select_due`. checked_at is
+    committed here, before the caller knows the track outcomes, so a release with a failed track is retried at the next
+    recheck (recheck_days), not the next night; the 3-day track cooldown of the engine makes that immaterial."""
     key = artist_key(artist)
     res = ArtistCheck(key=key, status=OK)
     if key is None:
@@ -558,13 +595,13 @@ def check_artist(source: MusicSource, artist: str, state: dict, stored_rows: Ite
         return res
     browse_id = (entry or {}).get("browse_id")
     budget = MAX_ARTIST_REQUESTS + (0 if browse_id else SEARCH_REQUESTS) + max(0, max_releases)
-    src = GuardedSource(source, pacer or Pacer(), budget)
+    src = GuardedSource(source, pacer or _DEFAULT_PACER, budget)
     try:
         _check(src, artist, key, state, stored_rows, stored_albums, today, max_releases, browse_id, res)
     except SourceRefused:
-        _fail(state, key, res, REFUSED, state["artists"].get(key, {}).get("browse_id"))
+        _fail(state, key, res, REFUSED, state["artists"].get(key, {}).get("browse_id"), today)
     except NewReleasesError:  # SourceError, BudgetExceeded: the text names no artist
-        _fail(state, key, res, FAILED, state["artists"].get(key, {}).get("browse_id"))
+        _fail(state, key, res, FAILED, state["artists"].get(key, {}).get("browse_id"), today)
     res.requests = src.requests  # records and pending are set only at the very end of a successful check
     out(log_line(res))
     return res
@@ -576,7 +613,8 @@ def _check(src: GuardedSource, artist: str, key: str, state: dict, stored_rows, 
     if not browse_id:
         status, browse_id = resolve_browse_id(src.search(artist), artist)
         if browse_id is None:  # no exact match / several artists with the name: skipped, not a failure
-            state["artists"][key] = {**entry, "checked_at": today.isoformat(), "failures": 0}
+            state["artists"][key] = {k: v for k, v in entry.items() if k != "failed_at"} | {
+                "checked_at": today.isoformat(), "failures": 0}
             res.status = status
             return
         entry = state["artists"].setdefault(key, {})
@@ -596,9 +634,20 @@ def _check(src: GuardedSource, artist: str, key: str, state: dict, stored_rows, 
     taken: set[str] = set()
     dropped = 0
     for rel in chosen:
-        recs = build_records(artist, rel, src.get_album(rel.browse_id))
+        stats: dict = {}
+        try:
+            recs = build_records(artist, rel, src.get_album(rel.browse_id), stats)
+        except SourceRefused:
+            raise
+        except SourceError:  # one poison release must not hide the others: skipped, not evaluated, retried later
+            recs = None
         if recs is None:
-            raise SourceError("source call failed (malformed album answer)")
+            res.release_failures += 1
+            continue
+        res.foreign += stats["foreign"]
+        if stats["tracks"] == 0:  # an empty or not yet filled album page: nothing was handled, so nothing is evaluated
+            res.empty_releases += 1
+            continue
         new = dedupe.drop_stored(recs, rows).new
         dropped += len(recs) - len(new)
         fresh = [r for r in new if r["song_id"] not in taken]  # the same song on an album and a single: once
@@ -606,9 +655,12 @@ def _check(src: GuardedSource, artist: str, key: str, state: dict, stored_rows, 
         records.extend(fresh)
         if new:
             pending.append(PendingRelease(rel.key, tuple(r["song_id"] for r in new)))
-        else:  # every track already stored (or none usable): handled now
+        else:  # every track already stored or dropped by the artist rule: handled now
             evaluated = add_evaluated(evaluated, rel.key)
-    entry = state["artists"].setdefault(key, {})  # commit only after every call succeeded
+    if chosen and res.release_failures == len(chosen):  # nothing could be read at all: a failed check (backs off)
+        raise SourceError("source call failed (no release could be read)")
+    entry = state["artists"].setdefault(key, {})  # commit only after the calls succeeded
+    entry.pop("failed_at", None)
     entry.update({"browse_id": browse_id, "checked_at": today.isoformat(), "failures": 0, "evaluated": evaluated})
     res.records, res.pending, res.dropped_stored = records, pending, dropped
 

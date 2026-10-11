@@ -45,11 +45,14 @@ def track(title, secs=200, artists=(BAND,), **kw):
     return t
 
 
+NOTSET = object()
+
+
 class FakeSource:
     """Records every call; answers from dicts. `fail` maps a method name to an exception to raise."""
 
-    def __init__(self, found=None, albums=None, singles=None, details=None, fail=None, inline=False):
-        self.found = found if found is not None else [{"resultType": "artist", "artist": BAND, "browseId": "UCband"}]
+    def __init__(self, found=NOTSET, albums=None, singles=None, details=None, fail=None, inline=False):
+        self.found = found if found is not NOTSET else [{"resultType": "artist", "artist": BAND, "browseId": "UCband"}]
         self.albums = albums if albums is not None else []
         self.singles = singles if singles is not None else []
         self.details = details or {}
@@ -263,7 +266,7 @@ class Artist(NoNetwork):
         e = state["artists"][nr.artist_key(BAND)]
         self.assertNotIn("browse_id", e)
         self.assertEqual(e["failures"], 0)
-        again = nr.check_artist(src, BAND, state, [], today=TODAY, out=out.append)  # not due: no calls at all
+        again = nr.check_artist(src, BAND, state, [], [], today=TODAY, out=out.append)  # not due: no calls at all
         self.assertEqual((again.status, src.names()), (nr.NOT_DUE, ["search"]))
 
     def test_near_name_is_not_accepted(self):
@@ -283,7 +286,7 @@ class Artist(NoNetwork):
         self.assertNotIn("search", src.names())
 
     def test_unusable_name(self):
-        res = nr.check_artist(FakeSource(), "!!!", nr.empty_state(), [], today=TODAY, out=lambda s: None)
+        res = nr.check_artist(FakeSource(), "!!!", nr.empty_state(), [], [], today=TODAY, out=lambda s: None)
         self.assertEqual(res.status, nr.UNUSABLE)
 
     def test_key_equals_engine_key(self):
@@ -315,6 +318,32 @@ class Due(NoNetwork):
         names, total = nr.select_due(["A", "B", "C", "D", "a", "!!!", "E"], state, TODAY, 3)
         self.assertEqual((names, total), (["A", "E", "C"], 4))  # never checked first, then oldest; repeats ignored
 
+    def test_failing_artists_back_off_and_sort_last(self):
+        state = nr.empty_state()
+        for n in ("F1", "F2", "F3"):
+            state["artists"][nr.artist_key(n)] = {"failures": 1, "failed_at": "2026-10-12"}
+        self.assertEqual(nr.select_due(["F1", "F2", "F3", "New"], state, TODAY, 10), (["New"], 1))  # backing off
+        later = date(2026, 10, 13)  # 1 day after: due again, but behind the healthy ones
+        self.assertEqual(nr.select_due(["F1", "F2", "F3", "New"], state, later, 2), (["New", "F1"], 4))
+        self.assertEqual([nr.backoff_days(n) for n in (1, 2, 3, 4, 99)], [1, 2, 4, 7, 7])
+        self.assertFalse(nr.is_due({"failures": 3, "failed_at": "2026-10-10"}, TODAY))   # 2 days of 4
+        self.assertTrue(nr.is_due({"failures": 3, "failed_at": "2026-10-08"}, TODAY))    # 4 days
+        self.assertTrue(nr.is_due({"failures": 3, "failed_at": "2027-01-01"}, TODAY))    # future: due
+
+    def test_failures_cannot_starve_the_rest(self):
+        state = nr.empty_state()
+        for n in ("F1", "F2"):
+            state["artists"][nr.artist_key(n)] = {"failures": 5, "failed_at": "2026-10-12"}
+        names, _ = nr.select_due(["F1", "F2", "Healthy"], state, TODAY, 1)
+        self.assertEqual(names, ["Healthy"])
+
+    def test_success_clears_the_failure_marks(self):
+        state = nr.empty_state()
+        state["artists"][nr.artist_key(BAND)] = {"browse_id": "UCband", "failures": 2, "failed_at": "2026-10-01"}
+        run(FakeSource(), state=state)
+        self.assertEqual(state["artists"][nr.artist_key(BAND)]["failures"], 0)
+        self.assertNotIn("failed_at", state["artists"][nr.artist_key(BAND)])
+
     def test_failed_check_keeps_checked_at_and_evaluated(self):
         state = nr.empty_state()
         k = nr.artist_key(BAND)
@@ -324,7 +353,7 @@ class Due(NoNetwork):
         src = FakeSource(fail={"get_artist": RuntimeError("boom https://x/Radiohead")})
         res, _, out = run(src, state=state)
         self.assertEqual(res.status, nr.FAILED)
-        self.assertEqual(state["artists"][k], {**before["artists"][k], "failures": 2})
+        self.assertEqual(state["artists"][k], {**before["artists"][k], "failures": 2, "failed_at": "2026-10-12"})
         self.assertEqual(len(src.calls), 1)  # no retry
 
     def test_failure_after_search_keeps_browse_id(self):
@@ -335,11 +364,53 @@ class Due(NoNetwork):
 
     def test_failed_get_album_commits_nothing_else(self):
         src = FakeSource(albums=[card("A", "2026", "MPREa"), card("B", "2026", "MPREb")],
-                         details={"MPREa": {"tracks": []}}, fail={})
-        src.details["MPREb"] = None  # malformed answer
+                         details={"MPREa": None, "MPREb": None})  # no release can be read at all
         res, state, _ = run(src)
         e = state["artists"][nr.artist_key(BAND)]
         self.assertEqual((res.status, res.records, "checked_at" in e, e.get("evaluated")), (nr.FAILED, [], False, None))
+        self.assertEqual((e["failures"], e["failed_at"]), (1, "2026-10-12"))
+
+    def test_poison_release_does_not_block_the_others(self):
+        src = FakeSource(albums=[card("Poison", "2027", "MPREp"), card("Good", "2026", "MPREg")],
+                         details={"MPREg": {"tracks": [track("Fine")]}, "MPREp": None})
+        res, state, out = run(src)
+        self.assertEqual((res.status, [r["name"] for r in res.records], res.release_failures), (nr.OK, ["Fine"], 1))
+        e = state["artists"][nr.artist_key(BAND)]
+        self.assertEqual(e["checked_at"], "2026-10-12")
+        self.assertNotIn(nr.release_key("Poison", 2027), e["evaluated"])  # retried at the next check
+        self.assertIn("1 release errors", out[0])
+
+    def test_poison_release_raising_in_the_source(self):
+        class Raising(FakeSource):
+            def get_album(self, browseId):
+                if browseId == "MPREp":
+                    raise KeyError("x")
+                return super().get_album(browseId)
+        src = Raising(albums=[card("Poison", "2027", "MPREp"), card("Good", "2026", "MPREg")],
+                      details={"MPREg": {"tracks": [track("Fine")]}})
+        res, _, _ = run(src)
+        self.assertEqual((res.status, len(res.records)), (nr.OK, 1))
+
+    def test_refusal_in_get_album_still_stops(self):
+        src = FakeSource(albums=[card("A", "2026", "MPREa"), card("B", "2026", "MPREb")],
+                         fail={"get_album": HTTP_429("HTTP 429")})
+        res, _, _ = run(src)
+        self.assertEqual((res.status, src.names().count("get_album")), (nr.REFUSED, 1))
+
+    def test_empty_album_page_is_not_evaluated(self):
+        src = FakeSource(albums=[card("Soon", "2026", "MPREs")], details={"MPREs": {"title": "Soon", "tracks": []}})
+        res, state, out = run(src)
+        e = state["artists"][nr.artist_key(BAND)]
+        self.assertEqual((res.status, res.empty_releases, e["evaluated"]), (nr.OK, 1, []))
+        self.assertIn("1 empty", out[0])
+
+    def test_foreign_only_release_is_handled_and_counted(self):
+        src = FakeSource(albums=[card("Comp", "2026", "MPREc")],
+                         details={"MPREc": {"tracks": [track("T1", artists=("Other",)), track("T2", artists=("Third",))]}})
+        res, state, out = run(src)
+        self.assertEqual((res.records, res.foreign), ([], 2))
+        self.assertEqual(state["artists"][nr.artist_key(BAND)]["evaluated"], [nr.release_key("Comp", 2026)])
+        self.assertIn("2 foreign", out[0])
 
 
 class Budget(NoNetwork):
@@ -352,6 +423,31 @@ class Budget(NoNetwork):
         self.assertEqual((res.requests, src.names().count("get_album"), res.deferred, len(res.records)), (9, 3, 5, 3))
         self.assertEqual(len(sleeps), len(src.calls) - 1)
         self.assertTrue(all(s >= 0.99 for s in sleeps))
+
+    def test_default_pacer_is_shared_across_artists(self):
+        t = [5000.0]
+        calls = []
+
+        def sleep(sec):
+            t[0] += sec
+
+        class Stamp(FakeSource):
+            def _go(self, name, *a, **k):
+                calls.append(t[0])
+                super()._go(name, *a, **k)
+        nr._DEFAULT_PACER._last = None
+        with mock.patch.object(nr.time, "monotonic", lambda: t[0]), mock.patch.object(nr.time, "sleep", sleep):
+            for name in ("Alpha", "Beta"):  # no pacer argument: the default one
+                nr.check_artist(Stamp(found=[{"artist": name, "browseId": "UC" + name}]), name, nr.empty_state(), [], [],
+                                today=TODAY, out=lambda s: None)
+        gaps = [b - a for a, b in zip(calls, calls[1:])]
+        self.assertGreater(len(gaps), 4)
+        self.assertTrue(all(g >= 0.999 for g in gaps), gaps)  # the artist boundary included
+        nr._DEFAULT_PACER._last = None
+
+    def test_stored_albums_is_required(self):
+        with self.assertRaises(TypeError):
+            nr.check_artist(FakeSource(), BAND, nr.empty_state(), [], today=TODAY)
 
     def test_budget_is_hard(self):
         g = nr.GuardedSource(FakeSource(), instant()[0], 2)
@@ -431,8 +527,8 @@ class Untrusted(NoNetwork):
     def test_repeated_track_title_once_and_other_result_types_ignored(self):
         rel = nr.Release("A", 2026, "MPREa", "album", nr.release_key("A", 2026))
         self.assertEqual(len(nr.build_records(BAND, rel, {"tracks": [track("Same"), track("Same", 300)]})), 1)
-        self.assertEqual(nr.resolve_browse_id([{"resultType": "song", "artist": BAND, "browseId": "UC9"}], BAND),
-                         (nr.UNRESOLVED, None))
+        self.assertEqual(nr.resolve_browse_id([{"resultType": "song", "artist": BAND, "browseId": "UC9"},
+                                               {"artist": "Else", "browseId": "UC8"}], BAND), (nr.UNRESOLVED, None))
 
     def test_wrong_shapes_fail_cleanly(self):
         for page in (None, [], "x"):
@@ -453,8 +549,19 @@ class Untrusted(NoNetwork):
         self.assertEqual((t["name"], t["duration"], t["track_number"], t["explicit"]), ("ok x", None, None, None))
 
     def test_search_results_shapes(self):
-        for bad in (None, "x", {}, [None, 5, {"artist": 5}, {"artist": BAND, "browseId": "bad id"}]):
-            self.assertEqual(nr.resolve_browse_id(bad, BAND), (nr.UNRESOLVED, None))
+        for bad in (None, "x", {}, {"a": 1}, [], [None, 5, "s"], [{"artist": 5}, {"artist": BAND, "browseId": "bad id"}],
+                    [{"resultType": "song", "artist": BAND, "browseId": "UC9"}]):
+            with self.assertRaises(nr.SourceError, msg=repr(bad)):
+                nr.resolve_browse_id(bad, BAND)
+
+    def test_malformed_search_answer_is_a_failed_check(self):
+        for bad in (None, "x", {"a": 1}, [None, 1, "s"], []):
+            src = FakeSource(found=bad)
+            res, state, _ = run(src)
+            e = state["artists"][nr.artist_key(BAND)]
+            self.assertEqual(res.status, nr.FAILED, bad)
+            self.assertEqual((e["failures"], "checked_at" in e, "browse_id" in e), (1, False, False))
+            self.assertEqual(src.names(), ["search"])
 
 
 class StateFile(NoNetwork):
@@ -509,6 +616,7 @@ class StateFile(NoNetwork):
                  '{"version": 1, "artists": {"lfm:0123456789abcdef": {"checked_at": "yesterday"}}}',
                  '{"version": 1, "artists": {"lfm:0123456789abcdef": {"checked_at": "2026-13-45"}}}',
                  '{"version": 1, "artists": {"lfm:0123456789abcdef": {"browse_id": "a b"}}}',
+                 '{"version": 1, "artists": {"lfm:0123456789abcdef": {"failed_at": "soon"}}}',
                  '{"version": 1, "artists": {"lfm:0123456789abcdef": {"evaluated": ["x"]}}}',
                  '{"version": 1, "artists": {"lfm:0123456789abcdef": {"evaluated": ["0a1b2c3d4e5f6071:", "0a1b2c3d4e5f6071:"]}}}',
                  '{"version": 1, "artists": {"lfm:0123456789abcdef": {"evaluated": ' + json.dumps([f"{i:016x}:" for i in range(51)]) + '}}}']
@@ -554,9 +662,9 @@ class Logging(NoNetwork):
         for fake in (src, FakeSource(fail={"get_artist": RuntimeError(f"{BAND} {secret_title}")}),
                      FakeSource(found=[])):
             state = nr.empty_state()
-            nr.check_artist(fake, BAND, state, [], today=TODAY, pacer=instant()[0], out=lines.append)
-            nr.check_artist(fake, BAND, state, [], today=TODAY, pacer=instant()[0], out=lines.append)  # not due / retry
-        nr.check_artist(src, "!!!", nr.empty_state(), [], today=TODAY, out=lines.append)
+            nr.check_artist(fake, BAND, state, [], [], today=TODAY, pacer=instant()[0], out=lines.append)
+            nr.check_artist(fake, BAND, state, [], [], today=TODAY, pacer=instant()[0], out=lines.append)  # not due / retry
+        nr.check_artist(src, "!!!", nr.empty_state(), [], [], today=TODAY, out=lines.append)
         totals = nr.Totals(due=3)
         lines.append(totals.line())
         self.assertGreater(len(lines), 4)
@@ -570,7 +678,7 @@ class Logging(NoNetwork):
         import io
         err, o = io.StringIO(), io.StringIO()
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(o):
-            nr.check_artist(FakeSource(), BAND, nr.empty_state(), [], today=TODAY, pacer=instant()[0])
+            nr.check_artist(FakeSource(), BAND, nr.empty_state(), [], [], today=TODAY, pacer=instant()[0])
         self.assertEqual(o.getvalue(), "")
         self.assertNotIn("Radiohead", err.getvalue())
 

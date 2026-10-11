@@ -405,8 +405,9 @@ prefix then means "synthetic artist + title id", not "from Last.fm". The alterna
 `ytm:`), needs `SONG_ID` and `RunState` changed in `ingest/ingest.py`: not proposed. #171 decides and tests it.
 
 Known limitation, inherited from #150/#152 [V, the #152 coordinator notes]: a compilation track is stored under
-the album artist, a record compares on `artists[0]`, so such a track does not match and can be added a second
-time. The nightly check shares this limitation. A release the owner already has under a different title (deluxe,
+the album artist, a record compares on `artists[0]`, so such a track would not match and could be added a second
+time. The nightly check (#171) avoids that by dropping, and counting in its log line, every track of a release whose
+listed artists do not include the checked artist; a release that holds only such tracks counts as handled. A release the owner already has under a different title (deluxe,
 remaster, regional edition) looks "missing"; the evaluated set (4.5) bounds the cost, the dedupe rule bounds the
 duplicates.
 
