@@ -350,6 +350,8 @@ jobs:
             title="(no title)"
           fi
           echo "title=$title" >> "$GITHUB_OUTPUT"
+          # Safe to print: only the charset above, and the fixed prefix means the line cannot start with a workflow command.
+          echo "commit title: $title"
 
   # Migrations (#202, design sections 5 and 12.2). Runs in the environment that `plan` computed: `production` (the
   # new migrations are not destructive) or `production-destructive` (the owner is a required reviewer: the job
