@@ -171,6 +171,81 @@ class Candidate:
     score: float
     mode: str = MODE_DURATION  # MODE_TITLE_ONLY when the match was made without a duration (#151)
     relaxed: bool = False  # True when only the relaxed title pass (#194) accepted it: traceable in the logs
+    # Cover fields (#248), read from the chosen search result; used only for the album cover guard below and by #251.
+    album: str | None = None          # the result's album name
+    artist_id: str | None = None      # browse id of the result's first artist
+    artist_name: str | None = None    # name of the result's first artist
+    thumbnail_base: str | None = None  # first thumbnail URL with its "=..." size suffix cut off
+
+
+COVER_SIZE_SUFFIX = "=w1200-h1200-l90-rj"  # verified 2026-10-11: HTTP 200, JPEG, 1200x1200, about 0.33 MB (#245, #248)
+# A cover from a match is stored per album for good (COALESCE keeps the first one), so the guard is strict: a missing
+# or different album, another edition, another volume or another artist means NO cover.
+COVER_ALBUM_MIN_SIMILARITY = 0.9
+COVER_ARTIST_MIN_SIMILARITY = 0.8
+_EDITION_WORDS = _VARIANT_WORDS | {"deluxe", "edition", "remastered", "remaster", "anniversary", "expanded", "special",
+                                   "bonus", "version", "ep", "single", "volume", "vol", "part", "pt", "disc", "cd"}
+_ROMAN = {"i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x"}
+
+
+def _result_extras(result: dict) -> dict:
+    """Cover fields of one search result; every field None when it is missing or not of the expected type."""
+    def text(v):
+        return v if isinstance(v, str) and v else None
+    album = result.get("album")
+    artists = [a for a in result.get("artists") or [] if isinstance(a, dict)]
+    first = artists[0] if artists else {}
+    thumbs = result.get("thumbnails")
+    url = thumbs[0].get("url") if isinstance(thumbs, list) and thumbs and isinstance(thumbs[0], dict) else None
+    base = url.rsplit("=", 1)[0] if isinstance(url, str) and url.startswith("https://") and "=" in url else None
+    return {"album": text(album.get("name")) if isinstance(album, dict) else None,
+            "artist_id": text(first.get("id")), "artist_name": text(first.get("name")), "thumbnail_base": text(base)}
+
+
+def _plural_pair(ww: set, wf: set) -> bool:
+    """True when the two word sets differ by a word and the same word plus 's' (Lover / Lovers, Slayer / Slayers):
+    near-identical by ratio, but a different album or artist."""
+    diff = ww ^ wf
+    return any(w + "s" in diff for w in diff)
+
+
+def artists_match(wanted: str, names: list[str]) -> bool:
+    """Cover-only artist check: article-insensitive, Latin vs Cyrillic aware, a bare plural 's' is a different artist."""
+    return any(artist_similarity(a, n) >= COVER_ARTIST_MIN_SIMILARITY
+               and not _plural_pair(set(normalize(a).split()), set(normalize(n).split()))
+               for a in (wanted, transliterate_to_cyrillic(wanted)) for n in names)
+
+
+def albums_match(wanted: str, found: str) -> bool:
+    nw, nf = normalize(wanted), normalize(found)
+    if not nw or not nf or SequenceMatcher(None, nw, nf).ratio() < COVER_ALBUM_MIN_SIMILARITY:
+        return False
+    ww, wf = set(nw.split()), set(nf.split())
+    if _plural_pair(ww, wf):
+        return False
+    if {w for w in ww if w.isdigit() or w in _ROMAN} != {w for w in wf if w.isdigit() or w in _ROMAN}:
+        return False  # Vol. 1 / Vol. 2, II / III
+    return not (ww ^ wf) & _EDITION_WORDS  # (Deluxe), (Live), Remastered, ...: another release
+
+
+def cover_url_from_match(album: str | None, artist: str, m) -> tuple[str | None, str]:
+    """(cover URL or None, reason). Reason is a fixed class word (never a title or a name): ok, no_album,
+    no_thumbnail, album_mismatch, artist_mismatch. `album` is the TRACK's album name (None for an unknown album)."""
+    base, found = getattr(m, "thumbnail_base", None), getattr(m, "album", None)
+    if not isinstance(base, str) or not base.startswith("https://"):
+        return None, "no_thumbnail"
+    if not isinstance(album, str) or not album.strip():
+        return None, "no_album"
+    if not isinstance(found, str):
+        return None, "no_match_album"
+    if not albums_match(album, found):
+        return None, "album_mismatch"
+    joined = getattr(m, "artists", None)
+    names = [n for n in (getattr(m, "artist_name", None), joined, *(joined.split(", ") if isinstance(joined, str) else []))
+             if isinstance(n, str) and n]
+    if not names or not artists_match(artist, names):
+        return None, "artist_mismatch"
+    return base + COVER_SIZE_SUFFIX, "ok"
 
 
 def queries(title: str, artist: str, album: str | None) -> list[str]:
@@ -192,7 +267,8 @@ def score(title: str, artist: str, duration_s: int, result: dict, relaxed: bool 
     a_sim = max(similarity(artist, yt_artists), similarity(transliterate_to_cyrillic(artist), yt_artists))
     # Artist only breaks ties; it must not veto (that is the bug we are working around).
     return Candidate(result["videoId"], result["title"], yt_artists, dur,
-                     t_sim + 0.3 * a_sim - 0.02 * abs(dur - duration_s), relaxed=relaxed)
+                     t_sim + 0.3 * a_sim - 0.02 * abs(dur - duration_s), relaxed=relaxed,
+                     **_result_extras(result))
 
 
 def score_title_only(title: str, artist: str, result: dict, relaxed: bool = False) -> Candidate | None:
@@ -214,7 +290,8 @@ def score_title_only(title: str, artist: str, result: dict, relaxed: bool = Fals
     a_sim = max(artist_similarity(a, y) for a in (artist, transliterate_to_cyrillic(artist)) for y in [joined, *names])
     if a_sim < TITLE_ONLY_ARTIST_MIN_SIMILARITY:
         return None
-    return Candidate(result["videoId"], result_title, joined, int(dur), t_sim + a_sim, MODE_TITLE_ONLY, relaxed)
+    return Candidate(result["videoId"], result_title, joined, int(dur), t_sim + a_sim, MODE_TITLE_ONLY, relaxed,
+                     **_result_extras(result))
 
 
 def find_match(ytmusic, title: str, artist: str, album: str | None, duration_s: int | None) -> Candidate | None:

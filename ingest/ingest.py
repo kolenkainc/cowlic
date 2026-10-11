@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Callable
 
 import tg_check
-from match import MODE_TITLE_ONLY, find_match, normalize
+from match import MODE_TITLE_ONLY, cover_url_from_match, find_match, normalize
 
 MAX_BYTES = 20 * 1024 * 1024  # Telegram Bot API getFile limit
 BITRATE = "256k"
@@ -745,7 +745,68 @@ def js_runtime_problem() -> str | None:
     return None
 
 
-def fetch_cover(url: str, dest: Path) -> Path:
+# Hosts of the thumbnail URLs the YouTube Music search returns for songs (observed 2026-10-11, see docs/cover-art.md).
+COVER_FROM_MATCH = "cover_from_match"  # song key set by process_track: the cover URL came from the YouTube Music match
+YTM_COVER_HOSTS = frozenset({"lh3.googleusercontent.com", "yt3.googleusercontent.com"})
+COVER_TOTAL_TIMEOUT_S = 60  # wall clock for one cover download: the socket timeout alone lets a slow drip run forever
+COVER_CHUNK = 64 * 1024
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A cover URL comes from third-party search output: a redirect could end on any host (or on http), so none is
+    followed; urllib then raises HTTPError for the 3xx answer."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _cover_opener(*extra_handlers) -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(_NoRedirect, *extra_handlers)
+
+
+def _read_cover_body(r, clock, deadline) -> bytes:
+    """read1 returns what has arrived (at most COVER_CHUNK bytes) instead of blocking until the full chunk is there; the
+    socket timeout restarts on every received byte, so only this loop can enforce the total deadline."""
+    chunks, total = [], 0
+    while True:
+        if clock() > deadline:
+            raise IngestError("cover download too slow")
+        chunk = r.read1(COVER_CHUNK)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > COVER_MAX_BYTES:
+            raise IngestError("cover too large")
+
+
+def _fetch_cover_checked(url: str, allowed_hosts: frozenset, opener, clock) -> bytes:
+    parts = urllib.parse.urlparse(url)
+    if parts.scheme != "https":
+        raise IngestError("cover url must be https")
+    try:
+        port = parts.port
+    except ValueError:
+        raise IngestError("cover url has an invalid port") from None
+    if "@" in parts.netloc or port not in (None, 443) or (parts.hostname or "") not in allowed_hosts:
+        raise IngestError("cover host is not allowed")
+    deadline = clock() + COVER_TOTAL_TIMEOUT_S
+    with opener.open(url, timeout=30) as r:
+        ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "image/jpeg":
+            raise IngestError("cover is not image/jpeg")
+        data = _read_cover_body(r, clock, deadline)
+    if not data.startswith(b"\xff\xd8"):
+        raise IngestError("cover is not a JPEG")
+    return data
+
+
+def fetch_cover(url: str, dest: Path, allowed_hosts: frozenset | None = None, opener=None, clock=time.monotonic) -> Path:
+    """Spotify URLs (allowed_hosts None) keep the original behaviour. With allowed_hosts (the YouTube Music route, #248):
+    https, an allowlisted host, no redirect, Content-Type image/jpeg, JPEG magic bytes, the size cap and a total deadline."""
+    if allowed_hosts is not None:
+        dest.write_bytes(_fetch_cover_checked(url, allowed_hosts, opener or _cover_opener(), clock))
+        return dest
     if urllib.parse.urlparse(url).scheme != "https":
         raise IngestError("cover url must be https")
     with urllib.request.urlopen(url, timeout=30) as r:
@@ -800,10 +861,21 @@ def process_track(song: dict, deps: Deps, existing: set, covers: dict, work: Pat
     try:
         al = album_id(primary_artist(song), song.get("album_name") or UNKNOWN_ALBUM)
         cover = covers.get(al)
+        if not cover and not song.get("cover_url"):  # no Spotify cover (Last.fm, new releases): the match may have one
+            album_name = song.get("album_name")
+            url, why = cover_url_from_match(None if album_name == UNKNOWN_ALBUM else album_name, primary_artist(song), m)
+            if url:
+                song = {**song, "cover_url": url, COVER_FROM_MATCH: True}
+            elif why != "no_thumbnail":  # a match without a thumbnail is the old behaviour: silent
+                log(f"cover skipped for {sid}: {why}")
+                if notes is not None:
+                    notes["cover_skipped"] = True
         if not cover and song.get("cover_url"):
             try:
                 cover = deps.upload_cover(song, tdir)
                 covers[al] = cover
+                if song.get(COVER_FROM_MATCH) and notes is not None:  # counted only after the upload worked
+                    notes["cover_from_match"] = True
             except (IngestError, OSError, KeyError, ValueError):
                 log(f"WARN cover failed for {sid}")
         deps.d1_batch(upsert_statements(song, size, msg["audio"]["file_id"], msg["message_id"], cover))
@@ -890,7 +962,8 @@ def real_deps(ytm, throttle: "Throttle | None" = None) -> Deps:
                           "duration": int(song["duration"])})
 
     def cover(song, tdir):
-        photo = fetch_cover(song["cover_url"], tdir / "cover.jpg")
+        photo = fetch_cover(song["cover_url"], tdir / "cover.jpg",
+                            YTM_COVER_HOSTS if song.get(COVER_FROM_MATCH) else None)
         return largest_photo_file_id(tg_upload("sendPhoto", "photo", photo, "image/jpeg")["photo"])
 
     return harden_deps(Deps(find, download, audio, cover, d1_batch, tg_delete), throttle)
@@ -1230,6 +1303,9 @@ def run(songs: list[dict], deps: Deps, existing: set, covers: dict, work: Path, 
             counts["matched_title_only"] = counts.get("matched_title_only", 0) + 1
         if notes.get("relaxed"):  # additive (#194): counts only
             counts["matched_normalized"] = counts.get("matched_normalized", 0) + 1
+        for note in ("cover_from_match", "cover_skipped"):  # additive (#248): counts only, present when non-zero
+            if notes.get(note):
+                counts[note] = counts.get(note, 0) + 1
         if limits and status in ("new", "too_big", "dry_run"):
             limits.attempted += 1
         if state and not dry:
@@ -1257,7 +1333,9 @@ def summary(counts: dict) -> str:
     return (f"{counts['new']} new, {counts['exists']} already present, {counts['no_match']} no match, "
             f"{counts['too_big']} too big, {counts['failed']} failed" + (f", {cooldown} in cooldown" if cooldown else "")
             + (f", {title_only} matched by title only" if title_only else "")
-            + (f", {normalized} matched after title normalization" if normalized else ""))
+            + (f", {normalized} matched after title normalization" if normalized else "")
+            + (f", {counts['cover_from_match']} covers from the match" if counts.get("cover_from_match") else "")
+            + (f", {counts['cover_skipped']} without a cover" if counts.get("cover_skipped") else ""))
 
 
 def run_playlists(urls: list[str], fetch_songs: Callable[[str], list[dict]], deps: Deps, existing: set,
