@@ -57,6 +57,100 @@ _VARIANT_WORDS = {"live", "remix", "mix", "rmx", "edit", "acoustic", "instrument
                   "rework", "reprise", "vip", "dub", "flip", "bootleg", "slowed", "sped", "nightcore", "remake"}
 
 
+# Relaxed title comparison (#194): a SECOND pass that find_match runs only when the strict pass (the code above, byte for
+# byte what it was) found nothing. It drops version / format noise that does not change the recording and compares the
+# rest, but it never makes different recordings equal: the variant markers (live + its venue, acoustic, remix, ...) of
+# the two titles must be the SAME (a repeat counts), however they are spelled, bracketed or ordered. The thresholds are the ones of
+# the calling mode, unchanged.
+_RELAXED_MARKERS = _VARIANT_WORDS | {"extended", "radio", "8d", "reverb", "reverbed"}
+_GROUP = re.compile(r"\s*[(\[]([^()\[\]]*)[)\]]")
+_DASH_TAIL = re.compile(r"\s+[-\u2013\u2014]\s+([^-\u2013\u2014]*)$")
+_NOISE = re.compile(
+    r"(?:\d{4}\s+)?(?:digital(?:ly)?\s+)?remaster(?:ed)?(?:\s+\d{4})?(?:\s+version)?"  # (Remastered 2011), - 2011 Remaster
+    r"|(?:19|20)\d{2}"                                                                    # (1971)
+    r"|(?:album|single)\s+version"
+    r"|explicit(?:\s+version)?")
+_LIVE_PREPOSITIONS = {"at", "in", "from", "on"}
+
+
+def _noise_stripped(text: str) -> str:
+    """Remove a bracket group or a ' - suffix' whose WHOLE content is noise. Never empties the title."""
+    stripped = _GROUP.sub(lambda m: "" if _NOISE.fullmatch(m[1].strip()) else m[0], text)
+    m = _DASH_TAIL.search(stripped)
+    if m and _NOISE.fullmatch(m[1].strip()):
+        stripped = stripped[:m.start()]
+    return stripped if re.search(r"\w", stripped) else text
+
+
+def _latin_without_marks(text: str) -> str:
+    """Drop combining marks from Latin letters only (so a Cyrillic 'й' keeps its breve)."""
+    out = []
+    for ch in text:
+        base = unicodedata.normalize("NFD", ch)
+        out.append("".join(c for c in base if not unicodedata.combining(c)) if base[0].isascii() else ch)
+    return "".join(out)
+
+
+def title_parts(title: str) -> tuple[list[str], tuple[str, ...]]:
+    """(core words, markers). Markers are the variant words found in the title; for 'live' also its venue words, so
+    'Live at X' and 'Live at Y' differ and 'live in X (acoustic)' equals 'Acoustic / Live At X, 2005'."""
+    text = unicodedata.normalize("NFKC", title).lower().replace("ё", "е")
+    text = _latin_without_marks(_noise_stripped(text))
+    text = text.replace("&", " and ")
+    text = re.sub(r"(?<=\w)['\u2019](?=\w)", "", text)  # don't -> dont
+    words = normalize(text).split()
+    core: list[str] = []
+    markers: list[str] = []
+    live_seen = False
+    venue: list[str] = []
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if w in _RELAXED_MARKERS:
+            markers.append(w)
+            if i + 1 < len(words) and words[i + 1] == "version":  # 'acoustic version' == 'acoustic'
+                i += 1
+            if w == "live":
+                live_seen = True
+                if i + 1 < len(words) and words[i + 1] in _LIVE_PREPOSITIONS:
+                    i += 1
+                    j = i + 1
+                    while j < len(words) and words[j] not in _RELAXED_MARKERS:
+                        if not re.fullmatch(r"\d{4}", words[j]):
+                            venue.append(words[j])
+                        j += 1
+                    i = j - 1
+        elif not (live_seen and re.fullmatch(r"\d{4}", w)):
+            core.append(w)
+        i += 1
+    if venue:
+        markers.append("live@" + " ".join(sorted(venue)))
+    return core, tuple(sorted(markers))
+
+
+def _singular_last(words: list[str]) -> list[str]:
+    """Bounded plural tolerance: only the LAST word, only a single trailing 's' of a word of 4+ letters."""
+    if len(words) >= 2 and len(words[-1]) >= 4 and words[-1].endswith("s") and not words[-1].endswith(("ss", "us", "is")):
+        return words[:-1] + [words[-1][:-1]]
+    return words
+
+
+def relaxed_similarity(a: str, b: str, allow_prefix: bool = False) -> float:
+    """0.0 when the variant markers differ; otherwise the similarity of the noise-free titles. `allow_prefix` (the
+    duration path only, where +-3 s backs it up): a title of 2+ words that is the start of the other, whose extra
+    words only repeat words of that start ('Ooh La' / 'Ooh La La La'), counts as TITLE_MIN_SIMILARITY."""
+    (ca, ma), (cb, mb) = title_parts(a), title_parts(b)
+    if ma != mb or not ca or not cb:
+        return 0.0
+    ca, cb = _singular_last(ca), _singular_last(cb)
+    sim = SequenceMatcher(None, " ".join(ca), " ".join(cb)).ratio()
+    if allow_prefix:
+        short, long_ = (ca, cb) if len(ca) <= len(cb) else (cb, ca)
+        if len(short) >= 2 and long_[:len(short)] == short and set(long_[len(short):]) <= set(short):
+            sim = max(sim, TITLE_MIN_SIMILARITY)
+    return sim
+
+
 @dataclass
 class Candidate:
     video_id: str
@@ -74,11 +168,12 @@ def queries(title: str, artist: str, album: str | None) -> list[str]:
     return list(dict.fromkeys(qs))
 
 
-def score(title: str, artist: str, duration_s: int, result: dict) -> Candidate | None:
+def score(title: str, artist: str, duration_s: int, result: dict, relaxed: bool = False) -> Candidate | None:
     dur = result.get("duration_seconds")
     if not dur or abs(dur - duration_s) > DURATION_TOLERANCE_S:
         return None
-    t_sim = similarity(title, result.get("title", ""))
+    t_sim = (relaxed_similarity(title, result.get("title", ""), allow_prefix=True) if relaxed
+             else similarity(title, result.get("title", "")))
     if t_sim < TITLE_MIN_SIMILARITY:
         return None
     yt_artists = ", ".join(a["name"] for a in result.get("artists") or [])
@@ -88,7 +183,7 @@ def score(title: str, artist: str, duration_s: int, result: dict) -> Candidate |
                      t_sim + 0.3 * a_sim - 0.02 * abs(dur - duration_s))
 
 
-def score_title_only(title: str, artist: str, result: dict) -> Candidate | None:
+def score_title_only(title: str, artist: str, result: dict, relaxed: bool = False) -> Candidate | None:
     """Scoring without a requested duration (see the constants above). None unless every check passes."""
     dur = result.get("duration_seconds")
     if isinstance(dur, bool) or not isinstance(dur, (int, float)) \
@@ -97,10 +192,10 @@ def score_title_only(title: str, artist: str, result: dict) -> Candidate | None:
     result_title = result.get("title")
     if not isinstance(result_title, str):
         return None
-    t_sim = similarity(title, result_title)
+    t_sim = relaxed_similarity(title, result_title) if relaxed else similarity(title, result_title)
     if t_sim < TITLE_ONLY_TITLE_MIN_SIMILARITY:
         return None
-    if set(normalize(result_title).split()) & (_VARIANT_WORDS - set(normalize(title).split())):
+    if not relaxed and set(normalize(result_title).split()) & (_VARIANT_WORDS - set(normalize(title).split())):
         return None  # live, remix, cover, ...: a different recording than the requested one
     names = [a["name"] for a in result.get("artists") or [] if isinstance(a.get("name"), str)]
     joined = ", ".join(names)
@@ -111,11 +206,24 @@ def score_title_only(title: str, artist: str, result: dict) -> Candidate | None:
 
 
 def find_match(ytmusic, title: str, artist: str, album: str | None, duration_s: int | None) -> Candidate | None:
-    """With a duration (any non-zero value) the +-3 s path below, unchanged. With None or 0 the title-only mode."""
-    scorer = (lambda r: score(title, artist, duration_s, r)) if duration_s else (lambda r: score_title_only(title, artist, r))
+    """With a duration (any non-zero value) the +-3 s path below, unchanged. With None or 0 the title-only mode.
+    Two passes over the SAME search results (no extra search call): strict first, exactly as before #194; only when it
+    finds nothing, the relaxed title comparison (version noise dropped, variant markers must be equal) is tried."""
+    def scorer(relaxed: bool):
+        if duration_s:
+            return lambda r: score(title, artist, duration_s, r, relaxed)
+        return lambda r: score_title_only(title, artist, r, relaxed)
+
+    strict, seen = scorer(False), []
     for q in queries(title, artist, album):
-        found = [c for r in ytmusic.search(q, filter="songs", limit=10) if r.get("videoId")
-                 and (c := scorer(r))]
+        results = ytmusic.search(q, filter="songs", limit=10)
+        seen.append(results)
+        found = [c for r in results if r.get("videoId") and (c := strict(r))]
+        if found:
+            return max(found, key=lambda c: c.score)
+    relaxed = scorer(True)
+    for results in seen:
+        found = [c for r in results if r.get("videoId") and (c := relaxed(r))]
         if found:
             return max(found, key=lambda c: c.score)
     return None
