@@ -37,11 +37,74 @@ const FAILING = {
   drop: ['DROP TABLE tracks;', 'DROP INDEX idx_a;', 'DROP VIEW v;', 'DROP TRIGGER t;', 'DROP TABLE IF EXISTS tracks;'],
   'drop-column': ['ALTER TABLE tracks DROP COLUMN title;'],
   rename: ['ALTER TABLE tracks RENAME TO songs;', 'ALTER TABLE tracks RENAME COLUMN a TO b;'],
-  'delete-without-where': ['DELETE FROM tracks;', 'DELETE FROM tracks WHERE 1;', 'DELETE FROM tracks WHERE 1=1;', 'DELETE FROM tracks WHERE TRUE;'],
-  'update-without-where': ["UPDATE tracks SET title = 'x';", 'UPDATE tracks SET a = (SELECT b FROM t WHERE t.id = 1);'],
+  'delete-without-where': [
+    'DELETE FROM tracks;',
+    'DELETE FROM tracks WHERE 1;',
+    'DELETE FROM tracks WHERE 1=1;',
+    'DELETE FROM tracks WHERE TRUE;',
+    'DELETE FROM t WHERE 0=0;',
+    "DELETE FROM t WHERE 'a'='a';",
+    'DELETE FROM t WHERE (1);',
+    'DELETE FROM t WHERE (1=1);',
+    'DELETE FROM t WHERE ((((1))));',
+    'DELETE FROM t WHERE 1==1;',
+    'DELETE FROM t WHERE 2;',
+    'DELETE FROM t WHERE 1.0;',
+    'DELETE FROM t WHERE NOT 0;',
+    'DELETE FROM t WHERE 1<2;',
+    'DELETE FROM t WHERE 1 <> 2;',
+    'DELETE FROM t WHERE x = 1 OR 1;',
+    'DELETE FROM t WHERE (x = 1 OR (y = 2 OR 1=1));',
+    'DELETE FROM t WHERE x = 1 OR TRUE;',
+    'DELETE FROM t WHERE;',
+    'DELETE FROM t WHERE 1 RETURNING id;',
+    'WITH x AS (SELECT 1) DELETE FROM t;',
+    'WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM x WHERE n < 3) DELETE FROM t;',
+    'WITH x AS (SELECT id FROM u WHERE id = 1) DELETE FROM t;',
+    'WITH x AS (SELECT 1), y AS (SELECT 2 WHERE 1) DELETE FROM t;',
+  ],
+  'update-without-where': [
+    "UPDATE tracks SET title = 'x';",
+    'UPDATE tracks SET a = (SELECT b FROM t WHERE t.id = 1);',
+    'UPDATE t SET a = 1 WHERE (1=1);',
+    'UPDATE t SET a = 1 WHERE 1 OR x = 2;',
+    'WITH x AS (SELECT 1) UPDATE t SET a = 1;',
+    'WITH RECURSIVE x(n) AS (SELECT 1) UPDATE t SET a = (SELECT n FROM x);',
+    'WITH x AS (SELECT id FROM u WHERE id = 1), y AS (SELECT 2) UPDATE t SET a = 1;',
+  ],
   truncate: ['TRUNCATE TABLE tracks;', 'TRUNCATE tracks;'],
-  'pragma-writable-schema': ['PRAGMA writable_schema = 1;', 'PRAGMA main.writable_schema=ON;'],
-  'schema-write': ["DELETE FROM sqlite_master WHERE type = 'index';", "UPDATE sqlite_master SET sql = 'x' WHERE name = 'y';"],
+  'pragma-writable-schema': [
+    'PRAGMA writable_schema = 1;',
+    'PRAGMA main.writable_schema=ON;',
+    'PRAGMA "writable_schema"=1;',
+    "PRAGMA 'writable_schema'=1;",
+    'PRAGMA [writable_schema]=1;',
+    'PRAGMA `Writable_Schema`=1;',
+    'PRAGMA main."writable_schema"=1;',
+  ],
+  'pragma-write': ['PRAGMA foreign_keys = OFF;', 'PRAGMA defer_foreign_keys=ON;', 'PRAGMA user_version = 9;', 'PRAGMA table_info(t);'],
+  'tautology-suspect': [
+    'DELETE FROM t WHERE id IS NOT NULL;',
+    'DELETE FROM t WHERE rowid > 0;',
+    'DELETE FROM t WHERE rowid >= 0;',
+    'DELETE FROM t WHERE id = id;',
+    'DELETE FROM t WHERE t.id = t.id;',
+    'DELETE FROM t WHERE ("id" IS NOT NULL);',
+    'UPDATE t SET a = 1 WHERE id IS NOT NULL;',
+    'DELETE FROM t WHERE id IS NOT NULL AND rowid > 0;',
+  ],
+  'schema-write': [
+    "UPDATE \"sqlite_master\" SET sql = 'x' WHERE name = 't';",
+    "UPDATE [sqlite_master] SET sql = 'x' WHERE name = 't';",
+    "UPDATE `SQLITE_MASTER` SET sql = 'x' WHERE name = 't';",
+    "UPDATE 'sqlite_master' SET sql = 'x' WHERE name = 't';",
+    "UPDATE main.sqlite_master SET sql = 'x' WHERE name = 't';",
+    "UPDATE temp.sqlite_master SET sql = 'x' WHERE name = 't';",
+    "UPDATE main.\"sqlite_master\" SET sql = 'x' WHERE name = 't';",
+    "UPDATE sqlite_schema SET sql = 'x' WHERE name = 't';",
+    "DELETE FROM sqlite_temp_master WHERE name = 't';",
+    "INSERT INTO \"sqlite_schema\" (name) VALUES ('t');",
+    'DELETE FROM t WHERE id IN (SELECT 1 FROM sqlite_master WHERE a = 1);',"DELETE FROM sqlite_master WHERE type = 'index';", "UPDATE sqlite_master SET sql = 'x' WHERE name = 'y';"],
   'missing-if-not-exists': [
     'CREATE TABLE t (a INTEGER);',
     'CREATE INDEX i ON t(a);',
@@ -64,7 +127,11 @@ const PASSING = [
   'UPDATE tracks SET title = :t WHERE id = ?;',
   'UPDATE tracks SET a = 1 WHERE id IN (SELECT id FROM t);',
   'WITH c AS (SELECT id FROM t WHERE id > 1) DELETE FROM tracks WHERE id IN (SELECT id FROM c);',
-  'PRAGMA foreign_keys = ON;',
+  'PRAGMA foreign_key_check;',
+  'DELETE FROM t WHERE id = 1 OR name = :n;',
+  'DELETE FROM t WHERE id IS NOT NULL AND created < 5;',
+  'DELETE FROM t WHERE a.id = b.id;',
+  'DELETE FROM t WHERE rowid > 5;',
 ];
 
 for (const [rule, sqls] of Object.entries(FAILING)) {
@@ -358,6 +425,8 @@ const MUTATIONS = [
   ['add-column-not-idempotent', 'ADD_COLUMN', 'ALTER TABLE t ADD COLUMN c INTEGER;'],
   ['unrecognized-statement', 'UNRECOGNIZED', 'VACUUM;'],
   ['parse-error', 'PARSE', 'SELECT (1;'],
+  ['pragma-write', 'PRAGMA_WRITE', 'PRAGMA user_version = 9;'],
+  ['tautology-suspect', 'TAUTOLOGY', 'DELETE FROM t WHERE id IS NOT NULL;'],
 ];
 
 for (const [rule, constName, sql] of MUTATIONS) {
@@ -388,11 +457,78 @@ test('mutation: disabling comment stripping makes 0002 fail', () => {
 
 test('mutation: disabling string-literal handling makes a DROP inside a string fail', () => {
   const source = readFileSync(SCRIPT, 'utf8');
-  const marker = "tokens.push({ t: c === 39 ? 's' : 'q', v: '', line: start });";
+  const marker = "tokens.push({ t: c === 39 ? 's' : 'q', v: '', u, line: start });";
   assert.ok(source.includes(marker));
   const copy = path.join(scratch, 'mutant-strings.mjs');
-  writeFileSync(copy, source.replace(marker, "tokens.push({ t: 'w', v: 'DROP', line: start });"));
+  writeFileSync(copy, source.replace(marker, "tokens.push({ t: 'w', v: 'DROP', u, line: start });"));
   const file = writeSql("INSERT INTO t VALUES ('DROP TABLE x');");
   assert.equal(runCli(SCRIPT, [file]).code, 0);
   assert.notEqual(runCli(copy, [file]).code, 0);
+});
+
+test('no output line can start with "::" (workflow command injection)', () => {
+  for (const name of ['::error::pwn.sql', '::set-output name=x::y.sql', '::add-mask::x.sql', '::stop-commands::x.sql']) {
+    const missing = spawnSync(process.execPath, [SCRIPT, name], { cwd: scratch, encoding: 'utf8' });
+    writeFileSync(path.join(scratch, name), 'DROP TABLE t;\n');
+    const found = spawnSync(process.execPath, [SCRIPT, name], { cwd: scratch, encoding: 'utf8' });
+    for (const res of [missing, found]) {
+      const out = (res.stdout || '') + (res.stderr || '');
+      assert.ok(out.length > 0);
+      for (const line of out.split('\n').filter(Boolean)) assert.ok(line.startsWith('lint-migrations: '), line);
+    }
+    assert.equal(found.status, 1);
+  }
+});
+
+test('every normal output line has the fixed prefix', () => {
+  const r = runCli(SCRIPT, [writeSql('DROP TABLE t;\nALTER TABLE t ADD COLUMN c;')]);
+  for (const line of r.out.split('\n').filter(Boolean)) assert.ok(line.startsWith('lint-migrations: '), line);
+});
+
+test('deeply nested and very wide WHERE conditions are fast and do not overflow the stack', () => {
+  const start = Date.now();
+  const nested = 'DELETE FROM t WHERE ' + '('.repeat(100_000) + '1' + ')'.repeat(100_000) + ';';
+  assert.ok(hasRule(nested, 'delete-without-where'));
+  const alt = 'DELETE FROM t WHERE ' + '(a OR '.repeat(50_000) + 'b' + ')'.repeat(50_000) + ';';
+  assert.ok(hasRule(alt, 'delete-without-where'));
+  const wide = 'DELETE FROM t WHERE ' + 'a = 1 OR '.repeat(200_000) + 'b = 2;';
+  assert.deepEqual(rulesOf(wide), []);
+  assert.ok(Date.now() - start < 10000, `took ${Date.now() - start} ms`);
+});
+
+// text mutations of logic (not of a rule emission): each must make its failing case pass the lint
+const LOGIC_MUTATIONS = [
+  ['WITH main-verb resolution', 'MAIN_VERBS.has(tok.v)', 'false', ['WITH x AS (SELECT 1) DELETE FROM t;'], 'delete-without-where'],
+  ['quoted PRAGMA name', "verb === 'PRAGMA' ? tok.u : undefined", 'undefined', ['PRAGMA "writable_schema"=1;', "PRAGMA 'writable_schema'=1;", 'PRAGMA [writable_schema]=1;'], 'pragma-writable-schema'],
+  ['quoted schema table', "else if (tok.t === 'q') name = tok.u;", 'else if (false) name = tok.u;', ['UPDATE "sqlite_master" SET a = 1 WHERE b = 2;', 'UPDATE [sqlite_master] SET a = 1 WHERE b = 2;'], 'schema-write'],
+  ['string schema table', "else if (tok.t === 's' && prev", 'else if (false && prev', ["UPDATE 'sqlite_master' SET a = 1 WHERE b = 2;"], 'schema-write'],
+  ['constant WHERE check', 'if (constant) return 2;', 'if (false) return 2;', ['DELETE FROM t WHERE 0=0;', 'DELETE FROM t WHERE (1);', 'DELETE FROM t WHERE 1<2;'], 'delete-without-where'],
+  ['OR branch check', 'return ors.reduce((m, [a, b]) => Math.max(m, level(a, b, depth + 1)), 0);', 'return 0;', ['DELETE FROM t WHERE x = 1 OR 1;'], 'delete-without-where'],
+  ['paren stripping', "while (hi - lo >= 2 && isOp(c[lo], '(') && match[lo] === hi - 1) {", 'while (false) {', ['DELETE FROM t WHERE (x = 1 OR 1);'], 'delete-without-where'],
+];
+
+for (const [label, find, replace, sqls, rule] of LOGIC_MUTATIONS) {
+  test(`mutation: ${label} is detected`, () => {
+    const source = readFileSync(SCRIPT, 'utf8');
+    assert.ok(source.includes(find), `mutation site not found: ${label}`);
+    const copy = path.join(scratch, `mutant-logic-${label.replace(/[^a-z]/gi, '_')}.mjs`);
+    writeFileSync(copy, source.replace(find, replace));
+    for (const sql of sqls) {
+      const file = writeSql(sql);
+      assert.ok(runCli(SCRIPT, [file]).out.includes(rule), `original must report ${rule} for ${sql}`);
+      assert.ok(!runCli(copy, [file]).out.includes(rule), `mutant must not report ${rule} for ${sql}`);
+    }
+  });
+}
+
+test('mutation: removing the fixed output prefix is detected', () => {
+  const source = readFileSync(SCRIPT, 'utf8');
+  const find = "const PREFIX = 'lint-migrations: ';";
+  assert.ok(source.includes(find));
+  const copy = path.join(scratch, 'mutant-prefix.mjs');
+  writeFileSync(copy, source.replace(find, "const PREFIX = '';"));
+  const name = '::error::m.sql';
+  writeFileSync(path.join(scratch, name), 'DROP TABLE t;\n');
+  const out = spawnSync(process.execPath, [copy, name], { cwd: scratch, encoding: 'utf8' }).stdout;
+  assert.ok(out.startsWith('::'), 'the mutant prints the raw name, so the prefix test would fail');
 });

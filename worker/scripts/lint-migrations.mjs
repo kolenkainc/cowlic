@@ -27,11 +27,20 @@
 // Limits: this is a guard for honest mistakes, not a SQL parser. Comments, string literals and
 // quoted identifiers are removed by a small tokenizer; statements are split on semicolons with
 // CREATE TRIGGER ... BEGIN ... END bodies kept together (and linted statement by statement).
+// Quoted PRAGMA names and table names are compared by their unquoted content, case-insensitively.
 // A reserved word DROP/RENAME/TRUNCATE anywhere outside quotes is flagged, even as an unquoted
-// column name (fail closed: quote it). A WHERE that is always true but not literally 1/TRUE/1=1
-// is not detected, and an edit to an already applied file is out of scope (default mode only looks
-// at new files). Anything unknown (unterminated string/comment, unbalanced parentheses, an
-// unexpected first keyword, invalid UTF-8, a file over 8 MiB or without statements) is rejected.
+// column name (fail closed: quote it). Every PRAGMA with "=" or "(" is flagged (pragma-write), no allowlist.
+// WHERE check: a condition without any column reference (1, 0=0, 'a'='a', (1=1), NOT 0, 1<2, ...) or with
+// an OR branch like that is treated as no WHERE; "<col> IS NOT NULL", "<col> = <same col>" and
+// "rowid > 0" are tautology-suspect. Residual, by design: a WHERE with a real column condition is
+// allowed (whether it matches every row cannot be decided statically), as are conditions hidden in
+// function calls or CASE. Data statements INSERT OR REPLACE, REPLACE INTO and upserts are allowed on
+// purpose (idempotent seed idioms). An edit to an already applied migration is not linted in default
+// mode (it only sees new files): the workflow must fail when a file that exists in the base ref is
+// modified, renamed or deleted. Anything unknown (unterminated string/comment, unbalanced
+// parentheses, an unexpected first keyword, invalid UTF-8, a file over 8 MiB or without statements)
+// is rejected. Every output line starts with "lint-migrations: " so a file name cannot form a
+// GitHub Actions workflow command.
 // 0001_init.sql predates the IF NOT EXISTS rule: linting it explicitly reports that; in default mode
 // it is skipped because it is in the base ref. 0002 mentions DROP INDEX only in a comment: it passes.
 
@@ -42,6 +51,9 @@ import { fileURLToPath } from 'node:url';
 
 const MAX_BYTES = 8 * 1024 * 1024;
 const MAX_FINDINGS_PRINTED = 200;
+// every output line starts with this fixed prefix, so a file name like "::error::x.sql" can never
+// make a line start with "::" (GitHub Actions workflow command)
+const PREFIX = 'lint-migrations: ';
 
 const R = {
   DROP: 'drop',
@@ -51,6 +63,8 @@ const R = {
   DELETE_NO_WHERE: 'delete-without-where',
   UPDATE_NO_WHERE: 'update-without-where',
   WRITABLE_SCHEMA: 'pragma-writable-schema',
+  PRAGMA_WRITE: 'pragma-write',
+  TAUTOLOGY: 'tautology-suspect',
   SCHEMA_WRITE: 'schema-write',
   NO_IF_NOT_EXISTS: 'missing-if-not-exists',
   ADD_COLUMN: 'add-column-not-idempotent',
@@ -66,6 +80,8 @@ const KIND = {
   [R.DELETE_NO_WHERE]: 'destructive',
   [R.UPDATE_NO_WHERE]: 'destructive',
   [R.WRITABLE_SCHEMA]: 'destructive',
+  [R.PRAGMA_WRITE]: 'destructive',
+  [R.TAUTOLOGY]: 'destructive',
   [R.SCHEMA_WRITE]: 'destructive',
   [R.NO_IF_NOT_EXISTS]: 'required',
   [R.ADD_COLUMN]: 'warning',
@@ -81,6 +97,8 @@ const MESSAGE = {
   [R.DELETE_NO_WHERE]: 'DELETE without a WHERE clause removes all rows',
   [R.UPDATE_NO_WHERE]: 'UPDATE without a WHERE clause rewrites all rows',
   [R.WRITABLE_SCHEMA]: 'writable_schema allows corrupting the schema',
+  [R.PRAGMA_WRITE]: 'PRAGMA with = or ( changes database settings',
+  [R.TAUTOLOGY]: 'WHERE looks always true (IS NOT NULL, rowid > 0, x = x), treated like no WHERE',
   [R.SCHEMA_WRITE]: 'direct write to the sqlite_master schema table',
   [R.NO_IF_NOT_EXISTS]: 'CREATE without IF NOT EXISTS is not safe to repeat',
   [R.ADD_COLUMN]: 'ADD COLUMN is additive but not idempotent (D1 runs a migration once)',
@@ -137,6 +155,8 @@ export function tokenize(src) {
       const start = line;
       const close = c === 91 ? 93 : c;
       i++;
+      const contentStart = i;
+      let contentEnd = i;
       let closed = false;
       while (i < n) {
         const d = src.charCodeAt(i);
@@ -145,6 +165,7 @@ export function tokenize(src) {
             i += 2;
             continue;
           }
+          contentEnd = i;
           i++;
           closed = true;
           break;
@@ -153,7 +174,14 @@ export function tokenize(src) {
         i++;
       }
       if (!closed) throw new ParseError('unterminated quoted text', start);
-      tokens.push({ t: c === 39 ? 's' : 'q', v: '', line: start });
+      // u: the unquoted content, upper-cased (only kept for short ones; names are short)
+      let u = '';
+      if (contentEnd - contentStart <= 128) {
+        u = src.slice(contentStart, contentEnd);
+        if (close !== 93) u = u.split(String.fromCharCode(close, close)).join(String.fromCharCode(close));
+        u = u.toUpperCase();
+      }
+      tokens.push({ t: c === 39 ? 's' : 'q', v: '', u, line: start });
     } else if (isIdentStart(c)) {
       const s = i;
       i++;
@@ -233,6 +261,7 @@ function isTriggerHeader(cur) {
 
 const isW = (tok, v) => tok !== undefined && tok.t === 'w' && tok.v === v;
 const SCHEMA_TABLES = new Set(['SQLITE_MASTER', 'SQLITE_SCHEMA', 'SQLITE_TEMP_MASTER', 'SQLITE_TEMP_SCHEMA']);
+const STRING_NAME_CONTEXT = new Set(['UPDATE', 'FROM', 'INTO', 'JOIN']);
 const MAIN_VERBS = new Set(['SELECT', 'INSERT', 'REPLACE', 'UPDATE', 'DELETE']);
 
 // Returns findings [{rule, line}] for one statement.
@@ -257,12 +286,15 @@ function analyzeStatement(s) {
 
   // reserved words anywhere in the statement (outside quotes and strings)
   for (const tok of s) {
-    if (tok.t !== 'w') continue;
-    if (tok.v === 'DROP' && verb === 'ALTER') add(R.DROP_COLUMN, tok.line);
-    else if (tok.v === 'DROP') add(R.DROP, tok.line);
-    else if (tok.v === 'RENAME') add(R.RENAME, tok.line);
-    else if (tok.v === 'TRUNCATE') add(R.TRUNCATE, tok.line);
-    else if (tok.v === 'WRITABLE_SCHEMA') add(R.WRITABLE_SCHEMA, tok.line);
+    if (tok.t === 'w') {
+      if (tok.v === 'DROP' && verb === 'ALTER') add(R.DROP_COLUMN, tok.line);
+      else if (tok.v === 'DROP') add(R.DROP, tok.line);
+      else if (tok.v === 'RENAME') add(R.RENAME, tok.line);
+      else if (tok.v === 'TRUNCATE') add(R.TRUNCATE, tok.line);
+    }
+    // a PRAGMA name may be quoted: compare the unquoted content
+    const name = tok.t === 'w' ? tok.v : verb === 'PRAGMA' ? tok.u : undefined;
+    if (name === 'WRITABLE_SCHEMA') add(R.WRITABLE_SCHEMA, tok.line);
   }
 
   switch (verb) {
@@ -295,7 +327,10 @@ function analyzeStatement(s) {
       break;
     }
     case 'DROP':
+      break;
     case 'PRAGMA':
+      // any assignment or call form changes settings (foreign_keys, user_version, ...): no allowlist today
+      if (s.some((tok) => tok.t === 'p' && (tok.v === '=' || tok.v === '('))) add(R.PRAGMA_WRITE, first.line);
       break;
     case 'INSERT':
     case 'REPLACE':
@@ -334,8 +369,14 @@ function analyzeDml(s, verb, add) {
     }
   }
   if (mainVerb !== 'SELECT') {
-    for (const tok of s) {
-      if (tok.t === 'w' && SCHEMA_TABLES.has(tok.v)) {
+    for (let k = 0; k < s.length; k++) {
+      const tok = s[k];
+      const prev = s[k - 1];
+      let name = '';
+      if (tok.t === 'w') name = tok.v;
+      else if (tok.t === 'q') name = tok.u;
+      else if (tok.t === 's' && prev && ((prev.t === 'w' && STRING_NAME_CONTEXT.has(prev.v)) || (prev.t === 'p' && prev.v === '.'))) name = tok.u;
+      if (SCHEMA_TABLES.has(name)) {
         add(R.SCHEMA_WRITE, tok.line);
         break;
       }
@@ -372,8 +413,113 @@ function analyzeDml(s, verb, add) {
     }
     cond.push(tok);
   }
-  const lit = cond.map((x) => x.v).join(' ');
-  if (cond.length === 0 || lit === '1' || lit === 'TRUE' || lit === '1 = 1') noWhere(s[where].line);
+  const level = conditionLevel(mergeOperators(cond));
+  if (level === 2) noWhere(s[where].line);
+  else if (level === 1) add(R.TAUTOLOGY, s[where].line);
+}
+
+
+// ---- WHERE condition check: 2 = constant (no column reference), 1 = suspect always-true, 0 = real condition.
+
+const CONST_WORDS = new Set(['TRUE', 'FALSE', 'NULL', 'NOT', 'AND', 'OR', 'IS']);
+const CONST_PUNCT = new Set(['(', ')', '+', '-', '*', '/', '%', '~', '&', '|', ',']);
+const CMP_CHARS = '=<>!';
+const MAX_COND_DEPTH = 64;
+
+// "<", "=" -> "<=" so comparison operators are single tokens
+function mergeOperators(toks) {
+  const out = [];
+  for (const t of toks) {
+    const last = out[out.length - 1];
+    if (t.t === 'p' && CMP_CHARS.includes(t.v) && last && last.t === 'p' && CMP_CHARS.includes(last.v[0])) {
+      out[out.length - 1] = { ...last, v: last.v + t.v };
+    } else out.push(t);
+  }
+  return out;
+}
+
+const isOp = (tok, v) => tok !== undefined && tok.t === 'p' && tok.v === v;
+const nameOfRef = (tok) => (tok.t === 'w' ? tok.v : tok.u);
+
+function conditionLevel(c) {
+  const n = c.length;
+  if (n === 0) return 2;
+  const match = new Int32Array(n).fill(-1);
+  const stack = [];
+  for (let i = 0; i < n; i++) {
+    if (isOp(c[i], '(')) stack.push(i);
+    else if (isOp(c[i], ')')) {
+      if (stack.length === 0) return 2;
+      match[stack.pop()] = i;
+    }
+  }
+  if (stack.length > 0) return 2;
+
+  const splitTop = (lo, hi, word) => {
+    const parts = [];
+    let start = lo;
+    for (let i = lo; i < hi; i++) {
+      if (isOp(c[i], '(')) i = match[i];
+      else if (c[i].t === 'w' && c[i].v === word) {
+        parts.push([start, i]);
+        start = i + 1;
+      }
+    }
+    parts.push([start, hi]);
+    return parts;
+  };
+
+  // ident (. ident)* starting at i: returns [key, next] or null
+  const ref = (i, hi) => {
+    if (i >= hi || (c[i].t !== 'w' && c[i].t !== 'q')) return null;
+    let key = nameOfRef(c[i]);
+    i++;
+    while (i + 1 < hi && isOp(c[i], '.') && (c[i + 1].t === 'w' || c[i + 1].t === 'q')) {
+      key += '.' + nameOfRef(c[i + 1]);
+      i += 2;
+    }
+    return [key, i];
+  };
+
+  const atom = (lo, hi) => {
+    let constant = true;
+    for (let i = lo; i < hi && constant; i++) {
+      const t = c[i];
+      if (t.t === 'n' || t.t === 's') continue;
+      if (t.t === 'w' && CONST_WORDS.has(t.v)) continue;
+      if (t.t === 'p' && (CONST_PUNCT.has(t.v) || CMP_CHARS.includes(t.v[0]))) continue;
+      constant = false;
+    }
+    if (constant) return 2;
+    const left = ref(lo, hi);
+    if (!left) return 0;
+    const [key, next] = left;
+    // <col> IS NOT NULL
+    if (hi - next === 3 && isW(c[next], 'IS') && isW(c[next + 1], 'NOT') && isW(c[next + 2], 'NULL')) return 1;
+    // <col> = <same col> (also ==, >=, <=, IS)
+    const rest = next < hi ? c[next] : undefined;
+    if (rest && ((rest.t === 'p' && ['=', '==', '>=', '<='].includes(rest.v)) || isW(rest, 'IS'))) {
+      const right = ref(next + 1, hi);
+      if (right && right[1] === hi && right[0] === key) return 1;
+    }
+    if (['ROWID', '_ROWID_', 'OID'].includes(key) && hi - next === 2 && c[next].t === 'p' && ['>', '>='].includes(c[next].v) && c[next + 1].t === 'n' && c[next + 1].v === '0') return 1;
+    return 0;
+  };
+
+  const level = (lo, hi, depth) => {
+    if (depth > MAX_COND_DEPTH || lo >= hi) return 2;
+    while (hi - lo >= 2 && isOp(c[lo], '(') && match[lo] === hi - 1) {
+      lo++;
+      hi--;
+    }
+    if (lo >= hi) return 2;
+    const ors = splitTop(lo, hi, 'OR');
+    if (ors.length > 1) return ors.reduce((m, [a, b]) => Math.max(m, level(a, b, depth + 1)), 0);
+    const ands = splitTop(lo, hi, 'AND');
+    if (ands.length > 1) return ands.reduce((m, [a, b]) => Math.min(m, level(a, b, depth + 1)), 2);
+    return atom(lo, hi);
+  };
+  return level(0, n, 0);
 }
 
 // ---------------------------------------------------------------- lint
@@ -430,10 +576,10 @@ export function lintFile(file, { approved = false } = {}) {
       if (f.level === 'parse') parse++;
       else hard++;
     }
-    if (printed++ < MAX_FINDINGS_PRINTED) lines.push(`${safeName(file)}:${f.line}: ${level} ${f.rule}: ${MESSAGE[f.rule]}`);
+    if (printed++ < MAX_FINDINGS_PRINTED) lines.push(`${PREFIX}${safeName(file)}:${f.line}: ${level} ${f.rule}: ${MESSAGE[f.rule]}`);
   }
   if (findings.length > MAX_FINDINGS_PRINTED) {
-    lines.push(`${safeName(file)}: ERROR truncated: ${findings.length - MAX_FINDINGS_PRINTED} more findings not printed`);
+    lines.push(`${PREFIX}${safeName(file)}: ERROR truncated: ${findings.length - MAX_FINDINGS_PRINTED} more findings not printed`);
   }
   return { lines, hard, parse };
 }
