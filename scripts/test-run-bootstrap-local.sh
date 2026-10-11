@@ -358,6 +358,55 @@ wp=$!; sleep 2.5; kill -TERM "$wp"; rc=0; wait "$wp" || rc=$?; sleep 1
 assert "ship SIGTERM: exit 143, one final flush, no stray process, lock free" "$([ "$rc" = 143 ] && [ "$(grep -c -e '--final' "$STUB_SHIP_CALLS")" = 1 ] && [ -z "$(pgrep -f -- "$R/scripts/run-bootstrap-local.sh|$R/ingest/.venv/bin/python" || true)" ] && flock -n "$S/cowlic/ingest.lock" true && echo 0 || echo 1)"
 assert "ship SIGTERM: the finished line reached the shipped bytes" "$(has 'finished: exit code 143' "$STUB_SHIPPED")"
 
+# 10c. covers (#250): the cover backfill. Caps required without --count, rejected with it; the 21:10 guard and the Grafana
+# shipping only for the session; --count is read-only (no guard, no shipping, no --result-json) but takes the lock
+new_case cov; run covers --max-new 5 --max-minutes=10 --retry-days 7
+assert "covers: exit 0, args forwarded verbatim then --result-json" "$([ "$rc" = 0 ] && [ "$(cat "$STUB_ARGS")" = "$(printf '%s\n' covers --max-new 5 --max-minutes=10 --retry-days 7 --result-json "$S/cowlic/.bootstrap-result.json")" ] && echo 0 || echo 1)"
+assert "covers: the child sees COWLIC_LOCK_HELD=1 and no fd 9" "$([ "$(has '^lock-held=1$' "$STUB_ARGS.env")" = 0 ] && [ ! -e "$STUB_ARGS.fd9" ] && echo 0 || echo 1)"
+assert "covers: last-run says subcommand covers" "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["subcommand"]=="covers" and d["exit_code"]==0' "$S/cowlic/bootstrap-last-run.json" > /dev/null 2>&1 && echo 0 || echo 1)"
+assert "covers: the session is shipped logs-only under the bootstrap job" "$([ -s "$STUB_SHIP_CALLS" ] && [ "$(grep -vc -e '--logs-only --job cowlic-bootstrap ' "$STUB_SHIP_CALLS" || true)" = 0 ] && grep -q -e '--final' "$STUB_SHIP_CALLS" && echo 0 || echo 1)"
+new_case cov-res; STUB_RESULT='{"stop_reason": "cap", "counts": {"covered": 2}}'; export STUB_RESULT; run covers --max-new 5 --max-minutes 10; unset STUB_RESULT
+assert "covers: the result object and its stop reason reach last-run" "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["stop_reason"]=="cap" and d["result"]["counts"]=={"covered":2}' "$S/cowlic/bootstrap-last-run.json" > /dev/null 2>&1 && echo 0 || echo 1)"
+new_case cov-rc3; STUB_RC=3; export STUB_RC; run covers --max-new 1 --max-minutes 1; unset STUB_RC
+assert "covers: exit 3 passed through, sign-in recorded" "$([ "$rc" = 3 ] && python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["stop_reason"]=="sign-in"' "$S/cowlic/bootstrap-last-run.json" > /dev/null 2>&1 && echo 0 || echo 1)"
+new_case cov-count; COWLIC_BOOTSTRAP_NOW_EPOCH="$(epoch '2026-10-11 21:09:30')" run covers --count --retry-days 3
+assert "covers --count: exit 0 even at 21:09:30 (no guard), forwarded verbatim, no --result-json" "$([ "$rc" = 0 ] && [ "$(cat "$STUB_ARGS")" = "$(printf '%s\n' covers --count --retry-days 3)" ] && echo 0 || echo 1)"
+assert "covers --count: ships nothing" "$([ ! -e "$STUB_SHIP_CALLS" ] && echo 0 || echo 1)"
+assert "covers --count: last-run written, no offset file" "$([ -s "$S/cowlic/bootstrap-last-run.json" ] && [ ! -e "$S/cowlic/.bootstrap-ship.offset" ] && echo 0 || echo 1)"
+new_case cov-count-lock; mkdir -p "$S/cowlic"
+( exec 9> "$S/cowlic/ingest.lock"; flock -n 9; exec sleep 3 ) 9> /dev/null &
+holder=$!; sleep 0.4
+run covers --count
+kill "$holder" 2> /dev/null || true; wait "$holder" 2> /dev/null || true
+assert "covers --count: a held lock gives 75 and touches nothing" "$([ "$rc" = 75 ] && [ "$(nothing_started)" = 0 ] && echo 0 || echo 1)"
+new_case cov-lock; mkdir -p "$S/cowlic"
+( exec 9> "$S/cowlic/ingest.lock"; flock -n 9; exec sleep 3 ) 9> /dev/null &
+holder=$!; sleep 0.4
+run covers --max-new 1 --max-minutes 1
+kill "$holder" 2> /dev/null || true; wait "$holder" 2> /dev/null || true
+assert "covers: a held lock gives 75, nothing started, nothing shipped" "$([ "$rc" = 75 ] && [ "$(nothing_started)" = 0 ] && [ ! -e "$STUB_SHIP_CALLS" ] && echo 0 || echo 1)"
+reject "covers without caps" covers
+reject "covers without --max-minutes" covers --max-new 5
+reject "covers without --max-new" covers --max-minutes 5
+reject "covers --count with --max-new" covers --count --max-new 5
+reject "covers --count with --max-minutes=5" covers --count --max-minutes=5
+reject "covers --count with both caps" covers --max-new 5 --count --max-minutes 5
+reject "covers --max-new 0" covers --max-new 0 --max-minutes 5
+reject "covers --max-minutes 1441" covers --max-new 5 --max-minutes 1441
+reject "covers abbreviated --max-n" covers --max-n 5 --max-minutes 5
+reject "covers --result-json supplied by the caller" covers --max-new 1 --max-minutes 1 --result-json /tmp/x
+reject "--count on run" run --count --max-new 1 --max-minutes 1
+reject "--count on rank" rank --count
+reject "--count on status" status --count
+new_case cov-g; COWLIC_BOOTSTRAP_NOW_EPOCH="$(epoch '2026-10-11 12:00:00')" run covers --max-new 1 --max-minutes 600
+assert "covers: the 21:10 guard applies and names how many minutes fit" "$([ "$rc" = 78 ] && [ "$(has 'at most 538 minutes fit now' "$C/out")" = 0 ] && [ "$(nothing_started)" = 0 ] && echo 0 || echo 1)"
+new_case cov-g-ok; COWLIC_BOOTSTRAP_NOW_EPOCH="$(epoch '2026-10-11 12:00:00')" run covers --max-new 1 --max-minutes 538
+assert "covers: 538 minutes fit at noon" "$(is "$rc" 0)"
+new_case cov-g-near; COWLIC_BOOTSTRAP_NOW_EPOCH="$(epoch '2026-10-11 21:10:30')" run covers --max-new 1 --max-minutes 1
+assert "covers: within 60 s after 21:10 that day's run still counts" "$(is "$rc" 78)"
+new_case cov-opt; run covers --max-new 3 --max-minutes 5 --retry-days 0
+assert "covers: other options are forwarded untouched" "$([ "$rc" = 0 ] && grep -qx -e '--retry-days' "$STUB_ARGS" && echo 0 || echo 1)"
+
 # 11. mutation checks: break one rule at a time in a copy of the wrapper; the scenario that guards the rule must fail
 # on the mutant and pass on the original. A scenario prints 0 when the wrapper behaves correctly.
 sc_lock() {
@@ -420,6 +469,23 @@ sc_watchdog() {
   local stray; stray="$(pgrep -f -- "sleep $MARK" || true)"; pkill -f -- "sleep $MARK" 2> /dev/null || true
   [ -z "$stray" ] && echo 0 || echo 1
 }
+sc_cov_guard() { new_case "m-cg-$RANDOM"; run covers --max-new 1 --max-minutes 600; [ "$rc" = 78 ] && [ ! -e "$STUB_ARGS" ] && echo 0 || echo 1; }
+sc_cov_caps() { new_case "m-cc-$RANDOM"; run covers; [ "$rc" = 78 ] && [ ! -e "$STUB_ARGS" ] && echo 0 || echo 1; }
+sc_cov_count_caps() { new_case "m-ccc-$RANDOM"; run covers --count --max-new 5; [ "$rc" = 78 ] && [ ! -e "$STUB_ARGS" ] && echo 0 || echo 1; }
+sc_cov_count_noguard() { new_case "m-ccg-$RANDOM"; COWLIC_BOOTSTRAP_NOW_EPOCH="$(epoch '2026-10-11 21:09:30')" run covers --count; [ "$rc" = 0 ] && [ -e "$STUB_ARGS" ] && echo 0 || echo 1; }
+sc_cov_count_noship() { new_case "m-ccs-$RANDOM"; run covers --count; [ "$rc" = 0 ] && [ ! -e "$STUB_SHIP_CALLS" ] && echo 0 || echo 1; }
+sc_cov_ship() { new_case "m-cs-$RANDOM"; run covers --max-new 1 --max-minutes 1; [ "$rc" = 0 ] && [ -s "$STUB_SHIP_CALLS" ] && echo 0 || echo 1; }
+sc_cov_result() { new_case "m-cr-$RANDOM"; run covers --max-new 1 --max-minutes 1; grep -qx -e '--result-json' "$STUB_ARGS" && echo 0 || echo 1; }
+sc_cov_count_result() { new_case "m-ccr-$RANDOM"; run covers --count; ! grep -qx -e '--result-json' "$STUB_ARGS" && echo 0 || echo 1; }
+sc_cov_count_lock() {
+  new_case "m-ccl-$RANDOM"; mkdir -p "$S/cowlic"
+  ( exec 9> "$S/cowlic/ingest.lock"; flock -n 9; exec sleep 3 ) 9> /dev/null &
+  local h=$!; sleep 0.4
+  run covers --count
+  kill "$h" 2> /dev/null || true; wait "$h" 2> /dev/null || true
+  [ "$rc" = 75 ] && [ ! -e "$STUB_ARGS" ] && echo 0 || echo 1
+}
+sc_count_on_run() { new_case "m-cor-$RANDOM"; run run --count --max-new 1 --max-minutes 1; [ "$rc" = 78 ] && [ ! -e "$STUB_ARGS" ] && echo 0 || echo 1; }
 mutation() { # name, scenario, sed expression: the scenario must pass on the original and fail on the mutant
   local name="$1" sc="$2" expr="$3" orig mut
   WRAPPER_SRC="$ROOT/scripts/run-bootstrap-local.sh"; orig="$($sc)"
@@ -451,10 +517,20 @@ mutation "shipping from offset 0 (earlier sessions)" sc_shipped_clean 's/--offse
 mutation "shipped bytes not redacted" sc_shipped_clean 's#| "\$VENV_PY" -u "\$SHIP" --filter 9>&- \\#| cat \\#'
 mutation "shipper failure changes the exit code" sc_ship_rc 's/out="\$(ship_call --final)" || out=""/out="$(ship_call --final)" || exit 9/'
 mutation "shipper without timeout" sc_ship_timeout 's/timeout -k 2 "\$SHIP_TIMEOUT_S" //'
-mutation "shipping for every subcommand" sc_only_run_plan '/^# The live shipper/,/^esac/ s/^  run | plan)$/  *)/'
+mutation "shipping for every subcommand" sc_only_run_plan '/^# The live shipper/,/^esac/ s/^  1)$/  *)/'
 mutation "no live loop" sc_live 's/^      warned=0$/      exit 0/'
 mutation "live loop outlives the wrapper" sc_tick_orphan 's#kill -0 "\$WRAPPER_PID" 2> /dev/null || exit 0#true#'
 mutation "no watchdog" sc_watchdog 's/^  while kill -0 "\$WRAPPER_PID".*$/  sleep 100000/'
+mutation "covers is not guarded against 21:10" sc_cov_guard 's/^case "\$SUB" in run | plan) LONG=1 ;; covers) \[ "\$COUNT" = 1 \] || LONG=1 ;; esac/case "$SUB" in run | plan) LONG=1 ;; esac/'
+mutation "covers caps not required" sc_cov_caps 's/usage_fail "covers requires --max-new and --max-minutes (or --count)"/true/'
+mutation "covers --count accepts caps" sc_cov_count_caps 's/usage_fail "covers --count takes no --max-new or --max-minutes"/true/'
+mutation "covers --count is guarded" sc_cov_count_noguard 's/covers) \[ "\$COUNT" = 1 \] || LONG=1 ;;/covers) LONG=1 ;;/'
+mutation "covers --count is shipped" sc_cov_count_noship 's/covers) \[ "\$COUNT" = 1 \] || LONG=1 ;;/covers) LONG=1 ;;/'
+mutation "covers session is not shipped" sc_cov_ship 's/^case "\$SUB" in run | plan) LONG=1 ;; covers) \[ "\$COUNT" = 1 \] || LONG=1 ;; esac/case "$SUB" in run | plan) LONG=1 ;; esac/'
+mutation "covers gets no --result-json" sc_cov_result 's/if \[ "\$SUB" = run \] || { \[ "\$SUB" = covers \] \&\& \[ "\$COUNT" = 0 \]; }; then/if [ "$SUB" = run ]; then/'
+mutation "covers --count gets --result-json" sc_cov_count_result 's/ \&\& \[ "\$COUNT" = 0 \]; }; then EXTRA/; }; then EXTRA/'
+mutation "covers --count skips the lock" sc_cov_count_lock 's/^exec 9> "\$LOCK"$/if [ "$COUNT" = 1 ]; then LOCK=\/dev\/null; fi; exec 9> "$LOCK"/'
+mutation "--count accepted on run" sc_count_on_run 's/\[ "\$SUB" = covers \] || usage_fail "--count belongs to covers only"/true/'
 
 if [ "$failures" -ne 0 ]; then echo "$failures FAILED"; exit 1; fi
 echo "all passed"
