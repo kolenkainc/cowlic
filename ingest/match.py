@@ -202,11 +202,27 @@ def _result_extras(result: dict) -> dict:
             "artist_id": text(first.get("id")), "artist_name": text(first.get("name")), "thumbnail_base": text(base)}
 
 
+def _plural_pair(ww: set, wf: set) -> bool:
+    """True when the two word sets differ by a word and the same word plus 's' (Lover / Lovers, Slayer / Slayers):
+    near-identical by ratio, but a different album or artist."""
+    diff = ww ^ wf
+    return any(w + "s" in diff for w in diff)
+
+
+def artists_match(wanted: str, names: list[str]) -> bool:
+    """Cover-only artist check: article-insensitive, Latin vs Cyrillic aware, a bare plural 's' is a different artist."""
+    return any(artist_similarity(a, n) >= COVER_ARTIST_MIN_SIMILARITY
+               and not _plural_pair(set(normalize(a).split()), set(normalize(n).split()))
+               for a in (wanted, transliterate_to_cyrillic(wanted)) for n in names)
+
+
 def albums_match(wanted: str, found: str) -> bool:
     nw, nf = normalize(wanted), normalize(found)
     if not nw or not nf or SequenceMatcher(None, nw, nf).ratio() < COVER_ALBUM_MIN_SIMILARITY:
         return False
     ww, wf = set(nw.split()), set(nf.split())
+    if _plural_pair(ww, wf):
+        return False
     if {w for w in ww if w.isdigit() or w in _ROMAN} != {w for w in wf if w.isdigit() or w in _ROMAN}:
         return False  # Vol. 1 / Vol. 2, II / III
     return not (ww ^ wf) & _EDITION_WORDS  # (Deluxe), (Live), Remastered, ...: another release
@@ -224,9 +240,10 @@ def cover_url_from_match(album: str | None, artist: str, m) -> tuple[str | None,
         return None, "no_match_album"
     if not albums_match(album, found):
         return None, "album_mismatch"
-    names = [n for n in (getattr(m, "artist_name", None), getattr(m, "artists", None)) if isinstance(n, str) and n]
-    if not names or max(artist_similarity(a, n) for a in (artist, transliterate_to_cyrillic(artist)) for n in names) \
-            < COVER_ARTIST_MIN_SIMILARITY:
+    joined = getattr(m, "artists", None)
+    names = [n for n in (getattr(m, "artist_name", None), joined, *(joined.split(", ") if isinstance(joined, str) else []))
+             if isinstance(n, str) and n]
+    if not names or not artists_match(artist, names):
         return None, "artist_mismatch"
     return base + COVER_SIZE_SUFFIX, "ok"
 

@@ -1,7 +1,12 @@
 """Album covers from the YouTube Music match (#248). Offline: every download and upload is a fake (NoNetwork base)."""
 import email.message
+import http.server
 import io
 import tempfile
+import threading
+import time
+import unittest
+import urllib.error
 import urllib.request
 import urllib.response
 from pathlib import Path
@@ -193,6 +198,8 @@ class FakeResponse:
             self.tick()
         return self.chunks.pop(0) if self.chunks else b""
 
+    read1 = read
+
 
 class FakeOpener:
     def __init__(self, resp):
@@ -265,6 +272,11 @@ class FetchCoverTest(NoNetwork):
             return t[0]
         resp = FakeResponse(chunks=[JPEG] * 100, tick=lambda: t.__setitem__(0, t[0] + 5))
         self.rejected(resp=resp, clock=clock)
+
+    def test_userinfo_forms_rejected(self):
+        for u in ("https://:@lh3.googleusercontent.com/x", "https://@lh3.googleusercontent.com/x"):
+            with self.subTest(u=u):
+                self.rejected(url=u)
 
     def test_failed_download_leaves_no_file(self):
         with tempfile.TemporaryDirectory() as d:
@@ -360,3 +372,127 @@ class RealDepsRoutingTest(NoNetwork):
 
     def test_spotify_cover_has_no_allowlist(self):
         self.assertEqual(self.route({"cover_url": "https://i.scdn.co/x"}), [None])
+
+
+class SlowDripTest(unittest.TestCase):
+    """A real loopback server (plain unittest.TestCase: NoNetwork would block the socket) that sends one byte per
+    0.3 s. A blocking read(64 KiB) would never return; read1 hands each byte over so the deadline can fire."""
+
+    def test_deadline_ends_a_slow_drip(self):
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(5 * 1024 * 1024))
+                self.end_headers()
+                try:
+                    while True:
+                        self.wfile.write(b"x")
+                        self.wfile.flush()
+                        time.sleep(0.3)
+                except OSError:
+                    pass
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        out = {}
+
+        def go():
+            t0 = time.monotonic()
+            try:
+                with urllib.request.build_opener().open(f"http://127.0.0.1:{srv.server_address[1]}/x", timeout=30) as r:
+                    ingest._read_cover_body(r, time.monotonic, time.monotonic() + 1.5)
+                out["r"] = "returned"
+            except ingest.IngestError as e:
+                out["r"] = str(e)
+            out["t"] = time.monotonic() - t0
+        th = threading.Thread(target=go, daemon=True)
+        th.start()
+        th.join(10)
+        self.assertEqual(out.get("r"), "cover download too slow", out or "still blocked after 10 s")
+        self.assertLess(out["t"], 5)
+
+
+class BoundaryTest(NoNetwork):
+    """Similarity bars: pairs on both sides of each."""
+
+    def album(self, a, b):
+        return match.albums_match(a, b)
+
+    def test_album_bar_is_0_9(self):
+        self.assertEqual(round(match.SequenceMatcher(None, "abcdefghijklmnopqrst", "abcdefghijklmnopqrxx").ratio(), 2), 0.9)
+        self.assertTrue(self.album("abcdefghijklmnopqrst", "abcdefghijklmnopqrxx"))  # exactly at the bar
+        self.assertFalse(self.album("abcdefghijklmnopqrst", "abcdefghijklmnopqxxx"))  # 0.85
+        self.assertFalse(self.album("night visions", "night visiting"))  # 0.82
+
+    def test_artist_bar(self):
+        self.assertEqual(round(match.artist_similarity("Eve", "Eva"), 2), 0.67)
+        self.assertFalse(match.artists_match("Eve", ["Eva"]))
+        self.assertTrue(match.artists_match("Eve", ["Eve"]))
+        self.assertFalse(match.artists_match("abcdefghij", ["abcdefgxyz"]))  # 0.7, above the title-only bar, below ours
+        self.assertTrue(match.artists_match("abcdefghij", ["abcdefghxy"]))  # 0.8, exactly at the bar
+
+    def test_plural_only_differences_are_refused(self):
+        self.assertFalse(self.album("Lover", "Lovers"))
+        self.assertFalse(self.album("Lovers", "Lover"))
+        self.assertFalse(match.artists_match("Slayer", ["Slayers"]))
+        self.assertTrue(match.artists_match("Slayer", ["Slayer"]))
+
+    def test_each_edition_word_alone(self):
+        base = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda"
+        for w in ("deluxe", "remastered", "live", "edition", "anniversary"):
+            with self.subTest(w=w):
+                self.assertGreaterEqual(match.SequenceMatcher(None, base, f"{base} {w}").ratio(), 0.9)  # ratio alone passes
+                self.assertFalse(self.album(base, f"{base} {w}"))
+        self.assertTrue(self.album(base, base))
+
+    def test_joined_artists_field_is_used(self):
+        m = cand(artist_name="Other Artist", artists="Other Artist, The Killers")
+        self.assertEqual(match.cover_url_from_match("Hot Fuss", "The Killers", m)[1], "ok")
+        m = cand(artist_name="Other Artist", artists="Other Artist, Third One")
+        self.assertEqual(match.cover_url_from_match("Hot Fuss", "The Killers", m)[1], "artist_mismatch")
+
+
+class CoverFailureKindsTest(ProcessTrackCoverTest):
+    def go_raising(self, exc):
+        with tempfile.TemporaryDirectory() as d:
+            f = Fakes(Path(d))
+            deps = f.deps()
+
+            def up(song_, tdir):
+                raise exc
+            deps.upload_cover, deps.find_match = up, lambda _s: cand()
+            notes = {}
+            s = song(1, cover_url=None, album_name="Hot Fuss", album_artist="The Killers")
+            status = ingest.process_track(s, deps, set(), {}, Path(d), False, notes)
+            return status, f.batches, notes
+
+    def test_oserror_and_httperror_never_fail_the_track(self):
+        for exc in (OSError("net"), urllib.error.HTTPError("https://x", 302, "Found", {}, None), ValueError("v"),
+                    KeyError("k"), ingest.IngestError("e")):
+            with self.subTest(exc=type(exc).__name__):
+                status, batches, notes = self.go_raising(exc)
+                self.assertEqual(status, "new")
+                self.assertIsNone(batches[0][1][1][-1])
+                self.assertNotIn("cover_from_match", notes)  # counted only after a successful upload
+
+    def test_counted_after_a_successful_upload(self):
+        _, _, _, _, notes = self.go(song(1, cover_url=None, album_name="Hot Fuss", album_artist="The Killers"), cand())
+        self.assertTrue(notes["cover_from_match"])
+
+    def test_counts_and_summary_in_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Fakes(Path(d))
+            deps = f.deps()
+            deps.find_match = lambda s: cand()
+            songs = [song(1, cover_url=None, album_name="Hot Fuss", album_artist="The Killers"),
+                     song(2, cover_url=None, album_name="Other Album", album_artist="The Killers")]
+            counts = ingest.run(songs, deps, set(), {}, Path(d), False)
+        self.assertEqual((counts["cover_from_match"], counts["cover_skipped"]), (1, 1))
+        self.assertIn("1 covers from the match, 1 without a cover", ingest.summary(counts))

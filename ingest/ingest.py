@@ -764,6 +764,22 @@ def _cover_opener(*extra_handlers) -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(_NoRedirect, *extra_handlers)
 
 
+def _read_cover_body(r, clock, deadline) -> bytes:
+    """read1 returns what has arrived (at most COVER_CHUNK bytes) instead of blocking until the full chunk is there; the
+    socket timeout restarts on every received byte, so only this loop can enforce the total deadline."""
+    chunks, total = [], 0
+    while True:
+        if clock() > deadline:
+            raise IngestError("cover download too slow")
+        chunk = r.read1(COVER_CHUNK)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > COVER_MAX_BYTES:
+            raise IngestError("cover too large")
+
+
 def _fetch_cover_checked(url: str, allowed_hosts: frozenset, opener, clock) -> bytes:
     parts = urllib.parse.urlparse(url)
     if parts.scheme != "https":
@@ -772,25 +788,14 @@ def _fetch_cover_checked(url: str, allowed_hosts: frozenset, opener, clock) -> b
         port = parts.port
     except ValueError:
         raise IngestError("cover url has an invalid port") from None
-    if parts.username or parts.password or port not in (None, 443) or (parts.hostname or "") not in allowed_hosts:
+    if "@" in parts.netloc or port not in (None, 443) or (parts.hostname or "") not in allowed_hosts:
         raise IngestError("cover host is not allowed")
     deadline = clock() + COVER_TOTAL_TIMEOUT_S
     with opener.open(url, timeout=30) as r:
         ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         if ctype != "image/jpeg":
             raise IngestError("cover is not image/jpeg")
-        chunks, total = [], 0
-        while True:
-            if clock() > deadline:
-                raise IngestError("cover download too slow")
-            chunk = r.read(COVER_CHUNK)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-            if total > COVER_MAX_BYTES:
-                raise IngestError("cover too large")
-    data = b"".join(chunks)
+        data = _read_cover_body(r, clock, deadline)
     if not data.startswith(b"\xff\xd8"):
         raise IngestError("cover is not a JPEG")
     return data
@@ -861,8 +866,6 @@ def process_track(song: dict, deps: Deps, existing: set, covers: dict, work: Pat
             url, why = cover_url_from_match(None if album_name == UNKNOWN_ALBUM else album_name, primary_artist(song), m)
             if url:
                 song = {**song, "cover_url": url, COVER_FROM_MATCH: True}
-                if notes is not None:
-                    notes["cover_from_match"] = True
             elif why != "no_thumbnail":  # a match without a thumbnail is the old behaviour: silent
                 log(f"cover skipped for {sid}: {why}")
                 if notes is not None:
@@ -871,6 +874,8 @@ def process_track(song: dict, deps: Deps, existing: set, covers: dict, work: Pat
             try:
                 cover = deps.upload_cover(song, tdir)
                 covers[al] = cover
+                if song.get(COVER_FROM_MATCH) and notes is not None:  # counted only after the upload worked
+                    notes["cover_from_match"] = True
             except (IngestError, OSError, KeyError, ValueError):
                 log(f"WARN cover failed for {sid}")
         deps.d1_batch(upsert_statements(song, size, msg["audio"]["file_id"], msg["message_id"], cover))

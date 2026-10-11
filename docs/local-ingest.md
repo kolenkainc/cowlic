@@ -929,6 +929,28 @@ the playlists are not affected. The shipped `ingest.log` gets counts and hashed 
 `new_releases` object (counts only: `due`, `checked`, `with_new`, `added`, `skipped`, `failed`, `not_started`, and a
 `status` word); its track counts are also part of `counts`.
 
+## Album covers from YouTube Music (#248)
+
+A track without a Spotify cover URL (Last.fm and new-release tracks) gets the album cover from the YouTube Music
+search result the matcher chose: the result's thumbnail with the size suffix `=w1200-h1200-l90-rj`, uploaded through
+the normal `sendPhoto` path. A cover is stored per album and kept forever, so the guard is strict. No cover is used when:
+the track has no album or `Unknown Album`; the matched album name differs (similarity under 0.9, another number or
+roman numeral, an edition word such as deluxe, remastered or live in the difference, or a plural-only difference
+like `Lover` / `Lovers`); or the matched artist differs from the track's artist (bar 0.8, article-insensitive,
+Latin/Cyrillic aware, plural-only differences refused). This artist check only gates the cover, never the audio match.
+Known residual: two different albums whose names differ by less than the bar in some other way can still pass.
+
+The download accepts only https from `lh3.googleusercontent.com` or `yt3.googleusercontent.com`, follows no redirect,
+needs `Content-Type: image/jpeg` and the JPEG magic bytes, is capped at 10 MB and has a 60 s total deadline. A failed
+cover is `WARN cover failed for <song id>` and never fails the track.
+
+Log and summary (counts and ids only, never names):
+
+- `cover skipped for <song id>: <class>` with class `no_album`, `no_match_album`, `album_mismatch` or `artist_mismatch`.
+  Logged per track, not per album (several tracks of one album each log it). A match without a thumbnail is silent.
+- The per-playlist and final summary lines get `, N covers from the match` (counted after a successful upload) and
+  `, N without a cover` (tracks the guard refused), each only when non-zero. They are not part of the result JSON.
+
 ## Troubleshooting
 
 | Symptom | Likely cause and fix |
