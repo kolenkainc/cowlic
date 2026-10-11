@@ -198,7 +198,7 @@ class ScoringTests(unittest.TestCase):
 
     def test_title_only_thresholds_are_unchanged(self):
         self.assertEqual((match.TITLE_ONLY_TITLE_MIN_SIMILARITY, match.TITLE_ONLY_ARTIST_MIN_SIMILARITY,
-                          match.TITLE_ONLY_MIN_DURATION_S, match.TITLE_ONLY_MAX_DURATION_S), (0.93, 0.6, 60, 600))
+                          match.TITLE_ONLY_MIN_DURATION_S, match.TITLE_ONLY_MAX_DURATION_S), (0.93, 0.7, 60, 600))
         self.assertEqual(match.TITLE_MIN_SIMILARITY, 0.85)
 
     def test_title_only_relaxed_keeps_the_threshold_artist_and_range(self):

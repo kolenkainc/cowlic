@@ -773,7 +773,7 @@ finished and holds the stop reason (same on every row) otherwise, so `--summariz
   outside 60-600 s rejected it), `no_results`. `pattern` is the same failing-pattern tag as in the Spotify report.
 - Title-only matches have no duration check, so they are the risky ones: `matched_artists` and `matched_duration_s`
   are there for the eyeball check. Thresholds of that mode (`ingest/match.py`): title similarity >= 0.93, artist
-  similarity >= 0.6 against any returned artist name (the 0.6 is loose; judge it on the numbers), candidate length
+  similarity >= 0.7 against any returned artist name (a leading the/a/an is ignored on both sides; the 0.7 is a judgement, not measured, so judge it on the numbers), candidate length
   60-600 s, and none of the variant words (live, remix, edit, acoustic, cover, ...) that the requested title lacks.
   The duration mode keeps title >= 0.85 and +-3 s.
 - Relaxed title pass (#194), both modes: only when the strict pass finds nothing in the same search results (no extra
