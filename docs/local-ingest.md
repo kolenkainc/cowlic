@@ -217,7 +217,8 @@ After every run (after `last-run.json` is written) the wrapper calls `ingest/shi
 library only). It is best effort and cannot change the run: it runs under `timeout` (30 s hard limit), its result
 is ignored, the wrapper exit code and `last-run.json` are unchanged, and a failure leaves one short line in
 `ingest.log` (`grafana: loki push failed (HTTP 401)`, `... (URLError)`, `grafana shipping timed out`). There is
-no retry: the next run is the retry, a failed night is a gap in Grafana.
+no retry loop: the next run is the retry, a failed night is a gap in Grafana (the only repeat is one small
+summary-only push after an HTTP 400/413 of the full push, see below).
 
 Enable it with three keys in the machine's `.env` (names only; values come from your Grafana Cloud portal, see
 #107, and are never committed or pasted anywhere):

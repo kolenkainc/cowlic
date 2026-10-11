@@ -515,6 +515,27 @@ class LastRunTests(Base):
                 sg.strict_json(bad)
         self.assertEqual(sg.strict_json(b'{"a": 1}'), {"a": 1})
 
+    def test_date_that_matches_the_pattern_but_is_not_real_is_a_shipping_error(self):
+        for bad in ("2026-13-10T19:10:01Z", "2026-02-30T19:10:01Z", "2026-10-10T25:10:01Z", "2026-10-10T19:60:01Z"):
+            with self.assertRaises(sg.ShipError) as cm:
+                sg._iso(bad)
+            self.assertEqual(str(cm.exception), "last-run.json has an unexpected value")  # fixed text, no value
+        for field in ("started_at", "finished_at"):
+            with self.assertRaises(sg.ShipError):
+                self.parse(json.dumps({**LAST_RUN, field: "2026-13-10T19:10:01Z"}))
+
+    def test_impossible_date_still_ships_the_log_and_the_metrics(self):
+        self.log.write_text("a line\n")
+        self.lr.write_text(json.dumps({**LAST_RUN, "finished_at": "2026-13-10T19:12:40Z"}))
+        f = self.fake()
+        env = {**self.env(), "INGEST_GRAFANA_PROM_URL": f"https://{HOST}", "INGEST_GRAFANA_PROM_USER": PROM_USER}
+        out = self.run_ship(f, env=env)
+        self.assertIn("no run_summary (last-run.json has an unexpected value)", out)
+        self.assertIn("loki push ok", out)
+        self.assertNotIn("2026-13", out)
+        self.assertEqual([r["path"] for r in f.requests].count(sg.PUSH_PATH), 1)
+        self.assertIn("metrics skipped (no last-run.json for this run)", out)
+
     def test_last_run_of_another_run_is_ignored(self):
         self.assertEqual(self.parse(json.dumps(LAST_RUN))["exit_code"], 0)
         sg.parse_last_run(str(self.lr), "2026-10-10T19:10:01Z")
@@ -652,6 +673,23 @@ class ConfigTests(Base):
             self.assertEqual((rc, out.strip()), (0, "grafana: not configured"))
         rc, out = self.main({})
         self.assertEqual((rc, out.strip()), (0, "grafana: not configured"))
+        self.assertEqual(f.requests, [])
+
+    def test_metrics_keys_without_log_keys_say_why_nothing_was_sent(self):
+        self.log.write_text("x\n")
+        f = self.fake()
+        env = {"INGEST_GRAFANA_TOKEN": CANARY_TOKEN, "INGEST_GRAFANA_PROM_URL": f"https://{HOST}",
+               "INGEST_GRAFANA_PROM_USER": PROM_USER}
+        for keys in (env, {k: v for k, v in env.items() if k != "INGEST_GRAFANA_PROM_USER"},
+                     {k: v for k, v in env.items() if k != "INGEST_GRAFANA_PROM_URL"}):
+            rc, out = self.main(keys)
+            self.assertEqual(rc, 0)
+            self.assertIn("not configured", out)
+            self.assertIn("metrics skipped", out)
+            self.assertNotIn(CANARY_TOKEN, out)
+            self.assertNotIn(PROM_USER, out)
+        rc, out = self.main({"INGEST_GRAFANA_TOKEN": CANARY_TOKEN})  # no metrics keys: the old plain line
+        self.assertEqual(out.strip(), "grafana: not configured")
         self.assertEqual(f.requests, [])
 
     def test_validate_url(self):

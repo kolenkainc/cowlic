@@ -111,7 +111,10 @@ def default_fetch(url: str, headers: dict, timeout: float) -> tuple[int, dict, d
         with _OPEN(req, timeout=timeout) as r:
             status, hdrs, raw = r.status, r.headers, r.read()
     except urllib.error.HTTPError as e:  # the body is read bounded; it carries Spotify's reason (error.message)
-        return e.code, {k.lower(): v for k, v in e.headers.items()}, read_error_body(e)
+        try:
+            return e.code, {k.lower(): v for k, v in e.headers.items()}, read_error_body(e)
+        finally:
+            e.close()  # an unclosed HTTPError leaks the connection (ResourceWarning)
     except (urllib.error.URLError, OSError, http.client.HTTPException) as e:  # includes timeouts; the class name only
         raise ArtistTracksError(f"network error talking to Spotify ({type(e).__name__})") from None
     try:
@@ -131,7 +134,10 @@ def client_credentials_token(client_id: str, client_secret: str, timeout: float 
         with _OPEN(req, timeout=timeout) as r:
             status, raw = r.status, r.read()
     except urllib.error.HTTPError as e:
-        status, raw = e.code, e.read()
+        try:
+            status, raw = e.code, e.read()
+        finally:
+            e.close()
     except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
         raise ArtistTracksError(f"network error getting a Spotify token ({type(e).__name__})") from None
     try:

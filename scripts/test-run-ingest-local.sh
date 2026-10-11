@@ -324,6 +324,9 @@ ia_reject() { # name, value
 }
 ia_reject unknown "--max-new 5 --bogus-SENTINEL 3"
 ia_reject unknown-ingest-option "--state-file /tmp/SENTINEL"
+# an unknown option with a perfectly valid integer passes the character-set check: only the allowlist stops it
+ia_reject unknown-option-integer "--retry-attempts 3"
+assert "ingest args reject unknown-option-integer: stopped by the allowlist, not the character set" "$(grep -q 'rejected: unknown option' "$(LOGF)" && echo 0 || echo 1)"
 ia_reject max-artists "--max-artists 5"
 ia_reject dry-run "--dry-run"
 ia_reject bare-word "SENTINEL"

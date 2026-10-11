@@ -138,12 +138,19 @@ def read_error_body(fp) -> dict:
 def error_reason(body: dict, secrets: list[str]) -> str:
     """The reason an API gave for an error (Spotify: error.message; OAuth style: a string `error`), safe to show:
     redacted first (so a secret is removed whole before any cutting), control characters replaced by '?', cut to
-    REASON_MAX characters. Empty when the body carries no string reason."""
+    REASON_MAX characters. Empty when the body carries no string reason. A secret split by control or zero-width
+    characters is caught by a second redaction on the text with those characters dropped (redact, clean, redact)."""
     err = body.get("error") if isinstance(body, dict) else None
     msg = err.get("message") if isinstance(err, dict) else err
     if not isinstance(msg, str):
         return ""
-    text = "".join(c if c.isprintable() else "?" for c in redact(msg, secrets)).strip()
+    first = redact(msg, secrets)
+    bare = "".join(c for c in first if c.isprintable())
+    again = redact(bare, secrets)
+    if again != bare:  # a secret was hiding behind control characters: use the redacted, control-free text
+        text = again.strip()
+    else:
+        text = "".join(c if c.isprintable() else "?" for c in first).strip()
     return text if len(text) <= REASON_MAX else text[:REASON_MAX] + "..."
 
 
