@@ -324,9 +324,12 @@ something bootstrap does silently.
   playlists are not counted.
 - `run --result-json FILE` writes counts only: added, skipped, no_match, too_big, failed, matched_title_only,
   `stop reason` (`done | cap | time | sign-in`, the engine's vocabulary [V, local-ingest.md "Why a run stopped"]).
-- Log: no secret, no Last.fm user name, counts per artist, never track titles [V, #168]. The engine already logs
-  artist names (`artist <name>: ...`) in the nightly style [V, `run_lastfm` on master]; names of artists are accepted in the log,
-  titles are not. [R] whether the owner wants artist names out of the bootstrap log too: not asked yet.
+- Log: what bootstrap itself writes (status, session summaries, progress file, result JSON) holds no secret, no Last.fm
+  user name, no artist names and no track titles. The shared engine does write names and titles into the log and the
+  terminal: `artist <name>: ...`, `ingested: <artist> - <title>`, `dry-run would ingest: <artist> - <title>`,
+  `ERROR <artist> - <title>` [V, `run_lastfm` and `run` on master]. `bootstrap.log` is local, 0600 and never shipped (the
+  wrapper's `ship_grafana --filter` only redacts secrets). A title filter would be a separate ticket (see 2.9). [R] whether
+  the owner wants artist names out of the bootstrap log too: not asked yet.
 - Exit codes: `bootstrap.py` 0 ok (a cap or time stop is NOT a failure), 1 some track or artist failed, 2 bad usage,
   missing caps, no ranking, bad config, 3 sign-in stop [V for 0/1/2/3 as ingest's codes, local-ingest.md "Exit
   codes"; the use of 2 for "no ranking" is [P]]. The wrapper adds 75 (locked) and 78 (prerequisite or
@@ -350,7 +353,7 @@ Where the code settled a point this page left open (the code and `ingest/test_bo
 - `tracks_added` of an artist accumulates over sessions; `tracks_seen` is the largest number of tracks handled in one
   pass. The progress file is written after each artist (not each track), so a process killed inside an artist loses
   the `tracks_added` count of that artist (the tracks are in D1 and are skipped next time; `M` of `status` can undercount).
-- `--result-json` holds `stop_reason` (`done | cap | time | sign-in`, `null` when nothing ran), `exit_code`, `counts`
+- `--result-json` holds `stop_reason` (`done | cap | time | sign-in`, `null` when the session failed before it ran; `done` on the nothing-to-do path), `exit_code`, `counts`
   (added, skipped, no_match, too_big, failed, matched_title_only, cooldown, not_attempted) and `artists` (planned,
   completed, cut, failed, not_started, parked, unusable). It is written only once the session got past the lock, the guard
   and the checks (no file for exit 2, 75 or 78).

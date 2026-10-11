@@ -551,6 +551,8 @@ def prepare(args, required_env: list[str]):
     except ConfigError as e:
         refuse(str(e))
         return EXIT_USAGE
+    if section is None:
+        ingest.log("no config file: nothing is excluded (pass --config FILE to exclude artists)")
     ranking, why = usable_ranking()
     if ranking is None:
         refuse(f"no usable ranking ({why}): run rank first")
@@ -780,7 +782,7 @@ def cmd_rank(args, lock_held: bool) -> int:
     finally:
         if lock is not None:
             os.close(lock)
-    ingest.log(f"ranking stored: {len(ranking['artists'])} artists (run status, plan, then run)")
+    ingest.log("next: status, plan, then run")
     return EXIT_OK
 
 

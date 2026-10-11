@@ -610,6 +610,16 @@ class FailureTest(Base):
         self.assertEqual(self.calls, ["Band 1"])
         self.assertEqual((self.entry("Band 1")["status"], self.entry("Band 1")["failures"]), ("done", 0))
 
+    def test_unpark_resets_failures_so_one_more_failure_does_not_park_again(self):
+        for _ in range(3):
+            self.run_session()
+        self.assertEqual(self.entry("Band 1")["status"], "parked")
+        self.assertEqual(self.run_session("--unpark"), 1)  # Band 1 fails once more
+        self.assertEqual((self.entry("Band 1")["status"], self.entry("Band 1")["failures"]), ("pending", 1))
+        self.calls.clear()
+        self.run_session()
+        self.assertEqual(self.calls, ["Band 1"])  # still worked: failures 2, not parked
+
     def test_a_success_resets_the_failure_count(self):
         self.run_session()
         self.run_session()
