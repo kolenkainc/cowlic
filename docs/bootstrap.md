@@ -9,8 +9,8 @@ main checkout, through the wrapper, as soon as the feature is merged and reviewe
 the owner reads the log and the status file and can interrupt a session at any time (section 4). The nightly 21:10 run
 stays lean and never does a bootstrap (section 8).
 
-Public repo: no secret, no real Last.fm user name and no id on this page. The key name `LASTFM_API_KEY` is the only
-secret name that appears.
+Public repo: no secret, no real Last.fm user name and no id on this page. Only the names `LASTFM_API_KEY` and
+`COWLIC_EXTRA_SECRET` of variables appear, never a value.
 
 ## 0. How to read this page
 
@@ -18,8 +18,8 @@ secret name that appears.
   `--help` output of `ingest/bootstrap.py` and of each of its four subcommands (`rank`, `plan`, `run`, `status`);
   `ingest/bootstrap.py status` against an EMPTY temporary state directory (it printed
   `no usable ranking: no ranking file; run rank first`, exit 0); the wrapper `scripts/run-bootstrap-local.sh` with no
-  arguments and with `run --max-new 5` and no `--max-minutes` (both refused with one usage line, exit 78, nothing
-  touched). Nothing else was run.
+  arguments and with `run --max-new 5` and no `--max-minutes` (both refused with one usage line, exit 78; usage and cap
+  errors and the 21:10 guard touch nothing, other exit-78 cases do, see section 5). Nothing else was run.
 - **Not run by the author**: every other command and every behaviour described here. These are read from
   `scripts/run-bootstrap-local.sh`, `ingest/bootstrap.py`, `ingest/bootstrap_ranking.py` and `docs/bootstrap-ongoing.md`
   on master (after PRs #231, #232 and #236). No call to Last.fm, YouTube, D1 or Telegram was made for this page.
@@ -92,11 +92,11 @@ There is NO Grafana push from bootstrap: the dashboard keeps meaning the 21:10 r
 
 1. **The gate comes first.** The Last.fm match-rate report (#153) and the go/no-go (#154) are both closed. The verdict
    of #154 is GO on 2026-10-11: matched 117 of 150 tracks (78.0%; duration mode 76.3%, title-only mode 14 of 15) after
-   the matcher change #194, accepted under the owner's own rule that 76% is OK to go. Nothing else is required before
+   the matcher change #194, BELOW the 80% the #92 gate asks for, accepted under the owner's own fallback rule "76% is OK to go"; the GO was recorded by the coordinator on the owner's behalf and the owner can reverse it. The wrong-rate half is unmeasured and accepted (section 9). Nothing else is required before
    the first session: the sample labelling of #214 is NOT a blocker (section 9).
 2. **Config and key** (section 1).
 3. **`rank`**, once: computes the ranking from the weekly charts (about 261 Last.fm calls at 1 call per second, about 5
-   minutes [V from the design page and `lastfm.py`, not run]) and stores it. Refuses with one line when a ranking
+   minutes [read from the design page and `lastfm.py`]) and stores it. Refuses with one line when a ranking
    already exists unless `--refresh`.
 4. **`status`**: confirm there is a ranking and nothing is `partial` yet.
 5. **`plan`**, a dry run with the same caps as the session you intend to run.
@@ -117,7 +117,7 @@ Not run by the author. Both `--max-new N` (1..1000000) and `--max-minutes M` (1.
 exit 78 from the wrapper [V for the missing cap] and exit 2 from `bootstrap.py`. `--result-json` belongs to the wrapper:
 do not pass it (or any abbreviation of it).
 
-What `plan` does: a dry run. It reads D1, searches YouTube Music (the searches count against `--max-new`) and may call
+What `plan` does: a dry run. It reads D1, searches YouTube Music (only searches that produce a match count against `--max-new`; no-match searches do not) and may call
 Last.fm to enumerate artists; it downloads, uploads and writes nothing (no state file). It prints one line:
 `plan: the next session (--max-new N, --max-minutes M) would reach X of Y artists (rank positions A-B): C complete,
 D cut by a limit, E whose enumeration failed; it would attempt T track(s); nothing was downloaded, uploaded or written`.
@@ -132,19 +132,25 @@ from the first sessions].
 
 - `--max-new` counts tracks attempted (new, too big, failed); tracks already stored, in cooldown or without a match
   are not counted. `--max-minutes` is wall clock: no new track starts after it, a download in progress finishes, and
-  the Last.fm enumeration time counts too. So the session can overrun `--max-minutes` by one track and its upload.
+  the Last.fm enumeration time counts too. The limit is checked only before an artist is enumerated and before each track, so the session can overrun
+  `--max-minutes` by an enumeration that started before the deadline (up to about 2.5 minutes) plus one track and
+  its upload. Leave a margin.
 - Both are caps, whichever comes first stops the session. With about a minute per track, `--max-new` of about
   `--max-minutes` is a sensible pair; set the second by what you want to stop on.
 - **A session must end before the next 21:10 (local time).** The lock is shared with the nightly timer. The wrapper
   REFUSES to start a `run` or `plan` when `now + --max-minutes + 10 minutes margin + 60 s` (the timer's random delay)
   reaches the next 21:10 local time: one stderr line that says how many minutes fit now, exit 78, nothing touched.
-  Choose `--max-minutes` below that number. Within 60 s after 21:10 that day's 21:10 still counts as the next one.
+  Choose `--max-minutes` at most that number. Within 60 s after 21:10 that day's 21:10 still counts as the next one.
 - **The lock.** If the timer's run (or another session) holds `ingest.lock`, the wrapper exits **75** at once with one
   stderr line and does nothing. Start the session after the 21:10 run finished. The reverse also holds: if a session is
   still running at 21:10, the timer's run exits 75 and does nothing that night. A night lost to the lock leaves NO
   record in `ingest.log`, `last-run.json` or Grafana (the locked invocation touches none of them), and the dashboard
   only flags more than 14 days without a run. The next night continues and nothing is lost but that one night. Whether
   systemd catches up a run that exited 75 is [R], not verified; do not count on it.
+- **Things the guard cannot see.** The timer has `Persistent=true`: after a sleep, wake or login the nightly run can
+  start at an arbitrary time and collide with a running session (it then exits 75 and that night is lost). A suspend
+  during a session makes the wall-clock cap meaningless. `rank` (about 5 minutes under the lock) has no 21:10 guard in
+  the wrapper: start it well before 21:10.
 
 ## 3. Reading `status`
 
@@ -156,7 +162,9 @@ running, call the Python entry point directly, which takes no lock for `status`:
 ingest/.venv/bin/python ingest/bootstrap.py status
 ```
 
-(Without `--config`, no artist is excluded from the counts; pass `--config FILE` to leave excluded artists out of N.)
+(Without `--config`, the default config file `${XDG_CONFIG_HOME:-$HOME/.config}/cowlic/bootstrap.yml` is used when it
+exists, for `status`, `plan` and `run` alike, and its `exclude` list is left out of N; `--config FILE` overrides it. With
+no file at all, nothing is excluded.)
 
 | Output | Meaning |
 |---|---|
@@ -195,8 +203,8 @@ instead of 0 when a track or artist failed during the session, whatever the stop
 | `done` | 0 or 1 | Nothing left to work (also the "nothing to do" case). Read `status` |
 | `cap` | 0 or 1 | `--max-new` reached. Normal. Run the next session |
 | `time` | 0 or 1 | `--max-minutes` reached. Normal. Run the next session |
-| `sign-in` | 3 | YouTube asked to sign in (the bot check, #62). **Wait and run again later. Never bypass:** no cookies, no proxies, no PO-token tricks, no client rotation, nothing stored. Do not retry in a loop; one stop ends the whole session |
-| (empty) | 1 or 2 | The session failed before it ran (for example D1 or Last.fm unreachable), or exit 2/75/78 before it started; read the log or the message |
+| `sign-in` | 3 | YouTube asked to sign in (the bot check, #62). **Wait and run again later; if a second session in a row ends with exit 3, stop and report to the owner, never loop. Never bypass:** no cookies, no proxies, no PO-token tricks, no client rotation, nothing stored. Do not retry in a loop; one stop ends the whole session |
+| (empty) | 1 or 2 | The session failed before it ran (for example D1 or Last.fm unreachable), or stopped on an engine error part-way (for example a D1 error; part of the work may have run), or exit 2/75/78 before it started; read the log or the message |
 
 Other exit codes of the wrapper: **2** bad usage, bad config, missing environment, no usable ranking or an unusable
 state file (nothing ran; one line says which); **75** locked; **78** usage, guard (would cross 21:10), missing venv or
@@ -206,8 +214,8 @@ prerequisites (nothing ran); **128+N** interrupted by signal N.
 whole process group (the session and its helpers) and ends with 128+N; it still writes `bootstrap-last-run.json`. State
 is written atomically after each change, so at most the current track is lost. A kill between the Telegram upload and
 the D1 write can leave one orphan message in the channel, and that track is uploaded again next session [R, not tested].
-Do not use `kill -9` unless the session does not stop: after it a watchdog ends the process group within about a
-second and then releases the lock, so no session keeps running without the lock. Interrupting never needs a cleanup
+Do not use `kill -9` unless the session does not stop: after it a watchdog ends the process group with TERM within about
+a second, KILL only after up to 10 more seconds, and only then releases the lock (so at most about 11 seconds), so no session keeps running without the lock. Interrupting never needs a cleanup
 step; start the next session when you want to continue.
 
 ## 5. Reading `bootstrap-last-run.json` and `bootstrap.log`
@@ -218,8 +226,12 @@ engine writes artist names and track titles into it (`artist <name>: ...`, `inge
 is local, mode 0600, and never shipped; do not paste it into a ticket. What bootstrap itself writes (status, summaries,
 the progress and result files) holds no names and no titles.
 
-`bootstrap-last-run.json` is removed at the start of every session and written after every invocation that got past
-the lock and the guard, so a killed wrapper leaves none and a locked or refused one (75, 78) does not replace it. Always
+`bootstrap-last-run.json` is removed and rewritten by EVERY wrapper invocation that gets past the lock and the guard,
+including `status`, `rank` and `plan`: a wrapper `status` after a `run` replaces the session's result with
+`subcommand: status` and `result: null`. **Read the file (and copy what you need) before any other wrapper call**, or
+check with the direct `ingest/.venv/bin/python ingest/bootstrap.py status`. A killed wrapper leaves none. Usage and cap
+errors, the 21:10 guard and a held lock (75) touch nothing; a missing venv or a failed prerequisite check (also exit 78)
+happens after the file was removed and the log opened, so it rewrites the file with `exit_code` 78. Always
 valid JSON, written atomically. Fields: `started_at`, `finished_at`, `subcommand`, `exit_code`, `stop_reason`
 (`done`, `cap`, `time`, `sign-in`, or empty), `log_file`, and `result`: for `run` the object of `--result-json` (counts
 only), otherwise `null`. The `result` object holds `stop_reason`, `exit_code`, `counts` (`added`, `skipped`,
@@ -258,7 +270,7 @@ The end state is the `status` line `done: N artists, M tracks` (with `, K parked
 | `refusing to start: now + --max-minutes M + 10 min margin reaches the next 21:10 local time (at most F minutes fit now)`, exit 78 | Lower `--max-minutes` to at most F, or start after the 21:10 run |
 | Partial artist (`status`: `partial: ... next: <rank>`) | Normal after a cap, time or sign-in stop. Run the next session; the partial artist is resumed first |
 | Parked artists (`, K parked`) | 3 failed enumerations in a row. `run --unpark` or add them to `exclude` (section 3) |
-| `state file unusable: <file>: <reason>` (`status`, exit 0) or `bootstrap: state file unusable: ...` (`run` and `plan`, exit 2) | A progress or state file is corrupt, too big, of an unknown version, or an entry would be dropped. `run --reset-state` MOVES both `bootstrap-progress.json` and `bootstrap-state.json` to a numbered `.bak` (`.bak`, `.bak.1`, ...; never deletes, never overwrites) and starts empty. Artists then restart from the first, and finished artists are re-enumerated (about 2.5 minutes each) but their tracks are skipped as stored. The ranking and the nightly state are not touched |
+| `state file unusable: <file>: <reason>` (`status`, exit 0) or `bootstrap: state file unusable: ...` (`run` and `plan`, exit 2) | A progress or state file is corrupt, too big, of an unknown version, or an entry would be dropped. `run --reset-state` MOVES both `bootstrap-progress.json` and `bootstrap-state.json` to a numbered `.bak` (`.bak`, `.bak.1`, ...; never deletes, never overwrites) and starts empty. `--reset-state` is an option of `run`: `run --reset-state --max-new N --max-minutes M` moves the files and then STARTS a real session with those caps in the same call. Effects: artists restart from the first and finished artists are re-enumerated (about 2.5 minutes each); tracks already stored are skipped, but the track cooldowns are gone too, so earlier `no_match`, `too_big` and failed tracks are attempted again and count against `--max-new`; `status` M restarts at 0. Use a small cap after a reset. The ranking and the nightly state are not touched |
 | `config unusable: ...` from `status` | The `--config` file is bad; fix it. `status` still exits 0 |
 | The wrapper exits 78 with a prerequisites message | `scripts/check-local-prereqs.sh` failed (flock, venv, ffmpeg, python; a Deno problem is only a WARN line); the log lists what is missing. Nothing ran |
 | `run` says `nothing to do: every ranked artist is done, parked or excluded` | Read `status`; `--unpark` if artists are parked |
@@ -274,8 +286,9 @@ this; the first capped run through `sources.yml` of #155 is superseded by this r
 
 ## 9. Accepted risk: the wrong-recording rate is not measured
 
-The gate of assessment #92 has two halves: matched rate at least 80% and wrong rate at most 2%. The matched rate was
-measured (section 2). The wrong rate, "the matched video is the wrong recording", cannot be computed by the code: it
+The gate of assessment #92 has two halves: matched rate at least 80% and wrong rate at most 2%. The matched half was
+measured at 78.0% (117 of 150), BELOW 80%; #154 records the GO as a decision by the coordinator on the owner's behalf,
+under the owner's own rule "76% is ok to go", reversible by the owner (section 2). The wrong rate, "the matched video is the wrong recording", cannot be computed by the code: it
 needs a human to label a sample of the matched rows `ok` or `wrong` in the `reviewed` column of the report CSV, and
 the owner decided on 2026-10-11 (#214, closed as not planned) that this labelling will NOT happen ("I will not review
 anything by hand, the match quality from the code is acceptable to me"). So:

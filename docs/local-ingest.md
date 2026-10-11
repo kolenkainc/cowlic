@@ -544,13 +544,13 @@ verdict line). A sample under 30 compared tracks only gives a hint (the summary 
 too: one artist at 20% in an otherwise good sample (say, a non-Latin name) is a finding even when the overall rate
 passes.
 
-What the owner does (ticket #112): run the report on the chosen artists, open the CSV, filter `status = no_match`
+What to do with the report: run the report on the chosen artists, open the CSV, filter `status = no_match`
 and sort by `similarity` ascending (the stdout list is the same view). For a handful of rows check on
 https://music.youtube.com whether a correct video exists. `reason = duration` with a right-looking video means the
 tolerance is too tight or the Spotify release is a different edit; `reason = title` with a right-looking video means
 the title normalisation misses something (remaster or live suffixes, transliteration); `no_results` means search,
 not scoring, is the problem. The `matched` spot-check above is optional. Then write the match rate, the wrong rate, the
-decision and the top failing patterns in #112. Do not commit the CSV.
+decision and the top failing patterns in the ticket that asked for the report. Do not commit the CSV.
 
 ## Exit codes
 
@@ -815,7 +815,7 @@ How to label and read it (optional tooling, not a gate; the `--summarize` comman
    not `matched` are ignored.
 2. Run `--summarize` on the labelled file (offline, needs no key). It prints the same figures with the wrong rates:
    `wrong / (ok + wrong)` overall, for `duration` and for `title-only`. The title-only mode is judged on its own
-   wrong rate: it has to be <= 2% by itself even when the overall rate is fine. A mode with matched rows and too
+   wrong rate: it should be <= 2% by itself (if labelled) even when the overall rate is fine. A mode with matched rows and too
    few labels (under min(30, its matched rows)), a sample under 30 compared tracks, a partial run or many failed
    searches give `no verdict: ...` (see above), not a go. Rate below 80% with a good wrong rate means tuning the matcher by the most
    frequent failing pattern; a high wrong rate in the title-only mode means raising its thresholds or turning it off.

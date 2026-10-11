@@ -563,11 +563,10 @@ default.
   record.** The locked wrapper touches neither `ingest.log` nor `last-run.json` [V] and pushes nothing to
   Grafana, and the dashboard only flags more than 14 days without a run [V, local-ingest.md "Dashboard"], so the
   owner would not learn that 21:10 was skipped. The check itself is idempotent and the next night continues.
-- **Guard against overlap, requirement for #169 [P].** `--max-minutes` goes up to 1440 [V] and is not a hard stop:
+- **Guard against overlap (implemented in #169, wrapper and `bootstrap.py run`).** `--max-minutes` goes up to 1440 [V] and is not a hard stop:
   a track in progress finishes [V]. So `run-bootstrap-local.sh` (and `bootstrap.py run`) refuse to start, exit
   78 with one line, when `now + --max-minutes + a margin (default 10 minutes)` crosses the next 21:10 local
-  time (plus the timer's up to 60 s random delay [V]). Today the only protection would be the owner's
-  arithmetic. The runbook (#170) states the same rule in words.
+  time (plus the timer's up to 60 s random delay [V]). The runbook (#170) states the same rule in words.
 - **Separate log and status.** `bootstrap.log` (same rotation and redaction rules as `ingest.log`) and
   `bootstrap-last-run.json` (started_at, finished_at, exit_code, stop reason, counts; valid JSON always) (#169).
   The bootstrap wrapper never writes or touches `last-run.json` or `ingest.log`. [P]
