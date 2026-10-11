@@ -46,7 +46,9 @@ def similarity(a: str, b: str) -> float:
 # duration (600 s is also about the 20 MB Telegram limit), and no variant marker the requested title lacks.
 # Trust trade-off accepted by the owner in #147: more wrong-video risk than the duration path.
 TITLE_ONLY_TITLE_MIN_SIMILARITY = 0.93
-TITLE_ONLY_ARTIST_MIN_SIMILARITY = 0.6
+# 0.6 was compared on the full names, so "the kooks" / "the motion" scored 0.63 (#241): the shared article and a similar
+# length carry the ratio, not the name. The article is now dropped from both sides before the compare, and the bar is 0.7.
+TITLE_ONLY_ARTIST_MIN_SIMILARITY = 0.7
 TITLE_ONLY_MIN_DURATION_S = 60
 TITLE_ONLY_MAX_DURATION_S = 600
 MODE_TITLE_ONLY = "title-only"
@@ -90,6 +92,15 @@ def _latin_without_marks(text: str) -> str:
         base = unicodedata.normalize("NFD", ch)
         out.append("".join(c for c in base if not unicodedata.combining(c)) if base[0].isascii() else ch)
     return "".join(out)
+
+
+def artist_similarity(a: str, b: str) -> float:
+    """Artist compare for title-only mode: a leading article ('the', 'a', 'an') is not part of the name."""
+    def bare(x: str) -> str:
+        n = normalize(x)
+        m = re.match(r"(?:the|a|an) (.+)", n)
+        return m[1] if m else n
+    return SequenceMatcher(None, bare(a), bare(b)).ratio()
 
 
 def title_parts(title: str) -> tuple[list[str], tuple[str, ...]]:
@@ -200,7 +211,7 @@ def score_title_only(title: str, artist: str, result: dict, relaxed: bool = Fals
         return None  # live, remix, cover, ...: a different recording than the requested one
     names = [a["name"] for a in result.get("artists") or [] if isinstance(a.get("name"), str)]
     joined = ", ".join(names)
-    a_sim = max(similarity(a, y) for a in (artist, transliterate_to_cyrillic(artist)) for y in [joined, *names])
+    a_sim = max(artist_similarity(a, y) for a in (artist, transliterate_to_cyrillic(artist)) for y in [joined, *names])
     if a_sim < TITLE_ONLY_ARTIST_MIN_SIMILARITY:
         return None
     return Candidate(result["videoId"], result_title, joined, int(dur), t_sim + a_sim, MODE_TITLE_ONLY, relaxed)
