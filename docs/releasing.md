@@ -2,7 +2,7 @@
 
 ## Naming
 
-- Milestones are `Release N` (and `4.0.0`). Release 3 is semantic version `v3.0.0`, Release 4 (multi-user, milestone 4.0.0) is `v4.0.0`.
+- Milestones are `Release N (vX.0.0)`. Release 3 (bootstrap of the top Last.fm artists and their albums) is semantic version `v3.0.0`, Release 4 (cover art for albums and artists, the nightly new-release phase, the Worker deploy automation) is `v4.0.0`, Release 5 (multi-user support) is `v5.0.0`.
 - A release is a tag `vX.Y.Z` on a master commit plus a GitHub Release with notes.
 - `release-2` is a legacy tag from before GitVersion existed. It is not a version and is ignored by the calculation (see below).
 
