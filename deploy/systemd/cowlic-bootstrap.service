@@ -1,0 +1,24 @@
+# User unit: one scheduled bootstrap session (Last.fm top artists to Telegram and D1). Started by cowlic-bootstrap.timer.
+# Install and stop instructions live in the runbook (docs/bootstrap.md, "Scheduled mode").
+#
+# - Secrets are NOT set here (no EnvironmentFile=): the launcher and the wrapper do not read .env, bootstrap.py loads it
+#   from the repo root.
+# - No Restart= and no OnFailure=: a failed session is not retried by systemd. The launcher decides: after a YouTube
+#   sign-in challenge (exit 3) it writes a halt marker and never retries; see docs/bootstrap.md.
+# - Overlap protection is the wrapper's flock (shared with the 21:10 ingest) and its 21:10 guard; no second locking here.
+# - The launcher picks --max-minutes (at most 100) and --max-new itself so the session ends before the next 21:10 run.
+# - The path below assumes the repo is checked out at ~/projects/personal/kolenkainc/cowlic; adjust WorkingDirectory and
+#   ExecStart together if it lives elsewhere.
+# Changing this file in the repo has NO effect on the machine until the copy in ~/.config/systemd/user is replaced
+# (owner step, like #175) and `systemctl --user daemon-reload` is run.
+[Unit]
+Description=cowlic scheduled bootstrap session (Last.fm top artists)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/personal/kolenkainc/cowlic
+# deno (yt-dlp challenge solving) usually lives in ~/.deno/bin, ffmpeg in /usr/bin.
+Environment=PATH=%h/.deno/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/projects/personal/kolenkainc/cowlic/scripts/run-bootstrap-scheduled.sh
+# A little above the longest session (100 minutes): systemd then stops a hung run.
+TimeoutStartSec=2h

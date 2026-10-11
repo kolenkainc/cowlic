@@ -329,6 +329,9 @@ code, the shared lock, the 21:10 guard or the signal handling. Locked (75), refu
 `rank` and `status` ship nothing. Explore: `{job="cowlic-bootstrap"}`; details and the dashboard proposal in
 [bootstrap.md](bootstrap.md) section 5.
 
+Bootstrap sessions can also run on a schedule, every 2 hours, from a second user timer (`cowlic-bootstrap.timer`, #279):
+see [bootstrap.md](bootstrap.md) section 12. It shares this lock and the 21:10 guard with the nightly run.
+
 ### Run metrics (optional)
 
 Added in #105, decided in #106. Right after the log push the same step sends ONE line of Influx line protocol

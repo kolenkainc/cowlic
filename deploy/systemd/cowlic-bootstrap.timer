@@ -1,0 +1,17 @@
+# User timer: a bootstrap session every 2 hours, counted from the END of the previous one.
+[Unit]
+Description=Run a cowlic bootstrap session every 2 hours (after the previous one finished)
+
+[Timer]
+# First run 2 minutes after the timer becomes active (enabled with --now, or the user manager starts at login/boot).
+OnActiveSec=2min
+# Then 2 hours after the service last became inactive (not wall-clock). The launcher skips by itself when fewer than
+# 15 minutes fit before the 21:10 ingest. The interval is a setting: change it here and daemon-reload.
+OnUnitInactiveSec=2h
+# No catch-up after sleep or power-off (the nightly timer is the one with Persistent=true).
+Persistent=false
+RandomizedDelaySec=60
+Unit=cowlic-bootstrap.service
+
+[Install]
+WantedBy=timers.target
