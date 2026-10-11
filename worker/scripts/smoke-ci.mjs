@@ -7,6 +7,8 @@
 //   3. `wrangler d1 migrations apply DB --local` (proves every migration applies to an empty database)
 //   4. seed the local D1 from scripts/fixtures/smoke-seed.sql (synthetic rows, fake Telegram ids)
 //   5. scripts/smoke.mjs with SMOKE_SKIP_STREAM=1 (stream checks that need real Telegram are reported SKIPPED)
+//   5b. the same smoke on a LEGACY database (migrations 0001+0002 only, seed fixtures/smoke-seed-pre0003.sql): proves the
+//       Worker still serves the library before migration 0003 (no artists.image_file_id) is applied
 //   6. scripts/paging-check.mjs
 // It never reads worker/.dev.vars or worker/wrangler.local.toml, and the children get an allowlisted environment
 // (no Cloudflare or Telegram credentials from the caller). Exit code is non-zero on any failure.
@@ -16,14 +18,15 @@
 // The smoke step's output is also checked: no FAIL, exactly the expected number of SKIPPED stream checks and at
 // least MIN_PASS PASS lines, so a silently emptied suite cannot pass.
 import { randomBytes } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { constants, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const EXPECTED_SKIPPED = 6; // the stream checks in smoke.mjs
-const MIN_PASS = 30; // the default suite has 35 PASS in CI mode; raise when checks are added
+const MIN_PASS = 51; // the default suite has 51 PASS in CI mode (35 before the artist-image checks of #249); raise when checks are added
+const MIN_PASS_LEGACY = 46; // the same suite on the pre-0003 schema (46 PASS: no photo-fixture checks)
 
 const workerDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const tmp = mkdtempSync(join(tmpdir(), "cowlic-smoke-"));
@@ -91,15 +94,38 @@ try {
   const wrangler = join(workerDir, "node_modules/wrangler/bin/wrangler.js");
   await run("apply migrations (local D1)", [wrangler, "d1", "migrations", "apply", "DB", "--local", "--config", configPath, "--persist-to", state]);
   await run("seed fixture", [wrangler, "d1", "execute", "DB", "--local", "--config", configPath, "--persist-to", state, "--file", join(workerDir, "scripts/fixtures/smoke-seed.sql")]);
+  const verify = (out, minPass) => {
+    const count = (word) => out.split("\n").filter((l) => l.startsWith(`${word} `)).length;
+    if (count("FAIL") !== 0 || count("SKIPPED") !== EXPECTED_SKIPPED || count("PASS") < minPass) {
+      throw new Error(`unexpected smoke counts: PASS=${count("PASS")} SKIPPED=${count("SKIPPED")} FAIL=${count("FAIL")}`);
+    }
+  };
   const out = await run("smoke (stream checks skipped)", ["scripts/smoke.mjs", configPath], {
     SMOKE_SKIP_STREAM: "1",
     SMOKE_VARS_FILE: varsPath,
     SMOKE_PERSIST_TO: state,
+    SMOKE_FIXTURE: "ci",
   });
-  const count = (word) => out.split("\n").filter((l) => l.startsWith(`${word} `)).length;
-  if (count("FAIL") !== 0 || count("SKIPPED") !== EXPECTED_SKIPPED || count("PASS") < MIN_PASS) {
-    throw new Error(`unexpected smoke counts: PASS=${count("PASS")} SKIPPED=${count("SKIPPED")} FAIL=${count("FAIL")}`);
-  }
+  verify(out, MIN_PASS);
+
+  // Legacy schema: a database with only migrations 0001 and 0002 (no artists.image_file_id), i.e. production before
+  // 0003 is applied. The Worker must keep serving the library there (deploy order rule, docs/worker-cicd.md 5.1).
+  const legacyMigrations = join(tmp, "migrations-pre0003");
+  const legacyState = join(tmp, "state-legacy");
+  mkdirSync(legacyMigrations);
+  mkdirSync(legacyState);
+  for (const f of ["0001_init.sql", "0002_library_indexes.sql"]) copyFileSync(join(workerDir, "migrations", f), join(legacyMigrations, f));
+  const legacyConfigPath = join(tmp, "wrangler.legacy.toml");
+  writeFileSync(legacyConfigPath, config.replace(/^migrations_dir = .*$/m, `migrations_dir = ${JSON.stringify(legacyMigrations)}`));
+  await run("apply migrations 0001+0002 only (legacy local D1)", [wrangler, "d1", "migrations", "apply", "DB", "--local", "--config", legacyConfigPath, "--persist-to", legacyState]);
+  await run("seed legacy fixture", [wrangler, "d1", "execute", "DB", "--local", "--config", legacyConfigPath, "--persist-to", legacyState, "--file", join(workerDir, "scripts/fixtures/smoke-seed-pre0003.sql")]);
+  const legacyOut = await run("smoke on the legacy schema (no image column)", ["scripts/smoke.mjs", legacyConfigPath], {
+    SMOKE_SKIP_STREAM: "1",
+    SMOKE_VARS_FILE: varsPath,
+    SMOKE_PERSIST_TO: legacyState,
+    SMOKE_FIXTURE: "legacy",
+  });
+  verify(legacyOut, MIN_PASS_LEGACY);
   await run("paging check", ["scripts/paging-check.mjs"]);
 } catch (e) {
   failed = true;

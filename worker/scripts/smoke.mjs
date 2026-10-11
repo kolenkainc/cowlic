@@ -20,6 +20,11 @@ const worker = await unstable_dev("src/index.ts", {
   experimental: { disableExperimentalWarning: true },
 });
 const skipStream = process.env.SMOKE_SKIP_STREAM === "1";
+// SMOKE_FIXTURE selects the seeded data the artist-image / cover-art checks expect (set by smoke-ci.mjs):
+//   "ci"     scripts/fixtures/smoke-seed.sql on a fully migrated DB (artist ar2 has a photo, ar1 has none)
+//   "legacy" scripts/fixtures/smoke-seed-pre0003.sql on a DB WITHOUT artists.image_file_id (migrations 0001+0002 only)
+// Unset (the owner's local run against the real seed): those checks are skipped, the rest is unchanged.
+const fixture = process.env.SMOKE_FIXTURE ?? "";
 let failed = 0;
 let skipped = 0;
 const check = (name, ok, detail = "") => {
@@ -73,7 +78,7 @@ try {
   x = await j("getAlbumList2&type=newest&size=5");
   check("getAlbumList2", x.albumList2?.album?.length === 1);
   x = await j("search3&query=");
-  check("search3 empty query returns all", x.searchResult3?.song?.length === 1 && x.searchResult3?.artist?.length === 1);
+  check("search3 empty query returns all", x.searchResult3?.song?.length === 1 && x.searchResult3?.artist?.length === (fixture === "ci" ? 2 : 1));
   x = await j("search3&query=sine");
   check("search3 matches title", x.searchResult3?.song?.[0]?.id === "t1");
   x = await j("search3&query=%25");
@@ -107,6 +112,51 @@ try {
 
   r = await worker.fetch(`/rest/stream?${auth}&id=nope`);
   check("unknown id -> Subsonic error 70", (await r.json())["subsonic-response"].error?.code === 70);
+
+  if (fixture === "ci" || fixture === "legacy") {
+    // getCoverArt: 404 + error 70 means "no such cover". A found cover is proxied from Telegram; with the fake CI
+    // token Telegram refuses, so "found" shows as the upstream error 502 (not 404): the id resolved to a file id.
+    const cover = async (id) => {
+      const res = await worker.fetch(`/rest/getCoverArt?${auth}&id=${encodeURIComponent(id)}`);
+      const body = res.headers.get("content-type")?.includes("json") ? (await res.json())["subsonic-response"] : {};
+      return { status: res.status, code: body.error?.code };
+    };
+    const resolved = (c) => c.status !== 404 && c.code !== 70;
+    const notFound = (c) => c.status === 404 && c.code === 70;
+    x = await j("getArtists");
+    const ar1 = x.artists?.index?.find((g) => g.name === "T")?.artist?.find((a) => a.id === "ar1");
+    check("artist without image has no coverArt (getArtists)", ar1?.id === "ar1" && !("coverArt" in ar1));
+    x = await j("getArtist&id=ar1");
+    check("artist without image has no coverArt (getArtist)", x.artist?.id === "ar1" && !("coverArt" in x.artist));
+    x = await j("search3&query=Test");
+    check("artist without image has no coverArt (search3)", x.searchResult3?.artist?.[0]?.id === "ar1" && !("coverArt" in x.searchResult3.artist[0]));
+    x = await j("getAlbum&id=al1");
+    check("album and song coverArt unchanged (plain album id)", x.album?.coverArt === "al1" && x.album.song?.[0]?.coverArt === "al1");
+    check("getCoverArt album id resolves (unchanged)", resolved(await cover("al1")));
+    check("getCoverArt ar-<artist without image> -> 404, error 70", notFound(await cover("ar-ar1")));
+    // In the "ci" fixture ar2 HAS an image, so a lookup that wrongly read artists for an unprefixed id would find it.
+    check("getCoverArt unprefixed artist id never reads artists -> 404", notFound(await cover(fixture === "ci" ? "ar2" : "ar1")));
+    check("getCoverArt ar-<album id> never reads albums -> 404", notFound(await cover("ar-al1")));
+    check("getCoverArt ar-<unknown> -> 404, error 70", notFound(await cover("ar-nope")));
+    check("getCoverArt bare prefix -> 404, error 70", notFound(await cover("ar-")));
+    r = await worker.fetch(`/rest/getCoverArt?u=${vars.SUBSONIC_USER}&t=deadbeef&s=${salt}&f=json&id=ar-ar2`);
+    check("getCoverArt with bad token -> error 40 before any lookup", (await r.json())["subsonic-response"].error?.code === 40);
+
+    // Only the migrated schema with the photo fixture (ar2).
+    if (fixture === "ci") {
+      const find = (o, id) => o?.artist?.find?.((a) => a.id === id);
+      x = await j("getArtists");
+      check("getArtists: artist with image has coverArt ar-<id>", find(x.artists?.index?.find((g) => g.name === "Z"), "ar2")?.coverArt === "ar-ar2");
+      x = await j("getIndexes");
+      check("getIndexes: artist with image has coverArt ar-<id>", find(x.indexes?.index?.find((g) => g.name === "Z"), "ar2")?.coverArt === "ar-ar2");
+      x = await j("getArtist&id=ar2");
+      check("getArtist: artist with image has coverArt ar-<id>", x.artist?.coverArt === "ar-ar2");
+      x = await j("search3&query=Zed");
+      check("search3: artist with image has coverArt ar-<id>", x.searchResult3?.artist?.[0]?.coverArt === "ar-ar2");
+      const c = await cover("ar-ar2");
+      check("getCoverArt ar-<artist with image> resolves (not 404)", resolved(c), `status=${c.status}`);
+    }
+  }
 } finally {
   await worker.stop();
 }
