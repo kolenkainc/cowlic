@@ -71,6 +71,7 @@ _NOISE = re.compile(
     r"|(?:album|single)\s+version"
     r"|explicit(?:\s+version)?")
 _LIVE_PREPOSITIONS = {"at", "in", "from", "on"}
+MAX_RELAXED_TITLE_LEN = 300  # real titles are about 100 characters; bounds the regex work per title
 
 
 def _noise_stripped(text: str) -> str:
@@ -94,11 +95,14 @@ def _latin_without_marks(text: str) -> str:
 def title_parts(title: str) -> tuple[list[str], tuple[str, ...]]:
     """(core words, markers). Markers are the variant words found in the title; for 'live' also its venue words, so
     'Live at X' and 'Live at Y' differ and 'live in X (acoustic)' equals 'Acoustic / Live At X, 2005'."""
+    if len(title) > MAX_RELAXED_TITLE_LEN:  # no regex runs on it: the strict pass alone decides
+        return [], ()
     text = unicodedata.normalize("NFKC", title).lower().replace("ё", "е")
     text = _latin_without_marks(_noise_stripped(text))
     text = text.replace("&", " and ")
-    text = re.sub(r"(?<=\w)['\u2019](?=\w)", "", text)  # don't -> dont
-    words = normalize(text).split()
+    words = normalize(re.sub(r"(?<=\w)['\u2019](?=\w)", "", text)).split()  # don't -> dont
+    if len(words) < 2:  # a one-word title keeps its apostrophe: Hell / He'll, Well / We'll stay apart
+        words = normalize(text).split()
     core: list[str] = []
     markers: list[str] = []
     live_seen = False
@@ -116,11 +120,12 @@ def title_parts(title: str) -> tuple[list[str], tuple[str, ...]]:
                     i += 1
                     j = i + 1
                     while j < len(words) and words[j] not in _RELAXED_MARKERS:
-                        if not re.fullmatch(r"\d{4}", words[j]):
-                            venue.append(words[j])
+                        venue.append(words[j])  # numbers included: another year is another recording
                         j += 1
                     i = j - 1
-        elif not (live_seen and re.fullmatch(r"\d{4}", w)):
+        elif live_seen and re.fullmatch(r"\d{4}", w):
+            venue.append(w)
+        else:
             core.append(w)
         i += 1
     if venue:
@@ -135,19 +140,14 @@ def _singular_last(words: list[str]) -> list[str]:
     return words
 
 
-def relaxed_similarity(a: str, b: str, allow_prefix: bool = False) -> float:
-    """0.0 when the variant markers differ; otherwise the similarity of the noise-free titles. `allow_prefix` (the
-    duration path only, where +-3 s backs it up): a title of 2+ words that is the start of the other, whose extra
-    words only repeat words of that start ('Ooh La' / 'Ooh La La La'), counts as TITLE_MIN_SIMILARITY."""
+def relaxed_similarity(a: str, b: str) -> float:
+    """0.0 when the variant markers differ; otherwise the similarity of the noise-free titles. There is no prefix
+    rule: 'Bye Bye' / 'Bye Bye Bye' are different songs and the duration path has no artist veto."""
     (ca, ma), (cb, mb) = title_parts(a), title_parts(b)
     if ma != mb or not ca or not cb:
         return 0.0
     ca, cb = _singular_last(ca), _singular_last(cb)
     sim = SequenceMatcher(None, " ".join(ca), " ".join(cb)).ratio()
-    if allow_prefix:
-        short, long_ = (ca, cb) if len(ca) <= len(cb) else (cb, ca)
-        if len(short) >= 2 and long_[:len(short)] == short and set(long_[len(short):]) <= set(short):
-            sim = max(sim, TITLE_MIN_SIMILARITY)
     return sim
 
 
@@ -159,6 +159,7 @@ class Candidate:
     duration_s: int
     score: float
     mode: str = MODE_DURATION  # MODE_TITLE_ONLY when the match was made without a duration (#151)
+    relaxed: bool = False  # True when only the relaxed title pass (#194) accepted it: traceable in the logs
 
 
 def queries(title: str, artist: str, album: str | None) -> list[str]:
@@ -172,7 +173,7 @@ def score(title: str, artist: str, duration_s: int, result: dict, relaxed: bool 
     dur = result.get("duration_seconds")
     if not dur or abs(dur - duration_s) > DURATION_TOLERANCE_S:
         return None
-    t_sim = (relaxed_similarity(title, result.get("title", ""), allow_prefix=True) if relaxed
+    t_sim = (relaxed_similarity(title, result.get("title", "")) if relaxed
              else similarity(title, result.get("title", "")))
     if t_sim < TITLE_MIN_SIMILARITY:
         return None
@@ -180,7 +181,7 @@ def score(title: str, artist: str, duration_s: int, result: dict, relaxed: bool 
     a_sim = max(similarity(artist, yt_artists), similarity(transliterate_to_cyrillic(artist), yt_artists))
     # Artist only breaks ties; it must not veto (that is the bug we are working around).
     return Candidate(result["videoId"], result["title"], yt_artists, dur,
-                     t_sim + 0.3 * a_sim - 0.02 * abs(dur - duration_s))
+                     t_sim + 0.3 * a_sim - 0.02 * abs(dur - duration_s), relaxed=relaxed)
 
 
 def score_title_only(title: str, artist: str, result: dict, relaxed: bool = False) -> Candidate | None:
@@ -202,7 +203,7 @@ def score_title_only(title: str, artist: str, result: dict, relaxed: bool = Fals
     a_sim = max(similarity(a, y) for a in (artist, transliterate_to_cyrillic(artist)) for y in [joined, *names])
     if a_sim < TITLE_ONLY_ARTIST_MIN_SIMILARITY:
         return None
-    return Candidate(result["videoId"], result_title, joined, int(dur), t_sim + a_sim, MODE_TITLE_ONLY)
+    return Candidate(result["videoId"], result_title, joined, int(dur), t_sim + a_sim, MODE_TITLE_ONLY, relaxed)
 
 
 def find_match(ytmusic, title: str, artist: str, album: str | None, duration_s: int | None) -> Candidate | None:

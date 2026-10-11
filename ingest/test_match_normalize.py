@@ -1,9 +1,15 @@
 """Relaxed title normalisation of the matcher (#194). Synthetic and well-known public titles only. Offline: the fake
 YouTube Music client never touches a network."""
+import contextlib
+import io
+import tempfile
 import unittest
+from pathlib import Path
 
 import dedupe
+import ingest
 import match
+from test_ingest import Fakes, SONG, sid
 
 
 def res(title, artists=("Queen",), dur=200, vid="v1"):
@@ -19,8 +25,8 @@ class FakeYtm:
         return list(self.per_query.get(q, self.default))
 
 
-def same(a, b, prefix=False):
-    return match.relaxed_similarity(a, b, allow_prefix=prefix) >= match.TITLE_MIN_SIMILARITY
+def same(a, b):
+    return match.relaxed_similarity(a, b) >= match.TITLE_MIN_SIMILARITY
 
 
 class NoiseTests(unittest.TestCase):
@@ -58,7 +64,12 @@ class NoiseTests(unittest.TestCase):
 
     def test_plural_of_the_last_word_only(self):
         self.assertEqual(match.relaxed_similarity("Sweet Dreams", "Sweet Dream"), 1.0)
-        self.assertLess(match.relaxed_similarity("Dreams Sweet", "Dream Sweet"), 1.0)  # not the first word
+        # only the LAST word: a plural in the first word is a plain difference (never made equal)
+        self.assertLess(match.relaxed_similarity("Dreams Sweet", "Dream Sweet"), 1.0)
+        self.assertEqual(match._singular_last(["dreams", "sweet"]), ["dreams", "sweet"])
+        self.assertEqual(match._singular_last(["dreams", "come", "true"]), ["dreams", "come", "true"])
+        self.assertEqual(match._singular_last(["sweet", "dreams"]), ["sweet", "dream"])
+        self.assertEqual(match._singular_last(["dreams", "comes"]), ["dreams", "come"])  # first word untouched
         self.assertEqual(match.relaxed_similarity("Love", "Loves"), match.similarity("Love", "Loves"))  # one word: no rule
         self.assertLess(match.relaxed_similarity("Bad Bus", "Bad Bu"), 1.0)  # 'us' / 'is' / 'ss' / short words are untouched
         self.assertEqual(match._singular_last(["the", "boys"]), ["the", "boy"])
@@ -96,7 +107,8 @@ class MarkerGuardTests(unittest.TestCase):
         base = "The Ballad Of Many Words Which Goes On For Quite A While Here And Even Longer Than You Think"
         self.assertFalse(same(f"{base} (Live)", f"{base} (Live at Wembley)"))
         self.assertTrue(same(f"{base} (Live at Wembley)", f"{base} - Live in Wembley"))
-        self.assertTrue(same("Song (Live)", "Song - Live 2005"))
+        self.assertFalse(same("Song (Live)", "Song - Live 2005"))  # a year in the marker is part of it
+        self.assertTrue(same("Song - Live 2005", "Song (Live 2005)"))
 
     def test_a_marker_in_the_title_is_not_cancelled_by_a_second_one(self):
         self.assertFalse(same("I Live In Fear", "I Live In Fear (Live)"))
@@ -106,7 +118,7 @@ class MarkerGuardTests(unittest.TestCase):
         for a, b in (("Song (Live)", "Song - Live"), ("Song [Acoustic]", "Song (Acoustic)"),
                      ("Song - Radio Edit", "Song (Radio Edit)"), ("Song (Acoustic Version)", "Song - Acoustic"),
                      ("Song (Live at Wembley)", "Song - Live in Wembley"),
-                     ("Song (live in Wembley) (acoustic)", "Song - Acoustic / Live At Wembley, 2005"),
+                     ("Song (live in Wembley 2005) (acoustic)", "Song - Acoustic / Live At Wembley, 2005"),
                      ("Song (Sped Up)", "Song - sped up"), ("Song (8D Audio)", "Song [8D Audio]")):
             self.assertTrue(same(a, b), (a, b))
             self.assertTrue(same(b, a), (b, a))
@@ -116,18 +128,64 @@ class MarkerGuardTests(unittest.TestCase):
         self.assertTrue({"live", "extended", "radio", "8d", "reverb"} <= match._RELAXED_MARKERS)
 
 
-class PrefixTests(unittest.TestCase):
-    def test_repeated_chant_prefix_matches_on_the_duration_path_only(self):
-        self.assertTrue(same("Ooh La", "Ooh La La La", prefix=True))
-        self.assertTrue(same("Ooh La La La", "Ooh La", prefix=True))
-        self.assertFalse(same("Ooh La", "Ooh La La La"))
+class NoPrefixRuleTests(unittest.TestCase):
+    PAIRS = [("Bye Bye", "Bye Bye Bye"), ("No No", "No No No"), ("Na Na", "Na Na Na"), ("Baby Baby", "Baby Baby Baby"),
+             ("Hey Ya", "Hey Ya Ya Ya"), ("Hold On", "Hold On Hold On"), ("Hello Goodbye", "Hello Goodbye Hello"),
+             ("Go Go Go", "Go Go"), ("Love", "Love Story"), ("Love Me", "Love Me Do"), ("La", "La La La"),
+             ("Ooh La", "Ooh La La La")]
 
-    def test_conservative_prefix_guards(self):
-        self.assertFalse(same("Love", "Love Story", prefix=True))        # one word
-        self.assertFalse(same("La", "La La La", prefix=True))            # one word
-        self.assertFalse(same("Love Me", "Love Me Do", prefix=True))     # extra word is new
-        self.assertFalse(same("Hey Jude", "Hey Jude Again Today", prefix=True))
-        self.assertFalse(same("Ooh La", "La Ooh La La", prefix=True))    # not a start
+    def test_prefix_titles_stay_no_match_in_both_modes_and_directions(self):
+        for a, b in self.PAIRS:
+            for x, y in ((a, b), (b, a)):
+                self.assertFalse(same(x, y), (x, y))
+                for dur in (200, None):
+                    self.assertIsNone(match.find_match(FakeYtm(default=[res(y)]), x, "Queen", None, dur), (x, y, dur))
+
+
+class ApostropheTests(unittest.TestCase):
+    def test_one_word_titles_keep_the_apostrophe(self):
+        for a, b in (("Hell", "He'll"), ("Well", "We'll"), ("Ill", "I'll"), ("Id", "I'd"), ("Were", "We're"),
+                     ("Shell", "She'll")):
+            for x, y in ((a, b), (b, a)):
+                self.assertNotEqual(match.title_parts(x)[0], match.title_parts(y)[0], (x, y))
+                self.assertLess(match.relaxed_similarity(x, y), match.TITLE_ONLY_TITLE_MIN_SIMILARITY, (x, y))
+                self.assertIsNone(match.find_match(FakeYtm(default=[res(y)]), x, "Queen", None, None), (x, y))
+
+    def test_longer_titles_ignore_the_apostrophe(self):
+        self.assertEqual(match.relaxed_similarity("Dont Stop", "Don't Stop"), 1.0)
+        self.assertEqual(match.relaxed_similarity("Don\u2019t Stop", "Dont Stop"), 1.0)
+
+
+class BoundsTests(unittest.TestCase):
+    def test_a_huge_title_is_left_to_the_strict_pass_and_is_fast(self):
+        import time
+        for title in ("Song" + " " * 20000 + "(Remastered)", "(" * 20000, "Song - " + " " * 20000):
+            t0 = time.monotonic()
+            self.assertEqual(match.relaxed_similarity("Song", title), 0.0)
+            self.assertEqual(match.relaxed_similarity(title, title), 0.0)
+            self.assertLess(time.monotonic() - t0, 1.0)
+
+    def test_a_title_at_the_cap_is_still_processed(self):
+        t = "a" * match.MAX_RELAXED_TITLE_LEN
+        self.assertEqual(match.relaxed_similarity(t, t), 1.0)
+
+    def test_live_years_and_venues_must_be_equal(self):
+        self.assertFalse(same("Live At A 1999", "Live At A 2000"))
+        self.assertFalse(same("Song (Live at A 1999)", "Song (Live at A 2000)"))
+        self.assertTrue(same("Song (Live at A 1999)", "Song - Live in A 1999"))
+        for dur in (None, 200):
+            self.assertIsNone(match.find_match(FakeYtm(default=[res("Some Live At A 2000")]), "Some Live At A 1999", "Queen", None, dur))
+
+
+class RelaxedFlagTests(unittest.TestCase):
+    def test_flag_only_on_relaxed_matches(self):
+        for dur in (200, None):
+            strict = match.find_match(FakeYtm(default=[res("Some Song")]), "Some Song", "Queen", None, dur)
+            self.assertFalse(strict.relaxed)
+            relaxed = match.find_match(FakeYtm(default=[res("Some Song (Remastered 2011)")]), "Some Song", "Queen", None, dur)
+            self.assertTrue(relaxed.relaxed)
+        self.assertFalse(match.score("Some Song", "Queen", 200, res("Some Song")).relaxed)
+        self.assertTrue(match.score("Some Song", "Queen", 200, res("Some Song [Explicit]"), relaxed=True).relaxed)
 
 
 class ScoringTests(unittest.TestCase):
@@ -152,8 +210,6 @@ class ScoringTests(unittest.TestCase):
         # 0.923 stays below the 0.93 line (one letter in a 13 letter title)
         self.assertLess(match.relaxed_similarity("Sweet Dreamer", "Sweet Dreamex"), 0.93)
         self.assertIsNone(match.score_title_only("Sweet Dreamer", "Queen", res("Sweet Dreamex"), relaxed=True))
-        # the prefix rule is not part of title-only
-        self.assertIsNone(match.score_title_only("Ooh La", "Queen", res("Ooh La La La"), relaxed=True))
 
 
 class FindMatchTests(unittest.TestCase):
@@ -195,9 +251,45 @@ class FindMatchTests(unittest.TestCase):
         for dur in (200, None):
             self.assertIsNone(self.find(FakeYtm(default=[res("Love Story")]), "Love", dur=dur))
 
-    def test_prefix_match_end_to_end(self):
-        self.assertIsNotNone(self.find(FakeYtm(default=[res("Ooh La La La")]), "Ooh La"))
-        self.assertIsNone(self.find(FakeYtm(default=[res("Ooh La La La")]), "Ooh La", dur=None))
+
+class PipelineFlagTests(unittest.TestCase):
+    """The relaxed-pass marker reaches the log, the counts, the summary and the result JSON; strict matches show none."""
+    URL = "https://open.spotify.com/playlist/" + "b" * 22
+
+    def run_one(self, cand):
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            f = Fakes(Path(d))
+            deps = f.deps()
+            deps.find_match = lambda s: cand
+            counts = ingest.run([dict(SONG, song_id=sid(1), url="u")], deps, set(), {}, Path(d), False)
+        return counts, out.getvalue()
+
+    def test_relaxed_match_is_marked(self):
+        counts, log = self.run_one(match.Candidate("v", "T", "A", 200, 2.0, relaxed=True))
+        self.assertEqual((counts["new"], counts["matched_normalized"]), (1, 1))
+        self.assertIn("(matched after title normalization)", log)
+        self.assertIn("1 matched after title normalization", ingest.summary(counts))
+
+    def test_strict_match_has_no_marker_no_key(self):
+        counts, log = self.run_one(match.Candidate("v", "T", "A", 200, 2.0))
+        self.assertNotIn("matched_normalized", counts)
+        self.assertNotIn("normalization", log)
+        self.assertNotIn("normalization", ingest.summary(counts))
+
+    def test_a_non_candidate_object_is_never_marked(self):
+        counts, log = self.run_one(object())
+        self.assertNotIn("matched_normalized", counts)
+
+    def test_result_json_is_additive(self):
+        c = {"new": 2, "exists": 0, "no_match": 0, "too_big": 0, "dry_run": 0, "failed": 0, "cooldown": 0,
+             "matched_normalized": 2}
+        r = ingest.build_result([self.URL], {self.URL: c}, None, 0)
+        self.assertEqual(r["counts"]["matched_normalized"], 2)
+        self.assertEqual(r["playlists"][0]["matched_normalized"], 2)
+        r2 = ingest.build_result([self.URL], {self.URL: dict(c, matched_normalized=0)}, None, 0)
+        self.assertNotIn("matched_normalized", r2["counts"])
+        self.assertNotIn("matched_normalized", r2["playlists"][0])
 
 
 if __name__ == "__main__":

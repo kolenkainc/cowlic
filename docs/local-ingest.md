@@ -765,11 +765,14 @@ finished and holds the stop reason (same on every row) otherwise, so `--summariz
 - Relaxed title pass (#194), both modes: only when the strict pass finds nothing in the same search results (no extra
   search call), `find_match` compares the titles again after dropping version noise that does not change the recording
   (` - Remastered YYYY`, `(Remastered YYYY)`, `(YYYY)`, `(Album Version)`, `(Single Version)`, `[Explicit]`), reading `&`
-  as `and`, ignoring apostrophes and Latin diacritics, and a plural `s` on the last word of a title of 2+ words. The
-  variant markers (live and its venue, acoustic, remix, instrumental, karaoke, cover, sped up, slowed, 8D, reverb, radio
-  edit, extended, demo, ...) of the two titles must be the same, however spelled or ordered. The thresholds and the
-  +-3 s are unchanged. Duration mode only: a title of 2+ words that is the start of the other and whose extra words
-  repeat words of that start (`Ooh La` / `Ooh La La La`) passes.
+  as `and`, ignoring Latin diacritics, apostrophes (titles of 2+ words only: `Hell` and `He'll` stay apart) and a plural
+  `s` on the last word of a title of 2+ words. The variant markers (live with its venue and year, acoustic, remix,
+  instrumental, karaoke, cover, sped up, slowed, 8D, reverb, radio edit, extended, demo, ...) of the two titles must be
+  the same, however spelled or ordered. The thresholds and the +-3 s are unchanged. Titles over 300 characters are left
+  to the strict pass. A match that only this pass accepted is logged "(matched after title normalization)" and counted
+  as `matched_normalized` (summary line and result JSON, only when non-zero). There is deliberately no prefix rule
+  (`Bye Bye` / `Bye Bye Bye`): the duration path has no artist veto, so a prefix could ingest another song; the chant
+  class (`Ooh La` / `Ooh La La La`) is dropped for now (follow-up idea: allow it only with a matching artist).
 
 The first line of the output is the verdict (the line you copy into #154), followed by its warnings. It is a go only
 on a sample the gate can be judged on. Otherwise it reads `no verdict: <reasons>` (and never says go) when any of
