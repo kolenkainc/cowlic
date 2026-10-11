@@ -1,6 +1,6 @@
 # Bootstrap and ongoing: design of the two ingest processes
 
-Contract for the implementation tickets #166-#178 (umbrella #102, milestone Release 3; since the regrooming of 2026-10-11 the nightly phase tickets #171-#175 and #178 are in milestone Release 4 (v4.0.0)). Owner decision, 2026-10-10
+Contract for the implementation tickets #166-#178 (umbrella #102, milestone Release 3; since the regrooming of 2026-10-11 #171, #172 and #174 shipped in Release 3 (v3.0.0), and the open follow-ups #173, #175, #178 and #238 are in milestone Release 4 (v4.0.0)). Owner decision, 2026-10-10
 (translated): "bootstrap = we parse the priorities from Last.fm ONCE, to fill the library; ongoing = the pipeline
 every day at 21:10 that looks at which releases are missing and tops them up".
 
@@ -606,7 +606,7 @@ default.
 
 Order of work on `ingest/ingest.py`, never two agents at once: #152 -> #166 -> #168 -> #172. `docs/local-ingest.md`
 is edited by #153, #170 (pointer) and #174: not together. Critical path: #152 -> #166 -> #168 -> #170 -> #176
-(also needs #154) -> #177; second path #164 -> #171 -> #172 -> #175 -> #178 (#171, #172, #175 and #178 moved to Release 4 on 2026-10-11). [V, milestone Release 3 description, as of 2026-10-10]
+(also needs #154) -> #177; second path #164 -> #171 -> #172 -> #175 -> #178 (#173, #175, #178 and #238 are in Release 4 since 2026-10-11; #171, #172 and #174 shipped in Release 3). [V, milestone Release 3 description, as of 2026-10-10]
 
 ## 7. Open questions (one to one with #165)
 
