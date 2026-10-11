@@ -167,9 +167,18 @@ All in `ingest/`:
    only `video_id, title, artists, duration_s, score, mode, relaxed`; `process_track` calls `deps.find_match(song)` before
    the download, so the cover URL can be put on the song: `cover_url = base + "=w1200-h1200-l90-rj"` when `cover_url` is
    None). The nightly path with a Spotify `cover_url` stays unchanged (never overwrite an existing `cover_url`).
-2. `fetch_cover`: keep https and the 10 MB cap; add a host allowlist (`yt3.googleusercontent.com`,
-   `lh3.googleusercontent.com`) for URLs coming from the YouTube route, and a JPEG magic-byte check (`FF D8`) because
-   `sendPhoto` and the Worker assume JPEG [R, not enforced today]. Failure keeps "WARN cover failed" and no cover.
+   **Wrong-cover guard in the new-track path (not only in the backfill).** `Candidate` has no album field today
+   [V `ingest/match.py` `Candidate`], so the match must also carry the result's album name, album id, first artist id and
+   artist names. Before `cover_url` is set, apply the guard: the result's album name must be similar to the song's
+   `album_name` (the project's `similarity`), the song must have a real album name (`UNKNOWN_ALBUM` or an empty name never
+   gets a cover from a match), and the result's artist names must match `primary_artist(song)` (the artist check the matcher
+   already uses). Without it a wrong cover would be shared through `covers[al]` and kept forever by the COALESCE [V
+   `ingest.py:540-549, 802-806`]. A song that fails the guard simply gets no cover (counted, logged without names).
+2. `fetch_cover` hardening for URLs from the YouTube route [V today it only checks https and size, and `urlopen` follows
+   redirects, `ingest.py:748-757`]: a host allowlist (`yt3.googleusercontent.com`, `lh3.googleusercontent.com`) checked
+   on the first URL AND on every redirect target (or refuse redirects altogether), `Content-Type: image/jpeg`, the JPEG
+   magic bytes `FF D8`, the 10 MB cap and https only kept. Failure keeps "WARN cover failed" and no cover. A hostile test
+   (redirect to another host, non-JPEG body, oversized body) with a mutation check for each rule.
 3. Tests offline with fakes; mutation checks; a nightly dry comparison with only Spotify sources must be byte-identical.
 4. No Worker, no migration, no production change.
 
@@ -181,16 +190,26 @@ All in `ingest/`:
    or by the owner; the Worker code must work with and without the column (rule 2): select the column only after it
    exists, or deploy the migration first (`needs: migrate` on `deploy`). Rollback in a comment: SQLite can
    `ALTER TABLE artists DROP COLUMN image_file_id` [R], leave the column otherwise. The ticket text says a production
-   change must be an explicit line in the split ticket: it is, in ticket 4 below.
+   change must be an explicit line in the split ticket: it is, in ticket 3 of section 8.
 2. Ingest: `upsert_statements` artist upsert gets `image_file_id` with the same COALESCE; a run-local `artist_images`
    dict loaded with `SELECT id, image_file_id FROM artists`; a new `Deps.upload_artist_image` (or a generalised cover
    upload) and one `get_artist(artists[0].id)` per NEW artist, thumbnail base + `=w800-h800-p-l90-rj`. The artist-id path
-   is a no-op when the matched result has no artist id.
+   is a no-op when the matched result has no artist id. **Artist-name guard:** `artists[0].id` of the match may belong to
+   a different artist than `primary_artist(song)` (a feature credit, a cover act), so the photo is used only when the
+   name returned by `get_artist` (or the result's first artist name) is similar to `primary_artist(song)`; otherwise no
+   photo. The same hardened fetch as ticket 1 applies to the artist image.
+   **Gate against a missing column:** the artist upsert sits in the shared D1 batch with the track insert, so if the
+   code that writes `image_file_id` ran before migration 0003 is applied, EVERY track insert would fail. Therefore ticket
+   4a is merged only after ticket 3 (the migration) is deployed and the column exists, and the code has a startup check
+   (`PRAGMA table_info(artists)` or a one-row `SELECT image_file_id FROM artists LIMIT 1` through the same read-only D1 call
+   that loads `artist_images`): when the column is missing the artist-image feature is switched off, the run logs one line
+   and everything else runs as before [P].
 3. Worker `library.ts`: `coverFileId` accepts an album id OR an artist id: `SELECT cover_file_id FROM albums WHERE id = ?`
    first, then `SELECT image_file_id FROM artists WHERE id = ?`. Album and artist ids are both 16-hex SHA-256 prefixes
    from different salted inputs (`stable_id("album", ...)`, `stable_id("artist", ...)`), so a collision is negligible but
-   possible in theory; to avoid ambiguity entirely hand out the artist's `coverArt` as `ar-<id>` and strip the prefix
-   [P, design choice]. `coverArt` on artist entries in `getArtists`/`getIndexes`/`getArtist`/`search3`, only when
+   possible in theory; DECISION of this design: the artist's `coverArt` id is `ar-<id>` (prefix `ar-`, then the 16-hex
+   artist id), and `getCoverArt` strips the prefix and reads `artists.image_file_id`; ids without the prefix keep reading
+   `albums` exactly as today, so existing album `coverArt` values do not change [P, design choice]. `coverArt` on artist entries in `getArtists`/`getIndexes`/`getArtist`/`search3`, only when
    `image_file_id` is set (the artist SELECTs need the column; D1 queries must stay parameterized). Optionally
    `artistImageUrl` is not needed.
 4. `smoke.mjs` and the CI smoke fixture get one artist with an image id.
@@ -203,7 +222,7 @@ of the artist entry plus `getCoverArt`, which phase 2 implements; Symfonium may 
 for image URLs (our stub returns an empty object). A URL there would have to carry the Subsonic credentials or a token,
 so it is NOT recommended; if the real client does not show the photo from `coverArt`, the follow-up is to fill
 `getArtistInfo2.largeImageUrl` with a `getCoverArt` link. The only real check is looking at Symfonium after
-deploy, which is an acceptance step for ticket 4.
+deploy, which is the acceptance step of ticket 6.
 
 ## 7. Backfill for albums (and artists) already stored without an image
 
@@ -213,14 +232,21 @@ deploy, which is an acceptance step for ticket 4.
   run the same `find_match(ytm, title, artist, album, duration_s)` (1 to 3 search calls, same code as ingest, so the same
   accept rules) and take the thumbnail of the chosen result. No audio download. Cost per album about 1 to 3 search calls, plus
   one `get_artist` per cover-less artist [R, the count of such albums was not read from D1 here].
-- **Mismatch guard.** Accept the cover only if the result's `album.name` is similar (the project's `similarity`) to the
-  stored album name; otherwise skip the album and count it `album_mismatch` (it stays NULL and is reported). Compilation
-  or deluxe covers differ little for the same album, but a different album must not be used [P].
-- **Command.** A new subcommand next to `rank/plan/run/status` of `ingest/bootstrap.py`, for instance `bootstrap.py covers`,
-  through the same wrapper `scripts/run-bootstrap-local.sh`. That gives, for free: the shared `ingest.lock`, the 21:10
+- **Mismatch guard.** The same guard as ticket 1 (shared code): accept the cover only if the result's `album.name` is
+  similar (the project's `similarity`) to the stored album name and the result's artist matches the stored artist;
+  otherwise skip the album and count it `album_mismatch` (it stays NULL and is reported). A stored album named
+  `UNKNOWN_ALBUM` is never filled. Compilation or deluxe covers differ little for the same album, but a different album
+  must not be used [P].
+- **Command.** A new subcommand next to `rank/plan/run/status` of `ingest/bootstrap.py`, for instance `bootstrap.py covers`
+  (with a `covers-plan` dry count, below). It is NOT free through the wrapper: `scripts/run-bootstrap-local.sh` hard-codes the
+  subcommand list `rank | plan | run | status` (line 55), the cap check (line 91) and the 21:10 guard (around line 194)
+  are keyed on `run | plan` [V read]. So the ticket changes the wrapper, `scripts/test-run-bootstrap-local.sh` and
+  `docs/bootstrap.md`. What it then reuses: the shared `ingest.lock`, the 21:10
   guard (`now + --max-minutes + 10 min + 60 s` must stay before the next 21:10), the required caps `--max-new N`
   (here: albums attempted) and `--max-minutes M`, the exit codes (75 locked, 78 usage or guard), and exit 3 on a sign-in
-  challenge with no bypass [V `docs/bootstrap.md` section 4/5, read, not run]. Pacing: at least 1.5 s between YouTube Music
+  challenge with no bypass [V `docs/bootstrap.md` section 4/5, read, not run]. **Dry count first:** a plan-like mode
+  (`covers-plan`, read-only, no YouTube call) that reads D1 and prints how many albums (and artists) lack an image, and how
+  many a run of the given caps would cover, so the owner sees the size before the first real run. Pacing: at least 1.5 s between YouTube Music
   calls plus jitter, bounded retries only for transient errors, never for sign-in [P]; search calls are not the 300 videos
   per hour class of downloads but their limit is undocumented [R].
 - **Resumable without a state file.** The work list is `SELECT ... FROM albums WHERE cover_file_id IS NULL` (artists:
@@ -241,28 +267,35 @@ deploy, which is an acceptance step for ticket 4.
 Recommendation: use YouTube Music thumbnails for both albums and artists (owner decision). Albums: the matched song's
 thumbnail with the size suffix `=w1200-h1200-l90-rj`. Artists: `get_artist` thumbnail with `=w800-h800-p-l90-rj` (square
 crop of the banner). Reuse the existing Telegram photo path and COALESCE. CAA is a documented fallback only. Every URL
-suffix and the artist crop quality are checked on one example each only, so each ticket has a spot-check in
-Symfonium as acceptance.
+suffix and the artist crop quality are checked on one example each only, so the Symfonium spot-check on real data is its
+own ticket (6); the other tickets are verified offline (tests, `tsc`, smoke).
 
 All tickets that touch `ingest/ingest.py` run serially. Order and sizes (S under half a day, M about a day):
 
 | # | Ticket | Size | Notes |
 |---|---|---|---|
-| 1 | Album covers in ingest for new tracks: `Candidate`/match thumbnail, `cover_url` from the match for Last.fm and new-release songs, `fetch_cover` host allowlist and JPEG check, offline tests with mutation checks, nightly byte-identical check | M | no Worker, no migration; touches `ingest.py` and `match.py` |
-| 2 | Backfill command `bootstrap.py covers` for stored albums (lock, 21:10 guard, caps, pacing, exit 3, cooldown file), runbook section in `docs/bootstrap.md` | M | after 1; serial with other `ingest.py` work; do not run during a bootstrap session |
-| 3 | Artist images, ingest side: `get_artist` per new artist, artist upsert with COALESCE, `artist_images` dict, tests; the backfill for artists as an extension of ticket 2's command | M | after 1 and after ticket 4's migration is applied (the column must exist before the first write) |
-| 4 | Artist images, Worker + migration `0003_artist_images.sql`: additive `ALTER TABLE ... ADD COLUMN`, `getCoverArt` accepts artist ids, `coverArt` on artist entries, smoke fixture, `tsc` and `smoke:ci`. Production change: the migration is applied by the deploy workflow on merge or by the owner, and the owner confirms in the ticket | M | independent of 1 and 2; must be applied before 3 writes; Worker must work with and without the column |
-| 5 | Spot-check in Symfonium on real data (one album, one artist), record results on #245; if the artist photo does not show, fill `getArtistInfo2` | S | after 3 and 4 |
-| (6) | Optional: CAA fallback for albums without a YouTube match | S | only if the backfill report shows many `no_match` |
+| 1 | Album covers in ingest for new tracks: `Candidate` carries the result's album name/id, artist id and names; wrong-cover guard (album-name similarity, real album name, artist match) before `cover_url` is set; `fetch_cover` hardening (host allowlist on first URL and every redirect or no redirects, `image/jpeg`, `FF D8`, 10 MB, https); offline tests including a hostile test, mutation checks, nightly byte-identical check | M | no Worker, no migration; touches `ingest.py` and `match.py`; the guard code is shared with 2 and 4b |
+| 2 | Album backfill: `bootstrap.py covers` and `covers-plan` (dry count), wrapper `scripts/run-bootstrap-local.sh` (subcommand list, cap check, 21:10 guard), `scripts/test-run-bootstrap-local.sh`, `docs/bootstrap.md`, cooldown file, exit 3 | M to L (Python plus bash plus runbook) | after 1; serial with other `ingest.py` work; not during a bootstrap session |
+| 3 | Worker plus migration: `0003_artist_images.sql` (additive), `getCoverArt` accepts `ar-<id>`, `coverArt` = `ar-<id>` on artist entries (`getArtists`, `getIndexes`, `getArtist`, `search3`), smoke fixture, `tsc`, `smoke:ci`. Acceptance includes: an `ar-<id>` resolves to the artist image, a plain album id still resolves as before, an artist without an image has no `coverArt`. Production change: migration applied by the deploy workflow on merge or by the owner; the owner confirms in the ticket | M | independent of 1 and 2; must be deployed before 4a |
+| 4a | Artist images, ingest side: `get_artist` per new artist, artist-name guard, artist upsert with COALESCE, `artist_images` dict, column-presence startup check (feature off when missing), hardened fetch, tests | M | after 1 and after 3 is deployed (otherwise every track insert fails): merge gate |
+| 4b | Artist backfill: extend `covers` and `covers-plan` to artists (`image_file_id IS NULL`), one search plus one `get_artist` per artist | M | after 2 and 4a |
+| 5 | (optional) CAA fallback for albums without a YouTube match | S | only if the backfill report shows many `no_match` |
+| 6 | Spot-check in Symfonium on real data (one album, one artist), record results on #245; if the artist photo does not show, fill `getArtistInfo2` | S | after 4a and 3 (and 2/4b for old data) |
 
-Order: 1, then 2 and 4 in parallel (different files), then 3, then 5.
+Order: 1, then 2 and 3 in parallel (different files), then 4a, then 4b, then 6.
 
 ## 9. Risks
 
 - ToS: automated thumbnail download is the same class as the existing ingest; accepted by the owner, not zero [R].
 - The `=w1200-h1200-l90-rj` grammar is undocumented and may change; a failed fetch must mean "no cover".
-- Wrong cover: the matched album can differ from the stored one (deluxe, compilation, a cover act) [V 2.1]; mitigated by
-  the album-name similarity guard.
+- Wrong cover: the matched album can differ from the stored one (deluxe, compilation, a cover act) [V 2.1], and a
+  Last.fm song can have a different or missing album name. Mitigated only if the guard lives in BOTH the new-track path
+  (ticket 1: album-name similarity, real album name, artist match, `Candidate` extended) and the backfill (ticket 2);
+  otherwise a wrong cover is shared through `covers[al]` and kept forever by the COALESCE. A wrong artist photo is
+  guarded by the artist-name check in 4a. The similarity thresholds are untested on real data [R].
+- A redirecting or hostile image URL: `urlopen` follows redirects today; ticket 1 closes it (section 6a point 2).
+- Shipping the artist-image writer before migration 0003 is applied would fail every track insert; the merge gate and
+  the column check in 4a cover it.
 - The artist square crop is checked for one artist only; solo artists may crop badly [R].
 - An artist with no `artists[0].id` or a pseudo-artist gets no photo.
 - YouTube bot check: search calls were fine here (no challenge in 8 calls), but a sustained run can trigger it; the rule
@@ -278,7 +311,7 @@ Order: 1, then 2 and 4 in parallel (different files), then 3, then 5.
    should any cover of the matched song be used? Default in this design: guard on.
 3. The artist photo is a square crop of the YouTube banner (a band photo for The Kooks, one sample only). OK, or prefer
    no artist photo when the crop is doubtful? There is no automatic quality judge.
-4. Production: ticket 4's migration reaches production through the merge workflow. Confirm that is the approved path
+4. Production: ticket 3's migration reaches production through the merge workflow. Confirm that is the approved path
    for this one (the owner's decision of 2026-10-11 in `docs/worker-cicd.md` says yes) or that the owner will apply it.
 
 ## 11. What was and was not verified
