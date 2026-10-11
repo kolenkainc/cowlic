@@ -30,6 +30,7 @@ new_case() { # NAME [launcher source]: fake repo with the launcher and a stub wr
 #!/bin/sh
 echo "$*" >> "$STUB_CALLS"
 [ -z "${STUB_NO_SESSION:-}" ] || exit "${STUB_RC:-0}"   # 75 and the guard 78: nothing touched
+[ -z "${STUB_RO:-}" ] || { mkdir -p "$XDG_STATE_HOME/cowlic"; chmod 500 "$XDG_STATE_HOME/cowlic"; exit "${STUB_RC:-0}"; }  # state dir becomes read-only
 d="$XDG_STATE_HOME/cowlic"; mkdir -p "$d"
 echo "stub wrapper line"
 res="{\"stop_reason\": \"${STUB_STOP:-cap}\", \"counts\": {\"added\": ${STUB_ADDED:-0}}}"
@@ -121,6 +122,26 @@ assert "exit 75: quiet skip, exit 0, never counted or halted" "$([ "$rc" = 0 ] &
 new_case guard78; at '2026-10-11 20:43:59'; STUB_RC=78 STUB_NO_SESSION=1; export STUB_RC STUB_NO_SESSION; run
 assert "exit 78 while the time still fits (prerequisite problem): a failure, counted" "$([ "$(cat "$(st bootstrap-fails)")" = 1 ] && echo 0 || echo 1)"
 unset STUB_RC STUB_NO_SESSION
+seeded_78() { # NAME LAUNCHER: a PRE-SEEDED last-run (added 232, older than the launcher start) and a wrapper that exits 78 early
+  new_case "$1" "$2"; at '2026-10-11 12:00:00'
+  mkdir -p "$S/cowlic"
+  printf '{"exit_code": 0, "result": {"stop_reason": "cap", "counts": {"added": 232}}}\n' > "$S/cowlic/bootstrap-last-run.json"
+  touch -d '2 hours ago' "$S/cowlic/bootstrap-last-run.json"
+  STUB_RC=78 STUB_NO_SESSION=1 run; unset STUB_RC STUB_NO_SESSION
+  [ "$(cat "$(st bootstrap-fails)" 2> /dev/null)" = 1 ]
+}
+r=0; seeded_78 stale78 "$LAUNCHER_SRC" || r=1
+assert "early wrapper exit 78 with a stale last-run (added 232): counted as a failure" "$r"
+assert "stale last-run is not 'tracks were added'" "$(hasnt 'track(s) were added' "$C/out")"
+new_case stale1; mkdir -p "$S/cowlic"
+printf '{"exit_code": 0, "result": {"stop_reason": "cap", "counts": {"added": 232}}}\n' > "$S/cowlic/bootstrap-last-run.json"
+touch -d '2 hours ago' "$S/cowlic/bootstrap-last-run.json"
+STUB_RC=1 STUB_NO_SESSION=1 run; unset STUB_RC STUB_NO_SESSION
+assert "any exit without a fresh last-run ignores the old file (exit 1, counter 1)" "$([ "$(cat "$(st bootstrap-fails)")" = 1 ] && echo 0 || echo 1)"
+# a halt marker that cannot be written: the breaker is NOT armed, say so loudly and exit non-zero
+new_case rohalt; STUB_RC=3 STUB_RO=1; export STUB_RC STUB_RO; run; unset STUB_RC STUB_RO
+chmod 700 "$S/cowlic"
+assert "halt marker unwritable after exit 3: exit 1 and a loud 'NOT armed' line" "$([ "$rc" = 1 ] && grep -q 'breaker is NOT armed' "$C/out" && echo 0 || echo 1)"
 # the clock passes the fit while the wrapper runs: a `date` shim answers +%s from a file the stub wrapper advances
 new_case guard78b; unset COWLIC_BOOTSTRAP_NOW_EPOCH
 mkdir -p "$C/bin"
@@ -192,6 +213,21 @@ mutant loop 's|^rc=\$?$|rc=$?; if [ "$rc" = 3 ]; then "$WRAPPER" run --max-new "
 assert "mutation: retry on exit 3 is caught" "$(scenario_breaker m3 "$TMP/mutant-loop.sh" && echo 1 || echo 0)"
 mutant nofailhalt 's|\[ "\$n" -ge "\$MAX_FAILS" \]|[ "$n" -ge 999 ]|'
 assert "mutation: failure halt removed is caught" "$(scenario_fails m4 "$TMP/mutant-nofailhalt.sh" && echo 1 || echo 0)"
+
+mutant nofresh 's|! \[ "\$MARK" -nt "\$LAST_RUN" \] \&\& ||'
+seeded_rc1() { # same with a non-78 exit: only the freshness check protects this one
+  new_case "$1" "$2"; mkdir -p "$S/cowlic"
+  printf '{"exit_code": 0, "result": {"stop_reason": "cap", "counts": {"added": 232}}}\n' > "$S/cowlic/bootstrap-last-run.json"
+  touch -d '2 hours ago' "$S/cowlic/bootstrap-last-run.json"
+  STUB_RC=1 STUB_NO_SESSION=1 run; unset STUB_RC STUB_NO_SESSION
+  [ "$(cat "$(st bootstrap-fails)" 2> /dev/null)" = 1 ]
+}
+assert "mutation baseline: seeded rc 1 scenario passes on the real launcher" "$(seeded_rc1 m5a "$LAUNCHER_SRC" && echo 0 || echo 1)"
+assert "mutation: stale last-run accepted is caught" "$(seeded_rc1 m5 "$TMP/mutant-nofresh.sh" && echo 1 || echo 0)"
+mutant no78 's|^\[ "\$rc" != "\$EXIT_PREREQ" \] \|\| ADDED=0.*$|:|'
+assert "mutation: 78 not forced to added 0 (with the freshness check also off) is caught" "$(sed 's|! \[ "\$MARK" -nt "\$LAST_RUN" \] \&\& ||' "$TMP/mutant-no78.sh" > "$TMP/mutant-no78b.sh"; seeded_78 m6 "$TMP/mutant-no78b.sh" && echo 1 || echo 0)"
+mutant swallow 's|if ! write_marker "\$HALT" "\$(now_utc) exit 3: YouTube sign-in challenge"; then|if false; then|'
+assert "mutation: unwritable halt marker swallowed is caught" "$(new_case m7 "$TMP/mutant-swallow.sh"; STUB_RC=3 STUB_RO=1 run; chmod 700 "$S/cowlic"; grep -q 'breaker is NOT armed' "$C/out" && echo 1 || echo 0)"
 
 echo
 if [ "$failures" -eq 0 ]; then echo "all tests passed"; else echo "$failures test(s) FAILED"; exit 1; fi

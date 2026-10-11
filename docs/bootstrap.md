@@ -496,6 +496,14 @@ the gentler pattern lowers the 403 rate is NOT measured.
    - any other non-zero exit that added no track: counted; after `COWLIC_BOOTSTRAP_MAX_FAILS` (default 3) consecutive such
      sessions the halt marker is written and the launcher exits 1. A non-zero exit that DID add tracks (routine: failed
      tracks make the engine exit 1) resets the counter. An ok session resets it too.
+   - The launcher reads `bootstrap-last-run.json` only when it is not older than the launcher's start (the wrapper
+     removes the old file only after its lock and guard), and treats a wrapper exit 78 as "added nothing", so an early
+     refusal never looks like the previous session's progress.
+   - If the halt marker cannot be written, the launcher says "the circuit breaker is NOT armed" and exits 1: disable the
+     timer by hand (command below).
+   - A signal exit seen by the wrapper (143, 130 ...) counts like any failed session with nothing added. Limit: when
+     systemd kills the whole cgroup (`TimeoutStartSec`, `systemctl stop`) the launcher dies with the session and does no
+     accounting, so a hang that repeats every 2 hours is not counted towards the failure halt.
    - exit 0 with stop reason `done` (every ranked artist done, parked or excluded): writes the done marker.
 
 **Markers** are in the state directory (`${XDG_STATE_HOME:-$HOME/.local/state}/cowlic/`), mode 0600, text with a time and a

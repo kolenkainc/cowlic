@@ -117,7 +117,9 @@ read_fails() {
 # last-run fields of the session that just ended (the wrapper removed the old file at its start): "<stop_reason> <added>"
 last_run_fields() {
   local out=""
-  [ -s "$LAST_RUN" ] && out="$(timeout 10 python3 -I -c '
+  # only a file the wrapper wrote during THIS call counts: an early wrapper exit (78 before it removes the old file)
+  # leaves the previous session's record, which must not be mistaken for this one's
+  [ -s "$LAST_RUN" ] && ! [ "$MARK" -nt "$LAST_RUN" ] && out="$(timeout 10 python3 -I -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
 r = d.get("result") if isinstance(d, dict) else None
@@ -130,6 +132,9 @@ print(s, a)
   case "$out" in *" "*) echo "$out" ;; *) echo "- 0" ;; esac
 }
 
+MARK="$STATE_DIR/.bootstrap-launcher-start"
+if ! : > "$MARK"; then echo "run-bootstrap-scheduled: cannot write $MARK" >&2; exit "$EXIT_PREREQ"; fi
+trap 'rm -f "$MARK"' EXIT
 log "starting a session: --max-minutes $MINUTES --max-new $NEW"
 "$WRAPPER" run --max-new "$NEW" --max-minutes "$MINUTES"
 rc=$?
@@ -139,7 +144,10 @@ case "$rc" in
     log "skip: another run or session holds the lock"
     exit 0 ;;
   "$EXIT_SIGN_IN")
-    write_marker "$HALT" "$(now_utc) exit 3: YouTube sign-in challenge" || true
+    if ! write_marker "$HALT" "$(now_utc) exit 3: YouTube sign-in challenge"; then
+      log "ERROR the halt marker could NOT be written: the circuit breaker is NOT armed and the next scheduled run will start again. Disable the timer NOW: systemctl --user disable --now cowlic-bootstrap.timer"
+      exit 1
+    fi
     log "ERROR halted after a YouTube sign-in challenge (exit 3). No retry, no workaround (rule #62). Read the log, wait, then remove $HALT"
     exit 1 ;;
   "$EXIT_PREREQ")
@@ -151,6 +159,7 @@ case "$rc" in
 esac
 
 read -r STOP ADDED < <(last_run_fields)
+[ "$rc" != "$EXIT_PREREQ" ] || ADDED=0  # a wrapper refusal (78) added nothing, whatever an old record says
 if [ "$rc" = 0 ]; then
   rm -f "$FAILS"
   if [ "$STOP" = done ]; then
@@ -160,7 +169,9 @@ if [ "$rc" = 0 ]; then
   exit 0
 fi
 
-# the session failed (exit 1, 2, 78 for another reason, a signal): only "failed and added nothing" counts
+# the session failed (exit 1, 2, 78 for another reason, 128+N after a signal or timeout seen by the wrapper): only
+# "failed and added nothing" counts. A systemd kill of the whole cgroup (TimeoutStartSec, systemctl stop) also ends the
+# launcher, so that case is not counted at all (documented in docs/bootstrap.md).
 if [ "$ADDED" -gt 0 ]; then
   rm -f "$FAILS"
   log "session exit code $rc, but $ADDED track(s) were added: not counted as a failed session"
@@ -170,7 +181,10 @@ n=$(($(read_fails) + 1))
 write_marker "$FAILS" "$n" || true
 log "session failed (exit code $rc) and added no track: $n of $MAX_FAILS consecutive"
 if [ "$n" -ge "$MAX_FAILS" ]; then
-  write_marker "$HALT" "$(now_utc) $n consecutive failed sessions without a new track" || true
+  if ! write_marker "$HALT" "$(now_utc) $n consecutive failed sessions without a new track"; then
+    log "ERROR the halt marker could NOT be written: the circuit breaker is NOT armed and the next scheduled run will start again. Disable the timer NOW: systemctl --user disable --now cowlic-bootstrap.timer"
+    exit 1
+  fi
   log "ERROR halted after $n consecutive failed sessions without a new track. Read the log, then remove $HALT"
   exit 1
 fi
