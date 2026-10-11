@@ -84,6 +84,13 @@ class TitleOnlyTest(unittest.TestCase):
                          ("A Flock of Seagulls", "Flock of Seagulls"), ("The Who", "Who"), ("Who", "The Who")):
             self.assertIsNotNone(find([res("Seaside", (got,), 208)], title="Seaside", artist=req), (req, got))
 
+    def test_artist_bar_is_pinned_by_behaviour(self):
+        # 0.667 after the strip: a bar of 0.65 or 0.6 would accept it
+        self.assertAlmostEqual(match.artist_similarity("Pink Floyd", "Pink Flamingos"), 0.667, places=2)
+        self.assertIsNone(find([res("Seaside", ("Pink Flamingos",), 208)], title="Seaside", artist="Pink Floyd"))
+        self.assertIsNotNone(find([res("Seaside", ("1975",), 208)], title="Seaside", artist="The 1975"))
+        self.assertIsNotNone(find([res("Seaside", ("The 1975",), 208)], title="Seaside", artist="1975"))
+
     def test_article_only_name_is_not_emptied(self):
         self.assertEqual(match.artist_similarity("The", "The"), 1.0)
         self.assertEqual(match.artist_similarity("A", "A"), 1.0)
