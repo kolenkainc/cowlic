@@ -364,7 +364,7 @@ jobs:
   ci:
     name: ci
     needs: [changes, lint, tests]
-    if: ${{ github.event_name == 'pull_request' }}
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
