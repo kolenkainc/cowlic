@@ -173,6 +173,37 @@ jobs:
             echo "worker_changed=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # FAIL CLOSED (#307). `changes` is a required check together with `lint` and `tests`, and a SKIPPED required job
+      # counts as passed: a successful `changes` whose worker_changed output is missing or invalid would skip lint and
+      # tests and let the PR through unchecked. This LAST step turns that into a red `changes`: worker_changed must be
+      # exactly true or false, base_sha must be 40 lowercase hex characters or empty, and an empty base is legitimate
+      # only together with worker_changed=true (the steps above write true when they cannot resolve a base, and lint
+      # and tests then fail closed on the missing base). A legitimate green stays green: false with a valid base,
+      # true with or without a base. The step has no `if` (a failed earlier step already fails the job) and no
+      # continue-on-error. The values come in through env and are never printed before they are validated.
+      - name: Validate outputs (fail closed)
+        env:
+          OUT_WORKER_CHANGED: ${{ steps.changes.outputs.worker_changed }}
+          OUT_BASE_SHA: ${{ steps.base.outputs.base_sha }}
+        run: |
+          if [ "$OUT_WORKER_CHANGED" != "true" ] && [ "$OUT_WORKER_CHANGED" != "false" ]; then
+            echo "::error::worker_changed is missing or not exactly true or false"
+            exit 1
+          fi
+          if [ -n "$OUT_BASE_SHA" ]; then
+            case "$OUT_BASE_SHA" in
+              *[!0-9a-f]*) echo "::error::base_sha is not lowercase hex"; exit 1 ;;
+            esac
+            if [ "${#OUT_BASE_SHA}" -ne 40 ]; then
+              echo "::error::base_sha is not 40 characters"
+              exit 1
+            fi
+          elif [ "$OUT_WORKER_CHANGED" != "true" ]; then
+            echo "::error::there is no base commit but worker_changed is not true"
+            exit 1
+          fi
+          echo "worker_changed=$OUT_WORKER_CHANGED base_sha=${OUT_BASE_SHA:-none}"
+
   # Stage 2: typecheck and migrations. A job-level `if:` is fine here: the gate `ci` decides what a skip means.
   lint:
     name: lint
@@ -346,13 +377,13 @@ jobs:
 
       # Vitest has no switch against skipped tests and no minimum count, so both are checked here on the numeric
       # outputs of the report step (no text parsing): skipped must be 0 (a skipped test is a silently dropped check)
-      # and passed must reach MIN_TESTS, a pinned number just below the real count (654 on 2026-10-14: 106 unit, 451
+      # and passed must reach MIN_TESTS, a pinned number just below the real count (691 on 2026-10-14: 106 unit, 488
       # workflow, 51 + 46 smoke) so a few removals do not trip it but a lost file or area does. NOT dynamic: raise it deliberately when tests are added,
       # lower it deliberately when tests are removed on purpose.
       - name: Minimum test count (Vitest)
         if: ${{ steps.vitest.outcome == 'success' }}
         env:
-          MIN_TESTS: "648"
+          MIN_TESTS: "685"
           PASSED: ${{ steps.vitest_report.outputs.passed }}
           SKIPPED: ${{ steps.vitest_report.outputs.skipped }}
         run: |

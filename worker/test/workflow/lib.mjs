@@ -461,6 +461,32 @@ export function releaseFailures(text) {
   return f;
 }
 
+// --- #307: `changes` fails closed. Its LAST step validates the two outputs (the behaviour is run by changes.mjs); here
+// the static shape: exactly one such step, last, unconditional, no continue-on-error, reading exactly the two step outputs
+// that the job outputs map (a skipped required job counts as passed, so a red `changes` is the only protection).
+export const VALIDATE_STEP_NAME = "Validate outputs (fail closed)";
+export function changesStepFailures(text) {
+  const f = [];
+  const b = jobBlock(text, "changes");
+  if (b === null) return ["job changes is missing"];
+  const all = steps(b);
+  const last = all[all.length - 1];
+  if (all.filter((s) => s.name === VALIDATE_STEP_NAME).length !== 1) f.push(`changes must have exactly one step "${VALIDATE_STEP_NAME}"`);
+  if (!last || last.name !== VALIDATE_STEP_NAME) f.push("the validation step must be the LAST step of changes");
+  const v = all.find((s) => s.name === VALIDATE_STEP_NAME);
+  if (v) {
+    const own = v.lines.filter((l) => !/^ {6}#/.test(l));
+    if (own.some((l) => /^ {8}(if|continue-on-error):/.test(l))) f.push("the validation step must have no if and no continue-on-error");
+    const env = own.filter((l) => /^ {10}\S/.test(l) && !/^ {10}#/.test(l)).slice(0, 2);
+    const want = ["          OUT_WORKER_CHANGED: ${{ steps.changes.outputs.worker_changed }}", "          OUT_BASE_SHA: ${{ steps.base.outputs.base_sha }}"];
+    if (JSON.stringify(env) !== JSON.stringify(want) || own.filter((l) => /^ {10}[A-Z_]+: /.test(l)).length !== 2) f.push("the validation step must read exactly the two outputs steps.changes.outputs.worker_changed and steps.base.outputs.base_sha through env");
+    if (/^ {8}(uses|working-directory|shell):/m.test(own.join("\n"))) f.push("the validation step must be a plain run step");
+  }
+  // No step of changes may be conditional or tolerate failure: a skipped step would leave an output unwritten.
+  for (const s of all) if (/^ {8}(if|continue-on-error):/m.test(s.lines.filter((l) => !/^ {6}#/.test(l)).join("\n"))) f.push(`the step "${s.name}" of changes has an if or continue-on-error`);
+  return f;
+}
+
 // --- #290, #292: ci.yml must report the required check `ci` on pull_request, push and merge_group, and the gate must
 // be a real gate. Static, on the text; every rule has a mutation test.
 export function ciFailures(text) {
@@ -519,6 +545,7 @@ export function ciFailures(text) {
   if (/pull_request_target/.test(code(text))) f.push("pull_request_target in ci.yml");
   // Secrets and environments outside the deploy jobs, the deploy graph and the install steps: see staticFailures.
   f.push(...staticFailures(text));
+  f.push(...changesStepFailures(text));
   if (!text.includes("github.event.merge_group.base_sha") || !text.includes("github.event.merge_group.head_sha")) f.push("merge_group base/head not read");
   if (!/^ {10}fetch-depth: 0$/m.test(jobBlock(text, "version") ?? "")) f.push("version job without fetch-depth: 0 (GitVersion needs the full history)");
   f.push(...stepFailures(text));

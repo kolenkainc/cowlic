@@ -199,3 +199,62 @@ export const scopeMutations = [
   ["the comparison looks at the whole tree, not worker/", (t) => t.replace('"$EVENT_SHA" -- worker/ || rc=$?', '"$EVENT_SHA" || rc=$?')],
   ["an equal tree deploys", (t) => t.replace('if [ "$rc" -eq 0 ]; then\n            echo "deploy=false"', 'if [ "$rc" -eq 99 ]; then\n            echo "deploy=false"')],
 ];
+
+// --- #307: the last step of `changes`, "Validate outputs (fail closed)": a required check must not pass with an invalid
+// output (a skipped required job counts as passed). Run under bash with the two outputs in the environment.
+export const VALIDATE_STEP = "Validate outputs (fail closed)";
+export function createValidateRunner(text, { tmp }) {
+  const dir = mkdtempSync(join(tmp, "val-"));
+  writeFileSync(join(dir, "validate.sh"), runBlock(text, VALIDATE_STEP));
+  const run = (workerChanged, baseSha) => {
+    const env = { PATH: "/usr/bin:/bin" };
+    if (workerChanged !== undefined) env.OUT_WORKER_CHANGED = workerChanged;
+    if (baseSha !== undefined) env.OUT_BASE_SHA = baseSha;
+    const r = spawnSync("bash", ["-eo", "pipefail", join(dir, "validate.sh")], { env, encoding: "utf8" });
+    return { status: r.status, log: r.stdout + r.stderr };
+  };
+  return { run };
+}
+
+// [name, worker_changed, base_sha, expected exit status]. `undefined` = the variable is not set at all.
+export const validateCases = [
+  ["false with a valid base (docs-only PR) stays green", "false", F40, 0],
+  ["true with a valid base stays green", "true", F40, 0],
+  ["true with an empty base (fail-closed path of the earlier steps) stays green", "true", "", 0],
+  ["true with an unset base stays green", "true", undefined, 0],
+  ["worker_changed unset fails", undefined, F40, 1],
+  ["worker_changed empty fails", "", F40, 1],
+  ["worker_changed 'maybe' fails", "maybe", F40, 1],
+  ["worker_changed 'True' (case) fails", "True", F40, 1],
+  ["worker_changed 'true ' (trailing space) fails", "true ", F40, 1],
+  ["worker_changed 'true\\nfalse' fails", "true\nfalse", F40, 1],
+  ["worker_changed '1' fails", "1", F40, 1],
+  ["worker_changed 'null' fails", "null", F40, 1],
+  ["empty base with false fails (a skipped lint and tests would pass unchecked)", "false", "", 1],
+  ["unset base with false fails", "false", undefined, 1],
+  ["short base fails", "true", "a".repeat(39), 1],
+  ["long base fails", "true", "a".repeat(41), 1],
+  ["uppercase base fails", "false", "A".repeat(40), 1],
+  ["base with a non-hex character fails", "true", `${"a".repeat(39)}g`, 1],
+  ["base with a trailing newline fails", "true", `${F40}\n`, 1],
+  ["base with a shell metacharacter fails", "false", "$(touch pwned)", 1],
+  ["a hostile worker_changed is not echoed", "::error::x\n::add-mask::y", F40, 1],
+];
+
+export function validateCaseFailures(runner, [name, workerChanged, baseSha, want]) {
+  const r = runner.run(workerChanged, baseSha);
+  const f = [];
+  if (r.status !== want) f.push(`${name}: exit ${r.status}, expected ${want}`);
+  // an invalid value must never reach the log (no workflow command from an untrusted value)
+  if (want === 1 && /(^|\n)(::add-mask|::error::x)/.test(r.log)) f.push(`${name}: the invalid value was echoed`);
+  return f;
+}
+
+export const validateMutations = [
+  ["worker_changed check accepts anything", (t) => t.replace('if [ "$OUT_WORKER_CHANGED" != "true" ] && [ "$OUT_WORKER_CHANGED" != "false" ]; then', "if false; then")],
+  ["worker_changed check accepts false only", (t) => t.replace('if [ "$OUT_WORKER_CHANGED" != "true" ] && [ "$OUT_WORKER_CHANGED" != "false" ]; then', 'if [ "$OUT_WORKER_CHANGED" != "false" ]; then')],
+  ["the hex check is dropped", (t) => t.replace('*[!0-9a-f]*) echo "::error::base_sha is not lowercase hex"; exit 1 ;;', "*[!0-9a-f]*) ;;")],
+  ["the length check is dropped", (t) => t.replace('if [ "${#OUT_BASE_SHA}" -ne 40 ]; then', "if false; then")],
+  ["an empty base is accepted with any worker_changed", (t) => t.replace('elif [ "$OUT_WORKER_CHANGED" != "true" ]; then', "elif false; then")],
+  ["the step reads a different variable than the env provides", (t) => t.replaceAll("OUT_WORKER_CHANGED", "OUT_WORKER_CHANGED_X")],
+];
