@@ -9,8 +9,6 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { lintSql } from './lint-migrations.mjs';
 
-test('SCRATCH deliberately failing test (#289 evidence, reverted)', () => assert.equal(1, 2));
-
 const here = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(here, 'lint-migrations.mjs');
 const MIGRATIONS = path.join(here, '..', 'migrations');
