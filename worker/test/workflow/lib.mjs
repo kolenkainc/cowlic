@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 const workerDir = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 export const deployFile = join(workerDir, "../.github/workflows/worker-deploy.yml");
 export const ciFile = join(workerDir, "../.github/workflows/worker-ci.yml");
+export const versionFile = join(workerDir, "../.github/workflows/version.yml");
 export const readText = (p) => readFileSync(p, "utf8");
 
 const SHA = "0123456789abcdef0123456789abcdef01234567";
@@ -66,6 +67,95 @@ const runBlock = (text, name) => {
   return s.run;
 };
 
+// --- permissions: exact comparison of the parsed blocks (#285 part 3; the old check was a prefix match, so an extra
+// scope appended after `contents: read` went unnoticed, and job-level blocks were not looked at at all).
+// The allowlist encodes exactly what the files have today. `null` = the job has no permissions block (it inherits the
+// top-level one). A new job, a new scope, a widened level or a changed block fails until this table is changed on
+// purpose, in the same PR as the workflow.
+export const PERMISSIONS = {
+  "worker-ci.yml": {
+    top: { contents: "read" },
+    jobs: { ci: { contents: "read", checks: "write" } },
+  },
+  "worker-deploy.yml": {
+    top: { contents: "read" },
+    jobs: {
+      plan: { contents: "read", "pull-requests": "read", deployments: "read" },
+      migrate: { contents: "read" },
+      deploy: null,
+    },
+  },
+  "version.yml": {
+    top: { contents: "read" },
+    jobs: { version: null },
+  },
+};
+
+// Line based parser (no YAML parser). Returns { top, jobs } or throws on anything it does not understand (inline form
+// `permissions: write-all`, a second block, an entry that is not `<scope>: read|write|none`, tabs): the caller turns
+// the throw into a failure, so parse trouble fails closed.
+export function parsePermissions(text) {
+  const lines = text.split("\n");
+  const entry = (l, indent) => new RegExp(`^ {${indent}}([a-z-]+): (read|write|none)(?: #.*)?$`).exec(l);
+  const block = (start, keyIndent, label) => {
+    const out = {};
+    for (let i = start + 1; i < lines.length; i++) {
+      const l = lines[i];
+      if (l.startsWith(" ".repeat(keyIndent)) && l.trim() !== "" && !/^\s*#/.test(l)) {
+        const m = entry(l, keyIndent);
+        if (!m) throw new Error(`${label}: cannot parse permissions entry ${JSON.stringify(l)}`);
+        if (m[1] in out) throw new Error(`${label}: duplicate scope ${m[1]}`);
+        out[m[1]] = m[2];
+      } else if (/^\s*#/.test(l)) continue;
+      else break;
+    }
+    return out;
+  };
+  const topLines = lines.map((l, i) => [l, i]).filter(([l]) => /^permissions:/.test(l));
+  if (topLines.length !== 1 || !/^permissions:\s*$/.test(topLines[0][0])) throw new Error("top-level permissions: missing, repeated or not a block");
+  const top = block(topLines[0][1], 2, "top-level");
+  const jobsAt = lines.findIndex((l) => /^jobs:\s*$/.test(l));
+  if (jobsAt < 0) throw new Error("no jobs: section");
+  const ids = [];
+  for (let i = jobsAt + 1; i < lines.length; i++) {
+    if (/^\S/.test(lines[i]) && !/^#/.test(lines[i])) break; // next top-level key
+    const m = /^ {2}([A-Za-z0-9_-]+):\s*$/.exec(lines[i]);
+    if (m) ids.push([m[1], i]);
+  }
+  const jobs = {};
+  ids.forEach(([id, at], n) => {
+    const end = n + 1 < ids.length ? ids[n + 1][1] : lines.length;
+    const own = [];
+    for (let i = at + 1; i < end; i++) if (/^ {4}permissions:/.test(lines[i]) || /^ {1,3}permissions:/.test(lines[i])) own.push(i);
+    if (own.length > 1) throw new Error(`job ${id}: permissions: repeated`);
+    if (own.length === 0) jobs[id] = null;
+    else {
+      if (!/^ {4}permissions:\s*$/.test(lines[own[0]])) throw new Error(`job ${id}: permissions is not a block`);
+      jobs[id] = block(own[0], 6, `job ${id}`);
+    }
+  });
+  return { top, jobs };
+}
+
+const same = (a, b) => JSON.stringify(a === null ? null : Object.entries(a).sort()) === JSON.stringify(b === null ? null : Object.entries(b).sort());
+export function permissionFailures(text, expected) {
+  let got;
+  try {
+    got = parsePermissions(text);
+  } catch (e) {
+    return [`permissions could not be parsed (fail closed): ${e.message}`];
+  }
+  const f = [];
+  if (!same(got.top, expected.top)) f.push(`top-level permissions changed: ${JSON.stringify(got.top)}`);
+  const gotIds = Object.keys(got.jobs).sort();
+  const wantIds = Object.keys(expected.jobs).sort();
+  if (JSON.stringify(gotIds) !== JSON.stringify(wantIds)) f.push(`jobs changed: ${gotIds.join(",")} (expected ${wantIds.join(",")})`);
+  for (const id of wantIds) {
+    if (id in got.jobs && !same(got.jobs[id], expected.jobs[id])) f.push(`permissions of job ${id} changed: ${JSON.stringify(got.jobs[id])}`);
+  }
+  return f;
+}
+
 // --- static controls of worker-deploy.yml
 export function staticFailures(text) {
   const f = [];
@@ -77,7 +167,7 @@ export function staticFailures(text) {
     if (s.name === "Install dependencies" && /^ {8}env:/m.test(s.text)) f.push("env on an install step");
     if (s.name === "Install dependencies" && !s.text.includes("npm ci --ignore-scripts")) f.push("install without --ignore-scripts");
   }
-  if (!/^permissions:\n {2}contents: read\n/m.test(text)) f.push("top-level permissions changed");
+  f.push(...permissionFailures(text, PERMISSIONS["worker-deploy.yml"]));
   if (!/^concurrency:\n {2}group: worker-deploy\n {2}cancel-in-progress: false\n/m.test(text)) f.push("concurrency changed");
   // #292: nothing may deploy from the merge queue; the deploy workflow must not react to merge_group at all.
   if (text.split("\n").some((l) => !/^\s*#/.test(l) && l.includes("merge_group"))) f.push("the deploy workflow mentions merge_group outside a comment");
@@ -91,7 +181,7 @@ export function ciFailures(text) {
   if (!/^ {2}ci:\n {4}name: ci\n/m.test(text)) f.push("job id or name is not ci");
   if (/^ {4}if:/m.test(text)) f.push("job-level if on the ci job (it could report skipped)");
   if (!/^concurrency:\n {2}group: worker-ci-\$\{\{ github\.event_name \}\}-\$\{\{ github\.ref \}\}\n {2}cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}\n/m.test(text)) f.push("concurrency: a queue run could be cancelled");
-  if (!/^permissions:\n {2}contents: read\n/m.test(text)) f.push("top-level permissions changed");
+  f.push(...permissionFailures(text, PERMISSIONS["worker-ci.yml"]));
   const code = text.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
   if (/pull_request_target|secrets\.|^ {4}environment:/m.test(code)) f.push("pull_request_target, secrets or environment in worker-ci.yml");
   if (!text.includes("github.event.merge_group.base_sha") || !text.includes("github.event.merge_group.head_sha")) f.push("merge_group base/head not read");

@@ -5,7 +5,8 @@
 import { rmSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
-  ciFailures, ciFile, createRunner, createSandbox, deployFile, dynamicFailures, hostileTitleFailures, hostileTitles, mutations, readText, staticFailures, steps, tamperCases,
+  PERMISSIONS, ciFailures, ciFile, createRunner, createSandbox, deployFile, dynamicFailures, hostileTitleFailures, hostileTitles, mutations,
+  permissionFailures, readText, staticFailures, steps, tamperCases, versionFile,
 } from "./lib.mjs";
 
 const original = readText(deployFile);
@@ -59,6 +60,41 @@ describe("mutations of worker-deploy.yml are caught", () => {
       }
     }
     expect(caught).toBe(true);
+  });
+});
+
+// Exact permissions (top level and per job) of all three workflows, against the allowlist in lib.mjs. Each mutation
+// must make the check fail: an extra scope, a widened level, a block where there was none, or a form the parser does
+// not understand (fail closed).
+describe("workflow permissions are exact", () => {
+  const files = { "worker-ci.yml": ciFile, "worker-deploy.yml": deployFile, "version.yml": versionFile };
+  const texts = Object.fromEntries(Object.entries(files).map(([name, path]) => [name, readText(path)]));
+
+  it.each(Object.keys(files))("%s: top-level and per-job permissions match the allowlist exactly", (name) => {
+    expect(permissionFailures(texts[name], PERMISSIONS[name])).toEqual([]);
+  });
+
+  // Insert a permissions block at the top of a job (right after `  <id>:`).
+  const addJobBlock = (id, lines) => (t) => t.replace(new RegExp(`^  ${id}:\\n`, "m"), (m) => `${m}    permissions:\n${lines.map((l) => `      ${l}\n`).join("")}`);
+  const appendTop = (line) => (t) => t.replace(/^permissions:\n {2}contents: read\n/m, (m) => `${m}  ${line}\n`);
+  const mutationsOfPermissions = [
+    ["worker-ci.yml", "append id-token: write at top level", appendTop("id-token: write")],
+    ["worker-deploy.yml", "append id-token: write at top level", appendTop("id-token: write")],
+    ["version.yml", "append id-token: write at top level", appendTop("id-token: write")],
+    ["worker-deploy.yml", "top-level contents: write", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, "permissions:\n  contents: write\n")],
+    ["worker-deploy.yml", "top-level write-all (inline form, parser fails closed)", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, "permissions: write-all\n")],
+    ["worker-deploy.yml", "add contents: write to a job that has no block (deploy)", addJobBlock("deploy", ["contents: write"])],
+    ["worker-deploy.yml", "widen checks to write in a job that has none (deploy)", addJobBlock("deploy", ["checks: write"])],
+    ["version.yml", "add contents: write to a job that has no block (version)", addJobBlock("version", ["contents: write"])],
+    ["worker-ci.yml", "contents: write in the ci job", (t) => t.replace("      contents: read\n      checks: write\n", "      contents: write\n      checks: write\n")],
+    ["worker-ci.yml", "add pull-requests: write to the ci job", (t) => t.replace("      checks: write\n", "      checks: write\n      pull-requests: write\n")],
+    ["worker-deploy.yml", "widen pull-requests to write in plan", (t) => t.replace("      pull-requests: read", "      pull-requests: write")],
+    ["worker-deploy.yml", "widen contents to write in migrate", (t) => t.replace(/^( {2}migrate:\n[\s\S]*?\n {4}permissions:\n {6}contents: )read/m, "$1write")],
+  ];
+  it.each(mutationsOfPermissions)("%s: mutation is caught: %s", (name, _label, fn) => {
+    const mutated = fn(texts[name]);
+    expect(mutated, "the mutation pattern was not found (update this test)").not.toBe(texts[name]);
+    expect(permissionFailures(mutated, PERMISSIONS[name]).length).toBeGreaterThan(0);
   });
 });
 
