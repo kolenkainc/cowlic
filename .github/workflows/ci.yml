@@ -194,6 +194,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+      checks: write
     defaults:
       run:
         shell: bash
