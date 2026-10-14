@@ -1345,7 +1345,7 @@ jobs:
   release:
     name: release
     needs: [changes, lint, tests, ci, version, plan, ship]
-    if: ${{ !cancelled() && needs.ci.result == 'success' && needs.version.result == 'success' && needs.plan.result == 'success' && ((needs.plan.outputs.deploy != 'true' && needs.ship.result == 'skipped') || (needs.plan.outputs.deploy == 'true' && needs.ship.result == 'success')) && github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}
+    if: ${{ !cancelled() && needs.ci.result == 'success' && needs.version.result == 'success' && needs.plan.result == 'success' && ((needs.plan.outputs.deploy != 'true' && needs.ship.result == 'skipped') || (needs.plan.outputs.deploy == 'true')) && github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
