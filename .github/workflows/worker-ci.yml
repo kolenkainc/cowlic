@@ -138,6 +138,40 @@ jobs:
           if [ "$APPROVED" = "true" ]; then args+=(--approved); fi
           node scripts/lint-migrations.mjs "${args[@]}" "${added[@]}"
 
+      # #286: the linter gates destructive D1 migrations, and its own tests were wired nowhere. Runs exactly one
+      # file (deliberate: another *.test.mjs is not picked up silently). The node exit code fails the job on a
+      # failing test. The summary check below additionally fails it when the summary cannot be read, when
+      # pass != tests or fail != 0 (skipped, todo and cancelled tests), or when tests is below MIN_TESTS.
+      # MIN_TESTS: node:test counts a file that registers nothing as ONE passing test (tests 1, pass 1, exit 0),
+      # so "tests > 0" proves nothing. The floor is a pinned number below the real count (69 on 2026-10-14) so a
+      # few removals do not trip it but a mass loss does. It is NOT dynamic: raise it deliberately when tests
+      # are added, lower it deliberately when tests are removed on purpose.
+      # The reporter is explicit: the summary lines ("tests N", "pass N", "fail N") come from the spec reporter,
+      # not from the TTY-dependent default. sed runs with LC_ALL=C so the pattern does not depend on the locale.
+      - name: Migration lint tests
+        if: steps.changes.outputs.worker_changed == 'true'
+        env:
+          MIN_TESTS: "60"
+        run: |
+          status=0
+          node --test --test-reporter=spec scripts/lint-migrations.test.mjs > "$RUNNER_TEMP/lint-tests.txt" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/lint-tests.txt"
+          if [ "$status" -ne 0 ]; then
+            echo "migration lint tests failed (node exit $status)"
+            exit 1
+          fi
+          tests=$(LC_ALL=C sed -nE 's/^.* tests ([0-9]+)$/\1/p' "$RUNNER_TEMP/lint-tests.txt")
+          pass=$(LC_ALL=C sed -nE 's/^.* pass ([0-9]+)$/\1/p' "$RUNNER_TEMP/lint-tests.txt")
+          fail=$(LC_ALL=C sed -nE 's/^.* fail ([0-9]+)$/\1/p' "$RUNNER_TEMP/lint-tests.txt")
+          echo "summary: tests=$tests pass=$pass fail=$fail (floor $MIN_TESTS)"
+          case "$tests$pass$fail" in
+            "" | *[!0-9]*) echo "summary missing or not a single number per line"; exit 1 ;;
+          esac
+          if [ "$tests" -lt "$MIN_TESTS" ] || [ "$pass" != "$tests" ] || [ "$fail" != "0" ]; then
+            echo "too few tests (floor $MIN_TESTS) or summary not clean"
+            exit 1
+          fi
+
       # Expected: 35 PASS, 6 SKIPPED (stream checks need real Telegram), no secrets used.
       - name: Smoke test
         if: steps.changes.outputs.worker_changed == 'true'
