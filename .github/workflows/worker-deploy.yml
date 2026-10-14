@@ -45,8 +45,6 @@ on:
 permissions:
   contents: read
 
-  id-token: write
-
 # One deploy at a time, a running deploy is never cancelled (section 3 rule 5). A pending run replaced by a newer one
 # is fine: the newer run deploys a later master commit that contains the older one. A run whose commit is no longer
 # the master head still deploys when no worker/ file changed after it (see `plan`), so a docs-only merge right after a
