@@ -888,7 +888,8 @@ jobs:
     if: needs.plan.outputs.deploy == 'true' && (needs.plan.outputs.environment == 'production' || needs.plan.outputs.environment == 'production-destructive')
     runs-on: ubuntu-latest
     timeout-minutes: 40
-    environment: production
+    environment:
+      name: ${{ needs.plan.outputs.environment }}
     permissions:
       contents: read
     defaults:
