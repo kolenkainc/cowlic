@@ -1,4 +1,4 @@
--- Synthetic fixture for the "legacy schema" smoke run (scripts/smoke-ci.mjs): used on a database where only
+-- Synthetic fixture for the "legacy schema" smoke run (test/smoke): used on a database where only
 -- migrations 0001 and 0002 were applied, i.e. artists has NO image_file_id column (production before 0003).
 -- It documents and tests that the Worker still works against the old schema (deploy order rule).
 INSERT INTO artists (id, name) VALUES ('ar1', 'Test Artist');

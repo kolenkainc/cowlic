@@ -1,18 +1,25 @@
 import { defineConfig } from "vitest/config";
 
 // Plain Vitest (Node), no @cloudflare/vitest-pool-workers: see the decision in the PR of #285 (the pool pins its own
-// exact wrangler/miniflare and needs vitest 4). The Worker handler tests use stubs; the real-D1 checks stay in the
-// local-wrangler smoke test.
+// exact wrangler/miniflare and needs vitest 4). Three projects:
+//   unit      the Worker handler tests with stubbed D1 and Telegram (test/*.test.ts)
+//   workflow  regression tests of the deploy workflow's run blocks (bash child processes, test/workflow)
+//   smoke     the Worker on a REAL local D1 through wrangler's unstable_dev (real workerd, real SQL), once on the fully
+//             migrated schema and once on the legacy 0001+0002 schema (test/smoke); slow start, hence the timeouts
+// The run-level guards below are global (they are not project options).
 export default defineConfig({
   test: {
-    include: ["test/**/*.test.ts"],
-    environment: "node",
     // A run that collects zero tests fails (explicit, this is also the default), and so does a committed .only
     // (explicit: Vitest only enforces it on CI by default). Skipped tests are rejected by the CI step "Minimum test
-    // count" (the JUnit report has a skipped count): Vitest has no switch for that.
+    // count (Vitest)" (the JUnit report has a skipped count): Vitest has no switch for that.
     passWithNoTests: false,
     allowOnly: false,
-    restoreMocks: true,
-    unstubGlobals: true,
+    // The smoke tests start wrangler, which prints a lot: show console output of failing tests only.
+    silent: "passed-only",
+    projects: [
+      { test: { name: "unit", environment: "node", include: ["test/*.test.ts"], restoreMocks: true, unstubGlobals: true } },
+      { test: { name: "workflow", environment: "node", include: ["test/workflow/*.test.mjs"], testTimeout: 30_000 } },
+      { test: { name: "smoke", environment: "node", include: ["test/smoke/*.test.mjs"], testTimeout: 60_000, hookTimeout: 180_000 } },
+    ],
   },
 });

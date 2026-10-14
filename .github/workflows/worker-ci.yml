@@ -20,7 +20,7 @@ on:
       - ".github/workflows/worker-ci.yml"
   # #292: the master ruleset has a merge queue and requires `ci`; the queue sends merge_group (checks_requested)
   # and waits for the required check on the gh-readonly-queue/* commit. No path filter: `ci` must always report.
-  # This workflow never deploys; worker-deploy.yml must NOT get this trigger (asserted by workflow-check.mjs).
+  # This workflow never deploys; worker-deploy.yml must NOT get this trigger (asserted by test/workflow).
   merge_group:
     types: [checks_requested]
 
@@ -95,9 +95,8 @@ jobs:
           fi
           echo "BASE_SHA=$base" >> "$GITHUB_ENV"
 
-      # worker_changed = any file under worker/ or this workflow or worker-deploy.yml (checked by the "Workflow checks"
-# step, #272) differs from the base. Fail closed: no base or a
-      # git failure means true. The pathspecs are :(top)-anchored because the job runs in worker/.
+      # worker_changed = any file under worker/ or this workflow or worker-deploy.yml (checked by the workflow tests of
+      # "Vitest tests", #272) differs from the base. Fail closed: no base or a git failure means true. The pathspecs are :(top)-anchored because the job runs in worker/.
       - name: Detect worker changes
         id: changes
         run: |
@@ -125,7 +124,7 @@ jobs:
           node-version: 22
           package-manager-cache: false # no cache at all (section 6)
 
-      # Plain npm ci: this job has no secrets, and the smoke test needs the workerd install script (section 4.2 item 6).
+      # Plain npm ci: this job has no secrets, and the smoke tests need the workerd install script (section 4.2 item 6).
       - name: Install dependencies
         if: steps.changes.outputs.worker_changed == 'true'
         run: npm ci
@@ -220,7 +219,9 @@ jobs:
             exit 1
           fi
 
-      # #285: Vitest (plain, Node, stubbed D1 and Telegram) runs the paging, log-leak and CORS tests of worker/test.
+      # #285: Vitest runs everything under worker/test in three projects: unit (paging, log-leak, CORS with stubbed D1
+      # and Telegram), workflow (the run blocks of worker-deploy.yml, hostile titles, mutations; needs bash) and smoke
+      # (the Worker on a REAL local D1 via wrangler, migrated and legacy schema; fake credentials, no secrets).
       # Two reporters: default to stdout and junit to a file under RUNNER_TEMP (read by the report step below). The
       # exit code of vitest is the verdict of THIS step: a failing test, zero collected tests (passWithNoTests
       # false) and a committed .only (allowOnly false) all fail it. No PR context: works on merge_group too.
@@ -246,13 +247,13 @@ jobs:
 
       # Vitest has no switch against skipped tests and no minimum count, so both are checked here on the numeric
       # outputs of the report step (no text parsing): skipped must be 0 (a skipped test is a silently dropped check)
-      # and passed must reach MIN_TESTS, a pinned number below the real count (106 on 2026-10-14) so one or two
-      # removals do not trip it but a mass loss does. NOT dynamic: raise it deliberately when tests are added,
-      # lower it deliberately when tests are removed on purpose.
+      # and passed must reach MIN_TESTS, a pinned number just below the real count (246 on 2026-10-14: 106 unit,
+      # 43 workflow, 51 + 46 smoke) so one or two removals do not trip it but a lost file or area does. NOT dynamic:
+      # raise it deliberately when tests are added, lower it deliberately when tests are removed on purpose.
       - name: Minimum test count (Vitest)
         if: ${{ steps.vitest.outcome == 'success' }}
         env:
-          MIN_TESTS: "95"
+          MIN_TESTS: "240"
           PASSED: ${{ steps.vitest_report.outputs.passed }}
           SKIPPED: ${{ steps.vitest_report.outputs.skipped }}
         run: |
@@ -268,15 +269,3 @@ jobs:
             echo "too few passed tests: a test file registers nothing or tests were lost"
             exit 1
           fi
-
-      # Expected: 51 PASS and 6 SKIPPED (stream checks need real Telegram) on the migrated schema, 46 PASS on the
-      # legacy schema; no secrets used. Moves to Vitest in a later part of #285.
-      - name: Smoke test
-        if: steps.changes.outputs.worker_changed == 'true'
-        run: npm run smoke:ci
-
-      # #272: regression test of the run blocks of worker-deploy.yml (hostile commit titles, tampered inputs, no
-      # expression in run blocks, in-memory mutations that must be caught). No network, no secrets.
-      - name: Workflow checks
-        if: steps.changes.outputs.worker_changed == 'true'
-        run: node scripts/workflow-check.mjs
