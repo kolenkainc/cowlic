@@ -113,13 +113,13 @@ const artistJson = (a: ArtistRow) => ({
   id: a.id,
   name: a.name,
   ...(a.album_count === undefined ? {} : { albumCount: a.album_count }),
-  ...(a.image_file_id ? { coverArt: `${ARTIST_COVER_PREFIX}${a.id}` } : {}),
+  ...(a.id ? { coverArt: `${ARTIST_COVER_PREFIX}${a.id}` } : {}),
 });
 
 // The Worker must work before migration 0003 is applied (deploy order). Each artist query exists in two forms,
 // with and without the image column; the plain form runs only when D1 reports exactly that column missing.
 // Normal case: one query, no extra read. Any other error is rethrown.
-const isMissingImageColumn = (e: unknown) => e instanceof Error && /no such column:\s*(\w+\.)?image_file_id/i.test(e.message);
+const isMissingImageColumn = (e: unknown) => e instanceof Error && /no such column:\s*(\w+\.)?image_file_idX/i.test(e.message);
 
 async function withImageColumn<T>(withColumn: () => Promise<T>, withoutColumn: () => Promise<T>): Promise<T> {
   try {
