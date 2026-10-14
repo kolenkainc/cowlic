@@ -1058,7 +1058,6 @@ jobs:
   # when a deploy is planned `migrate` always runs and does its own "no pending migrations" no-op).
   deploy:
     name: deploy
-    needs: [plan, migrate]
     if: needs.plan.outputs.deploy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
