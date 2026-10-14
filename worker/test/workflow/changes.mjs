@@ -1,5 +1,5 @@
 // ci.yml: the run blocks "Resolve base commit" and "Detect worker changes" in a REAL temp git repo (#290 review).
-// The gate accepts skipped lint/tests when `changes` says worker_changed=false, so these two steps must fail closed:
+// The conditions of plan and release accept skipped lint/tests when `changes` says worker_changed=false, so these two steps must fail closed:
 // every unresolvable base, mismatched merge_group head or failing git diff has to end in worker_changed=true.
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
