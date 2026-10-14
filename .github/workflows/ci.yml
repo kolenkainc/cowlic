@@ -74,7 +74,7 @@ permissions:
 # pull_request -> per PR ref; any other run (merge_group, a dispatch from another ref) -> its own run id, so a queue run
 # is never cancelled or replaced and a dispatch from a feature branch can never take the place of a pending deploy run.
 concurrency:
-  group: ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'ci-push' || format('ci-{0}-{1}', github.event_name, github.event_name == 'pull_request' && github.ref || github.run_id) }}
+  group: ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'worker-deploy' || format('ci-{0}-{1}', github.event_name, github.event_name == 'pull_request' && github.ref || github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' && contains(fromJSON('["opened","reopened","synchronize"]'), github.event.action) }}
 
 jobs:
