@@ -44,6 +44,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 # One deploy at a time, a running deploy is never cancelled (section 3 rule 5). A pending run replaced by a newer one
 # is fine: the newer run deploys a later master commit that contains the older one. A run whose commit is no longer
@@ -636,6 +637,8 @@ jobs:
   # cancelled migrate job skips this job; so does a skipped one (nothing here treats a skipped migrate as a no-op:
   # when a deploy is planned `migrate` always runs and does its own "no pending migrations" no-op).
   deploy:
+    permissions:
+      checks: write
     name: deploy
     needs: [plan, migrate]
     if: needs.plan.outputs.deploy == 'true'
