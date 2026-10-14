@@ -395,7 +395,7 @@ jobs:
 
       # No secrets in this step's environment: install scripts of dependencies never see the token.
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       # Same step as in `deploy` (section 4.2): validate, mask, substitute. Never printed.
       - name: Write runner-local wrangler config
@@ -659,7 +659,7 @@ jobs:
 
       # No secrets in this step's environment: install scripts of dependencies never see the token.
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       # Section 4.2. Validate first (allowlist, whole value, nothing echoed), mask second, substitute third.
       # wrangler.toml keeps its placeholder; wrangler.ci.toml (gitignored) lives next to it because wrangler resolves
