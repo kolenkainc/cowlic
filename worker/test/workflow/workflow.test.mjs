@@ -8,12 +8,12 @@ import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
-  PERMISSIONS, SHIP_STEPS, ciFailures, ciFile, createRunner, createSandbox, dynamicFailures, hostileTitleFailures, hostileTitles, jobBlock, mutations,
+  PERMISSIONS, SHIP_STEPS, changesStepFailures, ciFailures, ciFile, createRunner, createSandbox, dynamicFailures, hostileTitleFailures, hostileTitles, jobBlock, mutations,
   parsePermissions, permissionFailures, readText, shipFailures, staticFailures, stepHash, steps, tamperCases,
 } from "./lib.mjs";
 import { baseCaseFailures, baseCases, baseMutations, createBaseRunner, envCaseFailures, shipOrderCaseFailures, shipOrderCases } from "./ship.mjs";
 import { createReleaseRunner, createVersionRunner, hostileCases, releaseCaseFailures, releaseCases, releaseConditionFailures, releaseMutations, versionCaseFailures, versionCases, versionMutations } from "./release.mjs";
-import { changesCaseFailures, changesCases, changesMutations, createChangesRunner, createScopeRunner, scopeCaseFailures, scopeCases, scopeMutations } from "./changes.mjs";
+import { changesCaseFailures, changesCases, changesMutations, createChangesRunner, createScopeRunner, createValidateRunner, scopeCaseFailures, scopeCases, scopeMutations, validateCaseFailures, validateCases, validateMutations } from "./changes.mjs";
 
 const ci = readText(ciFile);
 const original = ci; // the deploy jobs live in ci.yml
@@ -387,6 +387,50 @@ describe("ci.yml: Resolve base commit and Detect worker changes", () => {
     expect(mutated, `the mutation pattern was not found: ${name}`).not.toBe(ci);
     const runner = createChangesRunner(mutated, sandbox);
     expect(changesCases.flatMap((c) => changesCaseFailures(runner, c)).length).toBeGreaterThan(0);
+  });
+});
+
+// #307: `changes` fails closed. A skipped required job counts as passed, so a successful `changes` with an invalid output
+// would let lint and tests be skipped unchecked: its last step must turn every invalid output into a red job.
+describe("ci.yml: changes fails closed (Validate outputs)", () => {
+  let validateRunner;
+  beforeAll(() => {
+    validateRunner = createValidateRunner(ci, sandbox);
+  });
+  it.each(validateCases.map((c) => [c[0], c]))("%s", (_name, c) => {
+    expect(validateCaseFailures(validateRunner, c)).toEqual([]);
+  });
+  it.each(validateMutations)("run block mutation is caught: %s", (name, fn) => {
+    const mutated = fn(ci);
+    expect(mutated, `the mutation pattern was not found: ${name}`).not.toBe(ci);
+    let caught;
+    try {
+      const runner = createValidateRunner(mutated, sandbox);
+      caught = validateCases.flatMap((c) => validateCaseFailures(runner, c)).length > 0;
+    } catch {
+      caught = true;
+    }
+    expect(caught).toBe(true);
+  });
+  it("the real file passes the static shape check", () => {
+    expect(changesStepFailures(ci)).toEqual([]);
+  });
+  const validationStep = steps(jobBlock(ci, "changes")).find((s) => s.name === "Validate outputs (fail closed)");
+  it.each([
+    ["the validation step is removed", (t) => t.replace(`${validationStep.text}\n`, "")],
+    ["the validation step is renamed", (t) => t.replace("Validate outputs (fail closed)", "Check outputs")],
+    ["the validation step has if: always()", (t) => t.replace("      - name: Validate outputs (fail closed)\n", "      - name: Validate outputs (fail closed)\n        if: always()\n")],
+    ["the validation step has continue-on-error", (t) => t.replace("      - name: Validate outputs (fail closed)\n", "      - name: Validate outputs (fail closed)\n        continue-on-error: true\n")],
+    ["a step is added after the validation step", (t) => t.replace(`${validationStep.text}\n`, `${validationStep.text}\n\n      - name: Extra\n        run: echo hi\n`)],
+    ["the validation step reads the wrong output", (t) => t.replace("OUT_BASE_SHA: ${{ steps.base.outputs.base_sha }}", "OUT_BASE_SHA: ${{ steps.base.outputs.other }}")],
+    ["the validation step reads worker_changed from the wrong step", (t) => t.replace("OUT_WORKER_CHANGED: ${{ steps.changes.outputs.worker_changed }}", "OUT_WORKER_CHANGED: ${{ steps.base.outputs.worker_changed }}")],
+    ["the validation step gets a third env entry", (t) => t.replace("          OUT_BASE_SHA: ${{ steps.base.outputs.base_sha }}\n", "          OUT_BASE_SHA: ${{ steps.base.outputs.base_sha }}\n          OUT_X: y\n")],
+    ["a step of changes becomes conditional", (t) => t.replace("      - name: Detect worker changes\n        id: changes\n", "      - name: Detect worker changes\n        id: changes\n        if: ${{ github.event_name != 'merge_group' }}\n")],
+  ])("static check catches: %s", (_label, fn) => {
+    const mutated = fn(ci);
+    expect(mutated).not.toBe(ci);
+    expect(changesStepFailures(mutated).length).toBeGreaterThan(0);
+    expect(ciFailures(mutated).length).toBeGreaterThan(0);
   });
 });
 
