@@ -1,6 +1,6 @@
 // CORS for browser clients (#283). Exact-match allowlist of origins: public values, not secrets.
 // To allow another client, add its exact origin string (scheme + host + port, no trailing slash) here and add a
-// test for it in scripts/cors-check.mjs. Never add a wildcard and never reflect the request Origin without this list.
+// test for it in test/cors.test.ts. Never add a wildcard and never reflect the request Origin without this list.
 export const ALLOWED_ORIGINS: readonly string[] = ["https://feishin.vercel.app"];
 
 // Feishin sends Content-Type: application/json (a non-simple header, hence the preflight), no Authorization header and

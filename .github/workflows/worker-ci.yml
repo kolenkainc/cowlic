@@ -220,7 +220,57 @@ jobs:
             exit 1
           fi
 
-      # Expected: 35 PASS, 6 SKIPPED (stream checks need real Telegram), no secrets used.
+      # #285: Vitest (plain, Node, stubbed D1 and Telegram) runs the paging, log-leak and CORS tests of worker/test.
+      # Two reporters: default to stdout and junit to a file under RUNNER_TEMP (read by the report step below). The
+      # exit code of vitest is the verdict of THIS step: a failing test, zero collected tests (passWithNoTests
+      # false) and a committed .only (allowOnly false) all fail it. No PR context: works on merge_group too.
+      - name: Vitest tests
+        id: vitest
+        if: steps.changes.outputs.worker_changed == 'true'
+        run: |
+          npx vitest run --reporter=default --reporter=junit --outputFile.junit="$RUNNER_TEMP/vitest.xml"
+
+      # Same pinned action and options as "Test Report" above, its own check run (the minimum below is per runner).
+      - name: Test Report (Vitest)
+        id: vitest_report
+        if: ${{ !cancelled() && (steps.vitest.outcome == 'success' || steps.vitest.outcome == 'failure') }}
+        continue-on-error: ${{ github.event.pull_request.head.repo.fork == true }}
+        uses: mikepenz/action-junit-report@a9170d5795813c01ab4901ffb045b52bab4ab09d # v6.5.0
+        with:
+          report_paths: ${{ runner.temp }}/vitest.xml
+          check_name: Test Report (Vitest)
+          fail_on_failure: true
+          fail_on_parse_error: true
+          require_tests: true
+          comment: false
+
+      # Vitest has no switch against skipped tests and no minimum count, so both are checked here on the numeric
+      # outputs of the report step (no text parsing): skipped must be 0 (a skipped test is a silently dropped check)
+      # and passed must reach MIN_TESTS, a pinned number below the real count (106 on 2026-10-14) so one or two
+      # removals do not trip it but a mass loss does. NOT dynamic: raise it deliberately when tests are added,
+      # lower it deliberately when tests are removed on purpose.
+      - name: Minimum test count (Vitest)
+        if: ${{ steps.vitest.outcome == 'success' }}
+        env:
+          MIN_TESTS: "95"
+          PASSED: ${{ steps.vitest_report.outputs.passed }}
+          SKIPPED: ${{ steps.vitest_report.outputs.skipped }}
+        run: |
+          case "$PASSED$SKIPPED" in
+            "" | *[!0-9]*) echo "passed/skipped count missing or not a number: '$PASSED' '$SKIPPED'"; exit 1 ;;
+          esac
+          echo "passed=$PASSED skipped=$SKIPPED (floor $MIN_TESTS)"
+          if [ "$SKIPPED" -ne 0 ]; then
+            echo "skipped tests are not allowed: remove the test or fix it"
+            exit 1
+          fi
+          if [ "$PASSED" -lt "$MIN_TESTS" ]; then
+            echo "too few passed tests: a test file registers nothing or tests were lost"
+            exit 1
+          fi
+
+      # Expected: 51 PASS and 6 SKIPPED (stream checks need real Telegram) on the migrated schema, 46 PASS on the
+      # legacy schema; no secrets used. Moves to Vitest in a later part of #285.
       - name: Smoke test
         if: steps.changes.outputs.worker_changed == 'true'
         run: npm run smoke:ci
