@@ -379,7 +379,7 @@ describe("ci.yml reports changes, lint and tests on pull_request, push and merge
   });
 });
 
-// The steps that decide worker_changed, which the gate trusts: run in a real temp git repo, fail closed (#290 review).
+// The steps that decide worker_changed, which the conditions of plan and release trust: run in a real temp git repo, fail closed (#290 review).
 describe("ci.yml: Resolve base commit and Detect worker changes", () => {
   let changesRunner;
   beforeAll(() => {

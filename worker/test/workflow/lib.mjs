@@ -246,7 +246,7 @@ export function staticFailures(text) {
       if (s.name === "Install dependencies" && !s.text.includes("npm ci --ignore-scripts")) f.push(`install without --ignore-scripts in ${id}`);
     }
   }
-  // Job graph and conditions (ORDER RULE, #287: deploy needs lint, tests and the gate; never pull_request or merge_group).
+  // Job graph and conditions (ORDER RULE, #287: deploy needs changes, lint and tests; never pull_request or merge_group).
   const block = Object.fromEntries(DEPLOY_JOBS.map((id) => [id, jobBlock(text, id)]));
   for (const id of DEPLOY_JOBS) if (block[id] === null) f.push(`job ${id} is missing`);
   const line = (id, re) => re.test(block[id] ?? "");
