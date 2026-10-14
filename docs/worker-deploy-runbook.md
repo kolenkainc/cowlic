@@ -8,7 +8,7 @@ All wrangler commands run from `worker/` on the owner's machine with `-c wrangle
 
 ## 1. What a merge to master does
 
-A squash merge to master that touches `worker/**` starts "Worker deploy" by itself [V trigger `push` with path filter]. Docs-only, ingest-only and `.github/` merges start nothing, and so does a tag [V]. `workflow_dispatch` (Actions -> Worker deploy -> Run workflow, branch `master`) does the same thing for the current master head; it is the way to re-run or to deploy without a worker/ change [V]. One run at a time: group `worker-deploy`, a running run is never cancelled, one pending run is kept and a newer one replaces it [V concurrency block; replacement behaviour [R]].
+A squash merge to master that touches `worker/**` starts "Worker deploy" by itself [V trigger `push` with path filter]. Docs-only, ingest-only and `.github/` merges start nothing, and so does a tag [V]. A merge through the merge queue is an ordinary push to master (the queue's squash commit), so the same rules apply; the deploy workflow has no `merge_group` trigger and nothing deploys from a queue run [V worker-cicd.md section 12.1, #292]. `workflow_dispatch` (Actions -> Worker deploy -> Run workflow, branch `master`) does the same thing for the current master head; it is the way to re-run or to deploy without a worker/ change [V]. One run at a time: group `worker-deploy`, a running run is never cancelled, one pending run is kept and a newer one replaces it [V concurrency block; replacement behaviour [R]].
 
 Before the merge: `Worker CI / ci` (typecheck, migration lint, immutability, CI-safe smoke; no secrets, no deploy) and the `pr-reviewer` label `review-completed` [V worker-cicd.md section 2].
 

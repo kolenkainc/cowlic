@@ -73,6 +73,23 @@ function staticFailures(text) {
   }
   if (!/^permissions:\n {2}contents: read\n/m.test(text)) f.push("top-level permissions changed");
   if (!/^concurrency:\n {2}group: worker-deploy\n {2}cancel-in-progress: false\n/m.test(text)) f.push("concurrency changed");
+  // #292: nothing may deploy from the merge queue; the deploy workflow must not react to merge_group at all.
+  if (text.split("\n").some((l) => !/^\s*#/.test(l) && l.includes("merge_group"))) f.push("the deploy workflow mentions merge_group outside a comment");
+  return f;
+}
+
+// --- #292: worker-ci.yml must report the required check `ci` on the merge queue
+const ciFile = join(workerDir, "../.github/workflows/worker-ci.yml");
+function ciFailures(text) {
+  const f = [];
+  if (!/^on:\n(?:[ #].*\n|\n)*? {2}merge_group:\n {4}types: \[checks_requested\]\n/m.test(text)) f.push("worker-ci.yml has no merge_group trigger with types [checks_requested]");
+  if (!/^ {2}ci:\n {4}name: ci\n/m.test(text)) f.push("job id or name is not ci");
+  if (/^ {4}if:/m.test(text)) f.push("job-level if on the ci job (it could report skipped)");
+  if (!/^concurrency:\n {2}group: worker-ci-\$\{\{ github\.event_name \}\}-\$\{\{ github\.ref \}\}\n {2}cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}\n/m.test(text)) f.push("concurrency: a queue run could be cancelled");
+  if (!/^permissions:\n {2}contents: read\n/m.test(text)) f.push("top-level permissions changed");
+  const code = text.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
+  if (/pull_request_target|secrets\.|^ {4}environment:/m.test(code)) f.push("pull_request_target, secrets or environment in worker-ci.yml");
+  if (!text.includes("github.event.merge_group.base_sha") || !text.includes("github.event.merge_group.head_sha")) f.push("merge_group base/head not read");
   return f;
 }
 
@@ -203,6 +220,18 @@ try {
     }
     check(`mutation is caught: ${name}`, caught);
   }
+
+  // #292: worker-ci.yml reports `ci` on merge_group; two mutations must be caught.
+  const ci = readFileSync(ciFile, "utf8");
+  const cf = ciFailures(ci);
+  check("worker-ci.yml: merge_group trigger, job ci always reporting, concurrency, permissions, no secrets", cf.length === 0, cf.join("; "));
+  const noMergeGroup = ci.replace("  merge_group:\n    types: [checks_requested]\n", "");
+  check("mutation applies: worker-ci without merge_group", noMergeGroup !== ci, "the trigger text was not found (update this test)");
+  check("mutation is caught: worker-ci without merge_group", noMergeGroup !== ci && ciFailures(noMergeGroup).length > 0);
+  const deployMg = original.replace("  workflow_dispatch:\n", "  workflow_dispatch:\n  merge_group:\n    types: [checks_requested]\n");
+  check("mutation applies: deploy workflow with merge_group", deployMg !== original, "the workflow_dispatch trigger was not found (update this test)");
+  check("mutation is caught: deploy workflow with merge_group", deployMg !== original && staticFailures(deployMg).length > 0);
+  check("the unmodified deploy workflow has no merge_group trigger", !staticFailures(original).some((x) => x.includes("merge_group")));
 } finally {
   rmSync(tmp, { recursive: true, force: true });
 }
