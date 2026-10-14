@@ -1,16 +1,17 @@
-// Regression tests of .github/workflows/ci.yml (#290, #292): the gate `ci`, the triggers incl. merge_group, permissions,
+// Regression tests of .github/workflows/ci.yml (#290, #292, #307): no aggregating job, the required jobs changes, lint and
+// tests, the conditions of plan and release, the triggers incl. merge_group, permissions,
 // secrets only in the deploy jobs, and the deploy jobs plan/migrate/deploy (#272; they were worker-deploy.yml until #290
 // part 2); was scripts/workflow-check.mjs. No network, no secrets; needs bash. The logic is in ./lib.mjs.
 // The mutation tests keep the repo's mutation-check practice: each in-memory mutation of the workflow text must be
 // caught by the static or the dynamic checks, so a weakened check turns a test red.
 import { existsSync, rmSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
-  PERMISSIONS, SHIP_STEPS, changesStepFailures, ciFailures, ciFile, createRunner, createSandbox, dynamicFailures, hostileTitleFailures, hostileTitles, jobBlock, mutations,
+  GATE_EXPR, PERMISSIONS, SHIP_STEPS, changesStepFailures, ciFailures, ciFile, createRunner, createSandbox, dynamicFailures, hostileTitleFailures, hostileTitles, jobBlock, mutations,
   parsePermissions, permissionFailures, readText, shipFailures, staticFailures, stepHash, steps, tamperCases,
 } from "./lib.mjs";
+import { planConditionFailures } from "./gate.mjs";
 import { baseCaseFailures, baseCases, baseMutations, createBaseRunner, envCaseFailures, shipOrderCaseFailures, shipOrderCases } from "./ship.mjs";
 import { createReleaseRunner, createVersionRunner, hostileCases, releaseCaseFailures, releaseCases, releaseConditionFailures, releaseMutations, versionCaseFailures, versionCases, versionMutations } from "./release.mjs";
 import { changesCaseFailures, changesCases, changesMutations, createChangesRunner, createScopeRunner, createValidateRunner, scopeCaseFailures, scopeCases, scopeMutations, validateCaseFailures, validateCases, validateMutations } from "./changes.mjs";
@@ -109,7 +110,8 @@ describe("workflow permissions are exact", () => {
     ["ci.yml", "widen checks to write in a job that has none (ship)", addJobBlock("ship", ["checks: write"])],
     ["ci.yml", "add contents: write to a job that has no block (version)", addJobBlock("version", ["contents: write"])],
     ["ci.yml", "add contents: write to a job that has no block (lint)", addJobBlock("lint", ["contents: write"])],
-    ["ci.yml", "add checks: write to the gate (ci), which has no block", addJobBlock("ci", ["checks: write"])],
+    ["ci.yml", "add checks: write to the job changes, which has no block", addJobBlock("changes", ["checks: write"])],
+    ["ci.yml", "a job ci with a write block is back", (t) => t.replace(/^jobs:\n/m, (m) => `${m}  ci:\n    permissions:\n      contents: write\n`)],
     ["ci.yml", "contents: write in the tests job", (t) => t.replace("      contents: read\n      checks: write\n", "      contents: write\n      checks: write\n")],
     ["ci.yml", "add pull-requests: write to the tests job", (t) => t.replace("      checks: write\n", "      checks: write\n      pull-requests: write\n")],
     ["ci.yml", "widen pull-requests to write in plan", (t) => t.replace("      pull-requests: read", "      pull-requests: write")],
@@ -175,57 +177,54 @@ describe("the permissions parser throws on forms it cannot read", () => {
   });
 });
 
-describe("ci.yml reports `ci` on pull_request, push and merge_group (#290, #292)", () => {
+describe("ci.yml reports changes, lint and tests on pull_request, push and merge_group; no aggregating job (#290, #292, #307)", () => {
   it("the old version.yml and worker-ci.yml are gone (no duplicate runners)", () => {
     expect(existsSync(join(ciFile, "../version.yml"))).toBe(false);
     expect(existsSync(join(ciFile, "../worker-ci.yml"))).toBe(false);
   });
-  it("triggers without filters, the always-running gate ci, concurrency, permissions, no secrets", () => {
+  it("triggers without filters, exactly the jobs changes/lint/tests/version/plan/ship/release (no ci), conditions, concurrency, permissions, no secrets", () => {
     expect(ciFailures(ci)).toEqual([]);
   });
-  it("the stages exist with their id equal to their name", () => {
-    for (const id of ["changes", "lint", "tests", "version", "ci"]) expect(ci).toMatch(new RegExp(`^ {2}${id}:\\n {4}name: ${id}\\n`, "m"));
+  it("the stages exist with their id equal to their name, and no job ci exists", () => {
+    for (const id of ["changes", "lint", "tests", "version"]) expect(ci).toMatch(new RegExp(`^ {2}${id}:\\n {4}name: ${id}\\n`, "m"));
+    expect(jobBlock(ci, "ci")).toBeNull();
+    expect(ci).not.toMatch(/needs\.ci\b/);
+    expect(ci).not.toMatch(/^ {4}needs:.*\bci\b/m);
   });
-  // Behaviour of the gate: its run block under bash with the results of the needed jobs in the environment.
-  describe("the gate aggregates the results", () => {
-    const gate = steps(ci).find((s) => s.name === "Aggregate results")?.run;
-    const run = (changes, workerChanged, lint, tests) =>
-      spawnSync("bash", ["-eo", "pipefail", "-c", gate], {
-        env: { PATH: "/usr/bin:/bin", CHANGES_RESULT: changes, WORKER_CHANGED: workerChanged, LINT_RESULT: lint, TESTS_RESULT: tests },
-        encoding: "utf8",
-      }).status;
-    it.each([
-      ["worker changed, lint and tests green", ["success", "true", "success", "success"], 0],
-      ["nothing changed, lint and tests skipped", ["success", "false", "skipped", "skipped"], 0],
-      ["nothing changed, jobs ran anyway and are green", ["success", "false", "success", "success"], 0],
-      ["worker changed but lint was skipped", ["success", "true", "skipped", "success"], 1],
-      ["worker changed but tests were skipped", ["success", "true", "success", "skipped"], 1],
-      ["lint failed", ["success", "true", "failure", "success"], 1],
-      ["tests failed", ["success", "true", "success", "failure"], 1],
-      ["tests cancelled", ["success", "true", "success", "cancelled"], 1],
-      ["nothing changed but a skipped-looking failure", ["success", "false", "failure", "skipped"], 1],
-      ["changes failed (lint and tests skipped as a consequence)", ["failure", "true", "skipped", "skipped"], 1],
-      ["changes cancelled", ["cancelled", "false", "skipped", "skipped"], 1],
-      ["worker_changed output missing", ["success", "", "skipped", "skipped"], 1],
-      ["worker_changed output invalid", ["success", "maybe", "success", "success"], 1],
-    ])("%s", (_label, args, status) => {
-      expect(gate, "the gate run block was not found").toBeTypeOf("string");
-      expect(run(...args)).toBe(status);
-    });
+  it("lint and tests have no event condition: they run on pull_request, push and merge_group", () => {
+    for (const id of ["lint", "tests"]) {
+      const ifs = jobBlock(ci, id).split("\n").filter((l) => /^ {4}if:/.test(l));
+      expect(ifs).toEqual(["    if: ${{ needs.changes.outputs.worker_changed == 'true' }}"]);
+    }
   });
   const prTypes ="    types: [opened, synchronize, reopened, labeled, unlabeled]\n";
   const ciMutations = [
     ["ci without merge_group", (t) => t.replace("  merge_group:\n    types: [checks_requested]\n", "")],
     ["merge_group with another type", (t) => t.replace("types: [checks_requested]", "types: [destroyed]")],
-    ["ci gate removed", (t) => t.replace(/^ {2}ci:\n(?: {4}.*\n| *#.*\n|\n)*/m, "")],
-    ["ci gate renamed (job id and name)", (t) => t.replace("  ci:\n    name: ci\n", "  gate:\n    name: gate\n")],
-    ["ci gate name changed (id kept)", (t) => t.replace("  ci:\n    name: ci\n", "  ci:\n    name: ci-gate\n")],
-    ["ci job with a pull_request-only if", (t) => t.replace("    if: ${{ always() }}\n", "    if: ${{ github.event_name == 'pull_request' }}\n")],
-    ["ci job with always() and another condition", (t) => t.replace("    if: ${{ always() }}\n", "    if: ${{ always() && github.event_name != 'merge_group' }}\n")],
-    ["ci job without an if (skipped when a needed job fails)", (t) => t.replace("    if: ${{ always() }}\n", "")],
-    ["ci job with a second if", (t) => t.replace("    if: ${{ always() }}\n", "    if: ${{ always() }}\n    if: ${{ true }}\n")],
-    ["ci gate without needs on tests", (t) => t.replace("needs: [changes, lint, tests]", "needs: [changes, lint]")],
-    ["ci gate with continue-on-error", (t) => t.replace("    if: ${{ always() }}\n", "    if: ${{ always() }}\n    continue-on-error: true\n")],
+    // #307: the aggregating job is gone and must not come back; the required jobs are the real ones.
+    ["a job ci is reintroduced (the aggregating gate)", (t) => t.replace("  plan:\n    name: plan\n", "  ci:\n    name: ci\n    needs: [changes, lint, tests]\n    if: ${{ always() }}\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n\n  plan:\n    name: plan\n")],
+    ["a job ci is reintroduced and plan needs it again", (t) => t.replace("  plan:\n    name: plan\n    needs: [changes, lint, tests]\n", "  ci:\n    name: ci\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n\n  plan:\n    name: plan\n    needs: [changes, lint, tests, ci]\n")],
+    ["a needs.ci reference in the condition of plan", (t) => t.replace("${{ !cancelled() && needs.changes.result == 'success' && ((needs.changes.outputs.worker_changed == 'true' && needs.lint.result == 'success' && needs.tests.result == 'success') || (needs.changes.outputs.worker_changed == 'false' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') && (needs.tests.result == 'success' || needs.tests.result == 'skipped'))) && github.repository", "${{ !cancelled() && needs.ci.result == 'success' && github.repository")],
+    ["the job changes is renamed (the required context would never report)", (t) => t.replace("  changes:\n    name: changes\n", "  changes:\n    name: detect\n")],
+    ["the job lint is renamed (the required context would never report)", (t) => t.replace("  lint:\n    name: lint\n", "  lint:\n    name: lint-job\n")],
+    ["the job tests is renamed (the required context would never report)", (t) => t.replace("  tests:\n    name: tests\n", "  tests:\n    name: unit-tests\n")],
+    ["changes with an event condition (no report on merge_group)", (t) => t.replace("  changes:\n    name: changes\n", "  changes:\n    name: changes\n    if: ${{ github.event_name != 'merge_group' }}\n")],
+    ["changes with continue-on-error", (t) => t.replace("  changes:\n    name: changes\n", "  changes:\n    name: changes\n    continue-on-error: true\n")],
+    ["lint with an event condition (skipped on merge_group, which counts as passed)", (t) => t.replace("  lint:\n    name: lint\n    needs: changes\n    if: ${{ needs.changes.outputs.worker_changed == 'true' }}\n", "  lint:\n    name: lint\n    needs: changes\n    if: ${{ needs.changes.outputs.worker_changed == 'true' && github.event_name != 'merge_group' }}\n")],
+    ["lint with continue-on-error (a red lint stays green)", (t) => t.replace("  lint:\n    name: lint\n", "  lint:\n    name: lint\n    continue-on-error: true\n")],
+    ["tests with continue-on-error (a red tests stays green)", (t) => t.replace("  tests:\n    name: tests\n", "  tests:\n    name: tests\n    continue-on-error: true\n")],
+    ["lint with a second if", (t) => t.replace("    if: ${{ needs.changes.outputs.worker_changed == 'true' }}\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n    defaults:", "    if: ${{ needs.changes.outputs.worker_changed == 'true' }}\n    if: ${{ true }}\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n    defaults:")],
+    ["lint without needs on changes", (t) => t.replace("  lint:\n    name: lint\n    needs: changes\n", "  lint:\n    name: lint\n")],
+    ["tests also needs lint (a failed lint would make tests skipped)", (t) => t.replace("  tests:\n    name: tests\n    needs: changes\n", "  tests:\n    name: tests\n    needs: [changes, lint]\n")],
+    // The explicit result conditions of plan (#307): each weakening must be caught (statically and by the exhaustive test).
+    ["plan without the changes result", (t) => t.replace("${{ !cancelled() && needs.changes.result == 'success' && ((needs.changes.outputs.worker_changed == 'true'", "${{ !cancelled() && ((needs.changes.outputs.worker_changed == 'true'")],
+    ["plan without the lint result (worker changed)", (t) => t.replace("worker_changed == 'true' && needs.lint.result == 'success' && needs.tests.result == 'success') || (needs.changes.outputs.worker_changed == 'false' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') && (needs.tests.result == 'success' || needs.tests.result == 'skipped'))) && github.repository", "worker_changed == 'true' && needs.tests.result == 'success') || (needs.changes.outputs.worker_changed == 'false' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') && (needs.tests.result == 'success' || needs.tests.result == 'skipped'))) && github.repository")],
+    ["plan without the tests result (worker changed)", (t) => t.replace("worker_changed == 'true' && needs.lint.result == 'success' && needs.tests.result == 'success') || (needs.changes.outputs.worker_changed == 'false' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') && (needs.tests.result == 'success' || needs.tests.result == 'skipped'))) && github.repository", "worker_changed == 'true' && needs.lint.result == 'success') || (needs.changes.outputs.worker_changed == 'false' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') && (needs.tests.result == 'success' || needs.tests.result == 'skipped'))) && github.repository")],
+    ["plan accepts a skipped lint when worker_changed is true (the skip hole)", (t) => t.replace("worker_changed == 'true' && needs.lint.result == 'success' &&", "worker_changed == 'true' && needs.lint.result != 'failure' &&")],
+    ["plan accepts a skipped tests when worker_changed is true (the skip hole)", (t) => t.replace("needs.lint.result == 'success' && needs.tests.result == 'success') ||", "needs.lint.result == 'success' && needs.tests.result != 'failure') ||")],
+    ["plan accepts a cancelled lint when worker_changed is false", (t) => t.replace("(needs.lint.result == 'success' || needs.lint.result == 'skipped') && (needs.tests.result == 'success' || needs.tests.result == 'skipped'))) && github.repository", "needs.lint.result != 'failure' && (needs.tests.result == 'success' || needs.tests.result == 'skipped'))) && github.repository")],
+    ["plan fails open on an invalid worker_changed (anything but true is the docs-only case)", (t) => t.replace("needs.changes.outputs.worker_changed == 'false' && (needs.lint.result", "needs.changes.outputs.worker_changed != 'true' && (needs.lint.result")],
+    ["plan with only the docs-only branch (a worker change never deploys)", (t) => t.replace("((needs.changes.outputs.worker_changed == 'true' && needs.lint.result == 'success' && needs.tests.result == 'success') || (needs.changes.outputs.worker_changed == 'false' &&", "((needs.changes.outputs.worker_changed == 'false' &&")],
     ["lint without the worker_changed condition", (t) => t.replace("  lint:\n    name: lint\n    needs: changes\n    if: ${{ needs.changes.outputs.worker_changed == 'true' }}\n", "  lint:\n    name: lint\n    needs: changes\n")],
     ["tests with another condition", (t) => t.replace("    if: ${{ needs.changes.outputs.worker_changed == 'true' }}\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n    permissions:", "    if: ${{ github.event_name == 'pull_request' }}\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n    permissions:")],
     ["tests without needed permissions (no checks: write)", (t) => t.replace("    permissions:\n      contents: read\n      checks: write\n", "")],
@@ -255,17 +254,17 @@ describe("ci.yml reports `ci` on pull_request, push and merge_group (#290, #292)
     ["workflow-level env with toJSON(secrets)", (t) => t.replace("\nconcurrency:\n", "\nenv:\n  ALL: ${{ toJSON(secrets) }}\n\nconcurrency:\n")],
     ["secrets index form in the tests job", (t) => t.replace("      - name: Migration lint tests\n", "      - name: Migration lint tests\n        env:\n          X: ${{ secrets['WORKER_URL'] }}\n")],
     ["toJSON(secrets) in the lint job", (t) => t.replace("      - name: Typecheck\n", "      - name: Typecheck\n        env:\n          X: ${{ toJSON(secrets) }}\n")],
-    ["a secret in the gate", (t) => t.replace("          CHANGES_RESULT: ${{ needs.changes.result }}\n", "          CHANGES_RESULT: ${{ needs.changes.result }}\n          X: ${{ secrets.WORKER_URL }}\n")],
+    ["a secret in the validation step of changes", (t) => t.replace("          OUT_BASE_SHA: ${{ steps.base.outputs.base_sha }}\n", "          OUT_BASE_SHA: ${{ steps.base.outputs.base_sha }}\n          X: ${{ secrets.WORKER_URL }}\n")],
     // The outputs of `changes` and the deploy decision of `plan`.
     ["changes exposes a deploy_changed output mapped to worker_changed", (t) => t.replace("      base_sha: ${{ steps.base.outputs.base_sha }}\n", "      base_sha: ${{ steps.base.outputs.base_sha }}\n      deploy_changed: ${{ steps.changes.outputs.worker_changed }}\n")],
     ["plan output deploy ignores the scope step", (t) => t.replace(" && steps.scope.outputs.deploy == 'true'", "")],
     ["plan output deploy only reads the scope step", (t) => t.replace("steps.guard.outputs.deploy == 'true' && steps.scope.outputs.deploy == 'true' && 'true' || 'false'", "steps.scope.outputs.deploy")],
     ["the scope step is removed (renamed)", (t) => t.replace("Anything to deploy (worker/ since BASE)", "Something else")],
-    ["plan without the gate result in its condition", (t) => t.replace("needs.ci.result == 'success' && ", "")],
-    ["plan without !cancelled()", (t) => t.replace("${{ !cancelled() && needs.ci.result", "${{ needs.ci.result")],
+    ["plan without !cancelled() (a docs-only push would skip plan, which must still run)", (t) => t.replace("${{ !cancelled() && needs.changes.result == 'success' && ((needs.changes.outputs.worker_changed == 'true' && needs.lint.result == 'success' && needs.tests.result == 'success') || (needs.changes.outputs.worker_changed == 'false' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') && (needs.tests.result == 'success' || needs.tests.result == 'skipped'))) && github.repository", "${{ needs.changes.result == 'success' && ((needs.changes.outputs.worker_changed == 'true' && needs.lint.result == 'success' && needs.tests.result == 'success') || (needs.changes.outputs.worker_changed == 'false' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') && (needs.tests.result == 'success' || needs.tests.result == 'skipped'))) && github.repository")],
+    ["plan with always() instead of !cancelled()", (t) => t.replace("${{ !cancelled() && needs.changes.result == 'success' && ((needs.changes.outputs.worker_changed == 'true' && needs.lint.result == 'success' && needs.tests.result == 'success') || (needs.changes.outputs.worker_changed == 'false' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') && (needs.tests.result == 'success' || needs.tests.result == 'skipped'))) && github.repository", "${{ always() && needs.changes.result == 'success' && ((needs.changes.outputs.worker_changed == 'true' && needs.lint.result == 'success' && needs.tests.result == 'success') || (needs.changes.outputs.worker_changed == 'false' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') && (needs.tests.result == 'success' || needs.tests.result == 'skipped'))) && github.repository")],
     // The deploy jobs (#290 part 2, #287, #312): the graph, the conditions, the group, secrets only in ship.
     ["ship job without needs", (t) => t.replace("  ship:\n    name: ship\n    needs: plan\n", "  ship:\n    name: ship\n")],
-    ["ship needs the gate instead of plan (no environment, no deploy decision)", (t) => t.replace("  ship:\n    name: ship\n    needs: plan\n", "  ship:\n    name: ship\n    needs: ci\n")],
+    ["ship needs the gate instead of plan (no environment, no deploy decision)", (t) => t.replace("  ship:\n    name: ship\n    needs: plan\n", "  ship:\n    name: ship\n    needs: [changes, lint, tests]\n")],
     ["the old job migrate is back next to ship", (t) => t.replace("  ship:\n    name: ship\n", "  migrate:\n    name: migrate\n    needs: plan\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n\n  ship:\n    name: ship\n")],
     ["a ship reference to needs.deploy", (t) => t.replace("needs.plan.outputs.deploy == 'true' && (needs.plan.outputs.environment == 'production' ||", "needs.deploy.result != 'x' && needs.plan.outputs.deploy == 'true' && (needs.plan.outputs.environment == 'production' ||")],
     // ship (#312): environment, condition, reachability, failure semantics, order.
@@ -296,7 +295,9 @@ describe("ci.yml reports `ci` on pull_request, push and merge_group (#290, #292)
     ["ship with a new step between migrate and deploy", (t) => t.replace("      - name: Mask the Worker URL\n", "      - name: Extra\n        run: echo hi\n\n      - name: Mask the Worker URL\n")],
     ["ship timeout changed", (t) => t.replace("    timeout-minutes: 40\n", "    timeout-minutes: 400\n")],
     ["ship with a secret removed (WORKER_URL not read)", (t) => t.replaceAll("secrets.WORKER_URL", "vars.WORKER_URL")],
-    ["plan without the gate in needs (deploy without lint, tests and ci)", (t) => t.replace("needs: [changes, lint, tests, ci]", "needs: [changes]")],
+    ["plan without lint and tests in needs (deploy without lint and tests)", (t) => t.replace("  plan:\n    name: plan\n    needs: [changes, lint, tests]\n", "  plan:\n    name: plan\n    needs: [changes]\n")],
+    ["plan without tests in needs", (t) => t.replace("  plan:\n    name: plan\n    needs: [changes, lint, tests]\n", "  plan:\n    name: plan\n    needs: [changes, lint]\n")],
+    ["plan also needs version (a GitVersion problem would block the deploy)", (t) => t.replace("  plan:\n    name: plan\n    needs: [changes, lint, tests]\n", "  plan:\n    name: plan\n    needs: [changes, lint, tests, version]\n")],
     ["plan without the repository condition (forks)", (t) => t.replace("github.repository == 'kolenkainc/cowlic' && ", "")],
     ["plan without the master ref condition", (t) => t.replace("github.ref == 'refs/heads/master' && ", "")],
     ["plan on every event except pull_request (merge_group deploys)", (t) => t.replace("(github.event_name == 'workflow_dispatch' || github.event_name == 'push')", "github.event_name != 'pull_request'")],
@@ -313,9 +314,11 @@ describe("ci.yml reports `ci` on pull_request, push and merge_group (#290, #292)
     ["a new unreviewed job", (t) => `${t}\n  extra:\n    name: extra\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n`],
     // The release job (#290 part 3).
     ["release job removed", (t) => t.replace(/^ {2}release:\n[\s\S]*$/m, "")],
-    ["release without needs", (t) => t.replace("    needs: [changes, lint, tests, ci, version, plan, ship]\n", "")],
-    ["release not needing ship", (t) => t.replace("needs: [changes, lint, tests, ci, version, plan, ship]", "needs: [changes, lint, tests, ci, version, plan]")],
-    ["release without needs.version", (t) => t.replace("needs: [changes, lint, tests, ci, version, plan, ship]", "needs: [changes, lint, tests, ci, plan, ship]")],
+    ["release without needs", (t) => t.replace("    needs: [changes, lint, tests, version, plan, ship]\n", "")],
+    ["release not needing ship", (t) => t.replace("needs: [changes, lint, tests, version, plan, ship]", "needs: [changes, lint, tests, version, plan]")],
+    ["release without needs.version", (t) => t.replace("needs: [changes, lint, tests, version, plan, ship]", "needs: [changes, lint, tests, plan, ship]")],
+    ["release without lint and tests in needs", (t) => t.replace("needs: [changes, lint, tests, version, plan, ship]", "needs: [changes, version, plan, ship]")],
+    ["release still needing ci", (t) => t.replace("needs: [changes, lint, tests, version, plan, ship]", "needs: [changes, lint, tests, ci, version, plan, ship]")],
     ["release without needs.version.result in its condition", (t) => t.replace(" && needs.version.result == 'success' && needs.plan.result", " && needs.plan.result")],
     ["release when the version job failed or was skipped (any result accepted)", (t) => t.replace("needs.version.result == 'success'", "needs.version.result != 'cancelled'")],
     ["release installing GitVersion again (a tool in the write-token job)", (t) => t.replace("      - name: Tag and release\n", "      - name: Install GitVersion.Tool\n        run: |\n          dotnet tool install GitVersion.Tool --tool-path \"$RUNNER_TEMP/gitversion\" --version 6.8.2\n\n      - name: Tag and release\n")],
@@ -325,7 +328,7 @@ describe("ci.yml reports `ci` on pull_request, push and merge_group (#290, #292)
     ["the version job given a read permission block", (t) => t.replace("  version:\n    name: version\n", "  version:\n    name: version\n    permissions:\n      contents: read\n")],
     ["the version job with an extra output", (t) => t.replace("      branch_name: ${{ steps.gv.outputs.branch_name }}\n", "      branch_name: ${{ steps.gv.outputs.branch_name }}\n      extra: ${{ steps.gv.outputs.sha }}\n")],
     ["the version output is not validated", (t) => t.replace('[[ "$mmp" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]] || mmp=""', "true")],
-    ["the version job inside the gate (could stall the queue)", (t) => t.replace("needs: [changes, lint, tests]", "needs: [changes, lint, tests, version]")],
+    ["the version job in the needs of lint (could stall the queue)", (t) => t.replace("  lint:\n    name: lint\n    needs: changes\n", "  lint:\n    name: lint\n    needs: [changes, version]\n")],
     ["release with a version output read by the wrong name", (t) => t.replace("V_MMP: ${{ needs.version.outputs.major_minor_patch }}", "V_MMP: ${{ needs.version.outputs.semver }}")],
     ["release with contents: write at workflow level", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, "permissions:\n  contents: write\n")],
     ["release without its write permission", (t) => t.replace("    permissions:\n      contents: write\n", "")],
@@ -341,9 +344,12 @@ describe("ci.yml reports `ci` on pull_request, push and merge_group (#290, #292)
     ["release when ship was skipped although a deploy was planned", (t) => t.replace("needs.plan.outputs.deploy == 'true' && needs.ship.result == 'success')", "needs.plan.outputs.deploy == 'true' && needs.ship.result != 'cancelled' && needs.ship.result != 'failure')")],
     ["release when ship ran although nothing was to be deployed", (t) => t.replace("needs.plan.outputs.deploy != 'true' && needs.ship.result == 'skipped')", "needs.plan.outputs.deploy != 'true')")],
     ["release when plan failed or was skipped", (t) => t.replace("needs.plan.result == 'success' && ", "")],
-    ["release without the gate", (t) => t.replace("needs.ci.result == 'success' && needs.version.result", "needs.version.result")],
-    ["release without !cancelled() (skipped by design would skip it)", (t) => t.replace("${{ !cancelled() && needs.ci.result == 'success' && needs.version.result", "${{ needs.ci.result == 'success' && needs.version.result")],
-    ["release with always() (runs after failures)", (t) => t.replace("${{ !cancelled() && needs.ci.result == 'success' && needs.version.result == 'success' && needs.plan.result == 'success' && ((", "${{ always() && ((")],
+    ["release without the results of changes, lint and tests", (t) => t.replace(`${GATE_EXPR} && needs.version.result`, "needs.version.result")],
+    ["release with a needs.ci reference in place of the results", (t) => t.replace(`${GATE_EXPR} && needs.version.result`, "needs.ci.result == 'success' && needs.version.result")],
+    ["release without the lint result (worker changed)", (t) => t.replace("worker_changed == 'true' && needs.lint.result == 'success' && needs.tests.result == 'success') || (needs.changes.outputs.worker_changed == 'false' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') && (needs.tests.result == 'success' || needs.tests.result == 'skipped'))) && needs.version.result", "worker_changed == 'true' && needs.tests.result == 'success') || (needs.changes.outputs.worker_changed == 'false' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') && (needs.tests.result == 'success' || needs.tests.result == 'skipped'))) && needs.version.result")],
+    ["release accepts a skipped tests when worker_changed is true (the skip hole)", (t) => t.replace("needs.lint.result == 'success' && needs.tests.result == 'success') || (needs.changes.outputs.worker_changed == 'false' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') && (needs.tests.result == 'success' || needs.tests.result == 'skipped'))) && needs.version.result", "needs.lint.result == 'success' && needs.tests.result != 'failure') || (needs.changes.outputs.worker_changed == 'false' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') && (needs.tests.result == 'success' || needs.tests.result == 'skipped'))) && needs.version.result")],
+    ["release without !cancelled() (skipped by design would skip it)", (t) => t.replace(`\${{ !cancelled() && ${GATE_EXPR} && needs.version.result`, `\${{ ${GATE_EXPR} && needs.version.result`)],
+    ["release with always() (runs after failures)", (t) => t.replace(`\${{ !cancelled() && ${GATE_EXPR} && needs.version.result == 'success' && needs.plan.result == 'success' && ((`, "${{ always() && ((")],
     ["release with the X.Y.Z regexp removed", (t) => t.replace('[[ "$V_MMP" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]]', "true")],
     ["release without the sha re-validation", (t) => t.replace('[ "$V_SHA" = "$EVENT_SHA" ]', "true")],
     ["release without the branch re-validation", (t) => t.replace('[ "$V_BRANCH" = "master" ]', "true")],
@@ -361,7 +367,7 @@ describe("ci.yml reports `ci` on pull_request, push and merge_group (#290, #292)
     ["merge_group base_sha not read", (t) => t.replaceAll("github.event.merge_group.base_sha", "github.event.merge_group.x")],
     ["version job without full history", (t) => t.replace(/^( {2}version:\n[\s\S]*?) {10}fetch-depth: 0\n/m, "$1")],
     ["unpinned action", (t) => t.replace(/actions\/checkout@[0-9a-f]{40} # v7\.0\.1/, "actions/checkout@v7")],
-    ["expression in a run block", (t) => t.replace('echo "changes did not succeed"', 'echo "${{ github.sha }}"')],
+    ["expression in a run block", (t) => t.replace('echo "::error::base_sha is not 40 characters"', 'echo "${{ github.sha }}"')],
   ];
   it.each(ciMutations)("mutation is caught: %s", (name, fn) => {
     const mutated = fn(ci);
@@ -474,12 +480,40 @@ describe("ci.yml: the release job", () => {
     const failedShip = ci.replace("needs.plan.outputs.deploy == 'true' && needs.ship.result == 'success')", "needs.plan.outputs.deploy == 'true')");
     expect(failedShip).not.toBe(ci);
     expect(releaseConditionFailures(failedShip).length).toBeGreaterThan(0);
-    const noCancel = ci.replace("${{ !cancelled() && needs.ci.result == 'success' && needs.version.result", "${{ needs.ci.result == 'success' && needs.version.result");
+    const noCancel = ci.replace(`\${{ !cancelled() && ${GATE_EXPR} && needs.version.result`, `\${{ ${GATE_EXPR} && needs.version.result`);
     expect(noCancel).not.toBe(ci);
     expect(releaseConditionFailures(noCancel).length).toBeGreaterThan(0);
     const noVersion = ci.replace(" && needs.version.result == 'success' && needs.plan.result", " && needs.plan.result");
     expect(noVersion).not.toBe(ci);
     expect(releaseConditionFailures(noVersion).length).toBeGreaterThan(0);
+    const noGate = ci.replace(`${GATE_EXPR} && needs.version.result`, "needs.version.result");
+    expect(noGate).not.toBe(ci);
+    expect(releaseConditionFailures(noGate).length).toBeGreaterThan(0);
+  });
+});
+
+// #307: the condition of `plan`, evaluated over every combination of the results of changes, lint and tests. There is
+// no aggregating job: this condition (and the same clause in `release`) is what keeps a deploy behind lint and tests.
+describe("ci.yml: the condition of plan names the result of changes, lint and tests (no ci job)", () => {
+  it("named combinations, the exhaustive oracle and the property: no deploy without lint and tests passing in that run, except docs-only", () => {
+    expect(planConditionFailures(ci)).toEqual([]);
+  });
+  it.each([
+    ["the changes result is dropped", (t) => t.replace("${{ !cancelled() && needs.changes.result == 'success' && ((", "${{ !cancelled() && ((")],
+    ["a skipped lint passes when worker_changed is true", (t) => t.replace("worker_changed == 'true' && needs.lint.result == 'success' &&", "worker_changed == 'true' && needs.lint.result != 'failure' &&")],
+    ["a skipped tests passes when worker_changed is true", (t) => t.replace("needs.lint.result == 'success' && needs.tests.result == 'success') ||", "needs.lint.result == 'success' && needs.tests.result != 'failure') ||")],
+    ["a cancelled lint passes when worker_changed is false", (t) => t.replace("(needs.lint.result == 'success' || needs.lint.result == 'skipped') && (needs.tests.result == 'success' || needs.tests.result == 'skipped'))) && github.repository", "needs.lint.result != 'failure' && (needs.tests.result == 'success' || needs.tests.result == 'skipped'))) && github.repository")],
+    ["an invalid worker_changed counts as the docs-only case", (t) => t.replace("needs.changes.outputs.worker_changed == 'false' && (needs.lint.result", "needs.changes.outputs.worker_changed != 'true' && (needs.lint.result")],
+    ["the worker_changed true branch is dropped", (t) => t.replace("((needs.changes.outputs.worker_changed == 'true' && needs.lint.result == 'success' && needs.tests.result == 'success') || (needs.changes.outputs.worker_changed == 'false' &&", "((needs.changes.outputs.worker_changed == 'false' &&")],
+    ["the repository condition is dropped", (t) => t.replace("github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}\n    runs-on: ubuntu-latest\n    timeout-minutes: 10", "github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}\n    runs-on: ubuntu-latest\n    timeout-minutes: 10")],
+    ["plan runs on merge_group too", (t) => t.replace("(github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}\n    runs-on: ubuntu-latest\n    timeout-minutes: 10", "(github.event_name != 'pull_request') }}\n    runs-on: ubuntu-latest\n    timeout-minutes: 10")],
+    ["!cancelled() is dropped", (t) => t.replace("${{ !cancelled() && needs.changes.result == 'success' && ((", "${{ needs.changes.result == 'success' && ((")],
+    ["the condition is replaced by always()", (t) => t.replace("${{ !cancelled() && needs.changes.result == 'success' && ((needs.changes.outputs.worker_changed == 'true' && needs.lint.result == 'success' && needs.tests.result == 'success') || (needs.changes.outputs.worker_changed == 'false' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') && (needs.tests.result == 'success' || needs.tests.result == 'skipped'))) && github.repository", "${{ always() && github.repository")],
+    ["a reference to needs.ci stays (the job is gone: nothing deploys)", (t) => t.replace("${{ !cancelled() && needs.changes.result == 'success' && ((", "${{ !cancelled() && needs.ci.result == 'success' && ((")],
+  ])("the evaluator catches: %s", (_label, fn) => {
+    const mutated = fn(ci);
+    expect(mutated).not.toBe(ci);
+    expect(planConditionFailures(mutated).length).toBeGreaterThan(0);
   });
 });
 

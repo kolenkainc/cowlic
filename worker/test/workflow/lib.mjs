@@ -80,7 +80,6 @@ export const PERMISSIONS = {
       lint: null,
       tests: { contents: "read", checks: "write" },
       version: null,
-      ci: null,
       plan: { contents: "read", "pull-requests": "read", deployments: "read" },
       // #312: migrate and deploy are one job, in the environment chosen by plan (contents: read, like migrate was).
       ship: { contents: "read" },
@@ -226,7 +225,12 @@ function stepFailures(text) {
 // migrate and deploy, #312)
 const DEPLOY_JOBS = ["plan", "ship"];
 const code = (t) => t.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
-const PLAN_IF = "    if: ${{ !cancelled() && needs.ci.result == 'success' && github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}";
+// #307: there is no aggregating job. The result of every required job is named in the conditions of `plan` and `release`:
+// `changes` succeeded and EITHER worker_changed is true and lint and tests succeeded, OR worker_changed is false (the
+// documented docs-only case) and lint and tests succeeded or were skipped. Anything else (a missing or invalid
+// worker_changed, a failed, cancelled or skipped need) matches nothing. Evaluated over every combination by gate.mjs.
+export const GATE_EXPR = "needs.changes.result == 'success' && ((needs.changes.outputs.worker_changed == 'true' && needs.lint.result == 'success' && needs.tests.result == 'success') || (needs.changes.outputs.worker_changed == 'false' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') && (needs.tests.result == 'success' || needs.tests.result == 'skipped')))";
+export const PLAN_IF = `    if: \${{ !cancelled() && ${GATE_EXPR} && github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}`;
 const PLAN_DEPLOY_OUTPUT = "      deploy: ${{ steps.guard.outputs.deploy == 'true' && steps.scope.outputs.deploy == 'true' && 'true' || 'false' }}";
 // The workflow-level group: whole push-to-master and dispatch-from-master runs are serialized in `worker-deploy`.
 export const WORKFLOW_GROUP = "  group: ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'worker-deploy' || format('ci-{0}-{1}', github.event_name, github.event_name == 'pull_request' && github.ref || github.run_id) }}";
@@ -246,8 +250,8 @@ export function staticFailures(text) {
   const block = Object.fromEntries(DEPLOY_JOBS.map((id) => [id, jobBlock(text, id)]));
   for (const id of DEPLOY_JOBS) if (block[id] === null) f.push(`job ${id} is missing`);
   const line = (id, re) => re.test(block[id] ?? "");
-  if (!line("plan", /^ {4}needs: \[changes, lint, tests, ci\]$/m)) f.push("plan must need exactly changes, lint, tests, ci");
-  if (!(block.plan ?? "").split("\n").includes(PLAN_IF)) f.push("plan has not the exact condition (gate succeeded, repository, master ref, dispatch or push)");
+  if (!line("plan", /^ {4}needs: \[changes, lint, tests\]$/m)) f.push("plan must need exactly changes, lint, tests");
+  if (!(block.plan ?? "").split("\n").includes(PLAN_IF)) f.push("plan has not the exact condition (!cancelled(), the result of changes, lint and tests, repository, master ref, dispatch or push)");
   if (!(block.plan ?? "").split("\n").includes(PLAN_DEPLOY_OUTPUT)) f.push("plan output deploy is not exactly guard AND scope");
   // The step that decides "anything to deploy": its id, its condition, and that a dispatch always deploys and a git
   // failure never means "nothing to deploy" (its run block is also executed by changes.mjs).
@@ -259,7 +263,7 @@ export function staticFailures(text) {
   if (line("plan", /^ {4}environment:/m)) f.push("plan must have no environment");
   // Concurrency: the deploy runs are serialized by the WORKFLOW-level group (see ciFailures); a job-level group on any
   // job would be a second mechanism (and the same name at both levels deadlocks): none may exist.
-  for (const id of ["changes", "lint", "tests", "version", "ci", ...DEPLOY_JOBS, "release"]) {
+  for (const id of ["changes", "lint", "tests", "version", ...DEPLOY_JOBS, "release"]) {
     if (/^ {4}concurrency:/m.test(code(jobBlock(text, id) ?? ""))) f.push(`job-level concurrency on ${id}`);
   }
   // `changes` exposes exactly worker_changed and base_sha: no deploy decision leaves it (plan decides).
@@ -272,7 +276,7 @@ export function staticFailures(text) {
   for (const id of ["ship"]) rest = rest.replace(jobBlock(text, id) ?? "\u0000", "");
   if (/\bsecrets\b/i.test(code(rest))) f.push("secrets outside the job ship (workflow level or another job)");
   // Environments: only on ship.
-  for (const id of ["changes", "lint", "tests", "version", "ci", "plan", "release"]) {
+  for (const id of ["changes", "lint", "tests", "version", "plan", "release"]) {
     if (/^ {4}environment:/m.test(code(jobBlock(text, id) ?? ""))) f.push(`environment on the job ${id}`);
   }
   if (/^environment:|^env:/m.test(code(text.split(/^jobs:/m)[0]))) f.push("workflow-level env or environment");
@@ -402,7 +406,7 @@ const trigger = (on, name) => new RegExp(`^ {2}${name}:.*\\n((?: {4,}.*\\n|\\n)*
 // Cloudflare, only the job's GITHUB_TOKEN, NO tool and NO action (the version comes from the read-only job `version`
 // as outputs that the script re-validates), and a run block that never moves, deletes or forces a tag (also executed by
 // release.mjs).
-export const RELEASE_IF = "    if: ${{ !cancelled() && needs.ci.result == 'success' && needs.version.result == 'success' && needs.plan.result == 'success' && ((needs.plan.outputs.deploy != 'true' && needs.ship.result == 'skipped') || (needs.plan.outputs.deploy == 'true' && needs.ship.result == 'success')) && github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}";
+export const RELEASE_IF = `    if: \${{ !cancelled() && ${GATE_EXPR} && needs.version.result == 'success' && needs.plan.result == 'success' && ((needs.plan.outputs.deploy != 'true' && needs.ship.result == 'skipped') || (needs.plan.outputs.deploy == 'true' && needs.ship.result == 'success')) && github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}`;
 export function releaseFailures(text) {
   const f = [];
   const b = jobBlock(text, "release");
@@ -410,7 +414,7 @@ export function releaseFailures(text) {
   const c = code(b);
   const lines = b.split("\n");
   if (!lines.includes(RELEASE_IF) || lines.filter((l) => /^ {4}if:/.test(l)).length !== 1) f.push("release has not the exact condition (gate, plan, ship succeeded or skipped by design, repository, master, push or dispatch)");
-  if (!/^ {4}needs: \[changes, lint, tests, ci, version, plan, ship\]$/m.test(b)) f.push("release must need exactly changes, lint, tests, ci, version, plan, ship");
+  if (!/^ {4}needs: \[changes, lint, tests, version, plan, ship\]$/m.test(b)) f.push("release must need exactly changes, lint, tests, version, plan, ship");
   if (!/^ {4}runs-on: ubuntu-24\.04$/m.test(b)) f.push("release must run on the audited image ubuntu-24.04");
   if (!/^ {4}permissions:\n {6}contents: write\n(?! {6})/m.test(b)) f.push("release must have exactly contents: write");
   if (/^ {4}environment:/m.test(c)) f.push("environment on the release job");
@@ -487,8 +491,8 @@ export function changesStepFailures(text) {
   return f;
 }
 
-// --- #290, #292: ci.yml must report the required check `ci` on pull_request, push and merge_group, and the gate must
-// be a real gate. Static, on the text; every rule has a mutation test.
+// --- #290, #292, #307: ci.yml must report the required checks `changes`, `lint` and `tests` on pull_request, push and
+// merge_group, with no aggregating job. Static, on the text; every rule has a mutation test.
 export function ciFailures(text) {
   const f = [];
   const on = onBlock(text);
@@ -500,31 +504,38 @@ export function ciFailures(text) {
   // The manual trigger has no inputs (nothing user-typed reaches the deploy).
   if (!/^ {2}workflow_dispatch:\s*$/m.test(onCode.join("\n")) || (trigger(on, "workflow_dispatch") ?? "").split("\n").some((l) => l.trim() !== "" && !/^\s*#/.test(l))) f.push("workflow_dispatch must have no inputs");
   if (!/^on:\n(?:[ #].*\n|\n)*? {2}merge_group:\n {4}types: \[checks_requested\]\n/m.test(text)) f.push("ci.yml has no merge_group trigger with types [checks_requested]");
-  // No filter that could stop `ci` from reporting: pull_request and merge_group only have `types`, push only branches: [master].
+  // No filter that could stop the required checks from reporting: pull_request and merge_group only have `types`, push only branches: [master].
   const keysOf = (name) => (trigger(on, name) ?? "").split("\n").filter((l) => /^ {4}\S/.test(l) && !/^\s*#/.test(l)).map((l) => /^ {4}([A-Za-z_-]+):/.exec(l)?.[1] ?? l.trim());
   for (const name of ["pull_request", "merge_group"]) {
-    if (keysOf(name).some((k) => k !== "types")) f.push(`${name} has a key other than types (a filter could stop ci from reporting): ${keysOf(name).join(",")}`);
+    if (keysOf(name).some((k) => k !== "types")) f.push(`${name} has a key other than types (a filter could stop the required checks from reporting): ${keysOf(name).join(",")}`);
   }
   if (JSON.stringify(keysOf("push")) !== JSON.stringify(["branches"]) || !/^ {4}branches: \[master\]$/m.test(trigger(on, "push") ?? "")) f.push("push must have exactly branches: [master] (no paths filter)");
 
-  // The gate: job id and name ci, always() as the ONLY condition, needs every other gating job.
-  const ci = jobBlock(text, "ci");
-  if (ci === null) f.push("no job ci (the required check would never report)");
-  else {
-    if (!/^ {4}name: ci$/m.test(ci)) f.push("job ci has not the name ci");
-    const ifs = ci.split("\n").filter((l) => /^ {4}if:/.test(l));
-    if (ifs.length !== 1 || ifs[0] !== "    if: ${{ always() }}") f.push(`job ci must have exactly "if: \${{ always() }}" (a skipped required check counts as passed): ${JSON.stringify(ifs)}`);
-    if (!/^ {4}needs: \[changes, lint, tests\]$/m.test(ci)) f.push("job ci does not need exactly changes, lint, tests");
-    if (/continue-on-error/.test(ci)) f.push("continue-on-error in the gate");
-  }
+  // #307: NO aggregating job. The required checks are the real jobs changes, lint and tests (the ruleset is the owner's);
+  // a job `ci`, or any reference to it, must not come back (the context would be required by nobody and a stale gate
+  // could be mistaken for the real one).
+  if (jobBlock(text, "ci") !== null) f.push("a job ci exists: the aggregating gate was removed (#307)");
+  if (/needs\.ci\b/.test(code(text))) f.push("a reference to needs.ci");
+  if (/^ {4}needs:.*\bci\b/m.test(code(text))) f.push("a needs list names ci");
   for (const id of ["changes", "lint", "tests", "version"]) if (jobBlock(text, id) === null) f.push(`job ${id} is missing`);
   // Only these jobs exist (a new job needs its permissions and conditions reviewed here on purpose).
   const afterJobs = text.slice(text.search(/^jobs:\n/m));
   const ids = [...afterJobs.matchAll(/^ {2}([A-Za-z0-9_-]+):\s*$/gm)].map((m) => m[1]);
-  if (JSON.stringify(ids) !== JSON.stringify(["changes", "lint", "tests", "version", "ci", "plan", "ship", "release"])) f.push(`jobs changed: ${ids.join(",")}`);
-  for (const id of ["lint", "tests"]) {
+  if (JSON.stringify(ids) !== JSON.stringify(["changes", "lint", "tests", "version", "plan", "ship", "release"])) f.push(`jobs changed: ${ids.join(",")}`);
+  // The three required checks: job id equals name, no condition on the event or the ref (they must report on pull_request,
+  // push AND merge_group), and the ONLY condition of lint and tests is worker_changed == 'true' (skipped only when
+  // `changes`, which fails closed, validated `false`). lint and tests need exactly `changes`; none tolerates failure.
+  for (const id of ["changes", "lint", "tests"]) {
     const j = jobBlock(text, id);
-    if (j !== null && !/^ {4}if: \$\{\{ needs\.changes\.outputs\.worker_changed == 'true' \}\}$/m.test(j)) f.push(`job ${id} has no condition on worker_changed`);
+    if (j === null) continue;
+    if (!new RegExp(`^ {4}name: ${id}$`, "m").test(j)) f.push(`job ${id} has not the name ${id} (the required check context)`);
+    if (/^ {4}continue-on-error:/m.test(code(j))) f.push(`job ${id} has continue-on-error`);
+    const ifs = code(j).split("\n").filter((l) => /^ {4}if:/.test(l));
+    if (id === "changes" && ifs.length !== 0) f.push("job changes must have no if (it must always report)");
+    if (id !== "changes") {
+      if (!/^ {4}needs: changes$/m.test(j)) f.push(`job ${id} must need exactly changes`);
+      if (JSON.stringify(ifs) !== JSON.stringify(["    if: ${{ needs.changes.outputs.worker_changed == 'true' }}"])) f.push(`job ${id} must have exactly the condition worker_changed == 'true' and no other: ${JSON.stringify(ifs)}`);
+    }
   }
 
   // Workflow-level concurrency, exactly: push to master and dispatch from master share the group `worker-deploy` (whole
@@ -534,7 +545,7 @@ export function ciFailures(text) {
   if (!text.includes(`\nconcurrency:\n${WORKFLOW_GROUP}\n${wantCancel}\n`)) f.push("workflow concurrency changed: a queue, master or label-event run could be cancelled, or a deploy run could share a cancellable group");
   f.push(...permissionFailures(text, PERMISSIONS["ci.yml"]));
   // A job that publishes a report needs checks: write (else the check run cannot be created), and only such a job has it.
-  for (const id of ["changes", "lint", "tests", "version", "ci", "plan", "ship", "release"]) {
+  for (const id of ["changes", "lint", "tests", "version", "plan", "ship", "release"]) {
     const j = jobBlock(text, id);
     if (j === null) continue;
     const reports = j.includes("mikepenz/action-junit-report@");
