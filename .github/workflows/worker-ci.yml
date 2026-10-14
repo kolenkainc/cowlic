@@ -18,13 +18,20 @@ on:
     paths:
       - "worker/**"
       - ".github/workflows/worker-ci.yml"
+  # #292: the master ruleset has a merge queue and requires `ci`; the queue sends merge_group (checks_requested)
+  # and waits for the required check on the gh-readonly-queue/* commit. No path filter: `ci` must always report.
+  # This workflow never deploys; worker-deploy.yml must NOT get this trigger (asserted by workflow-check.mjs).
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
 
 # Section 3 rule 5: superseded PR runs are cancelled (cancelling CI is fine; deploys are never cancelled).
+# The event name is in the group and cancel-in-progress is true only for pull_request: a merge-queue run is never
+# cancelled by a PR run or by another queue entry (each queue entry also has its own ref).
 concurrency:
-  group: worker-ci-${{ github.ref }}
+  group: worker-ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -45,17 +52,33 @@ jobs:
           fetch-depth: 0
 
       # BASE = the commit to compare against. Untrusted values come in through env: only (section 3 rule 7).
-      # pull_request: current origin/master. push: the previous head of master. If it cannot be resolved,
-      # BASE_SHA stays empty: the detect step then treats worker/ as changed (run everything) and the steps
-      # that need a base fail (fail closed, never "unchanged").
+      # pull_request: current origin/master. push: the previous head of master. merge_group: the queue's
+      # base_sha, and only if head_sha (40 lowercase hex, like base_sha) is the checked-out commit. If it
+      # cannot be resolved, BASE_SHA stays empty: the detect step then treats worker/ as changed (run everything)
+      # and the steps that need a base fail (fail closed, never "unchanged").
       - name: Resolve base commit
         env:
           EVENT_NAME: ${{ github.event_name }}
           BEFORE_SHA: ${{ github.event.before }}
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
         run: |
           base=""
+          is_sha() {
+            case "$1" in
+              *[!0-9a-f]* | "") return 1 ;;
+            esac
+            [ "${#1}" -eq 40 ]
+          }
           if [ "$EVENT_NAME" = "pull_request" ]; then
             base=$(git rev-parse --verify --quiet "refs/remotes/origin/master^{commit}") || base=""
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            if is_sha "$MG_BASE_SHA" && is_sha "$MG_HEAD_SHA"; then
+              head=$(git rev-parse --verify --quiet "HEAD^{commit}") || head=""
+              if [ "$head" = "$MG_HEAD_SHA" ]; then
+                base=$(git rev-parse --verify --quiet "${MG_BASE_SHA}^{commit}") || base=""
+              fi
+            fi
           else
             case "$BEFORE_SHA" in
               *[!0-9a-f]* | "") base="" ;;
@@ -123,6 +146,8 @@ jobs:
 
       # Lint the migrations ADDED since the base, passed explicitly. The PR label destructive-migration-approved
       # (boolean computed here, never spliced into the script) turns destructive findings into notices.
+      # #292: merge_group has no pull_request payload, so APPROVED is false there and a destructive finding fails
+      # the queue run (fail closed, by choice); the PR run already showed the finding and the label.
       - name: Lint new migrations
         if: steps.changes.outputs.worker_changed == 'true'
         env:
