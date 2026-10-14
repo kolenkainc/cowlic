@@ -1,5 +1,5 @@
 -- Synthetic fixture for the smoke tests on a real local D1 (test/smoke). Everything here is made up:
--- the Telegram ids are obviously fake and are never sent anywhere (the stream checks are skipped in CI).
+-- the Telegram ids are obviously fake and are never sent anywhere (the stream checks, which need real Telegram, are not part of the CI tests: they live only in scripts/smoke.mjs, the owner's local run).
 -- Needs migration 0003 (artists.image_file_id). The smoke checks expect: ar1 "Test Artist" with one album al1 (with a
 -- cover) and one track t1, and ar2 "Zed Image Artist" with a photo and no albums. ar1 has NO photo on purpose.
 INSERT INTO artists (id, name) VALUES ('ar1', 'Test Artist');

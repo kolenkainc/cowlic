@@ -96,44 +96,84 @@ export const PERMISSIONS = {
 // the throw into a failure, so parse trouble fails closed.
 export function parsePermissions(text) {
   const lines = text.split("\n");
+  const isBlank = (l) => l.trim() === "";
+  const isComment = (l) => /^\s*#/.test(l);
+  const code = lines.filter((l) => !isComment(l));
+
+  // Nothing exotic may hide a scope: no tabs, no anchors / aliases / merge keys (a YAML anchor or alias sits after
+  // `: ` or `- `; a plain `&` or `*` inside a shell command does not match), no CR (the files are LF).
+  if (text.includes("\t")) throw new Error("a tab character in the file");
+  if (text.includes("\r")) throw new Error("a carriage return in the file");
+  for (const l of code) {
+    if (/(^|:|-)\s+[&*][A-Za-z0-9_-]+(\s|$)/.test(l) || /^\s*<<\s*:/.test(l)) throw new Error(`YAML anchor, alias or merge key: ${JSON.stringify(l.trim().slice(0, 60))}`);
+  }
+
   const entry = (l, indent) => new RegExp(`^ {${indent}}([a-z-]+): (read|write|none)(?: #.*)?$`).exec(l);
+  // A block: the key line at `start`, entries at exactly `keyIndent`. Blank lines and comments inside are skipped (YAML
+  // allows them); the block ends at the first other line that is indented LESS than keyIndent; a deeper line is not
+  // understood and throws.
   const block = (start, keyIndent, label) => {
     const out = {};
     for (let i = start + 1; i < lines.length; i++) {
       const l = lines[i];
-      if (l.startsWith(" ".repeat(keyIndent)) && l.trim() !== "" && !/^\s*#/.test(l)) {
-        const m = entry(l, keyIndent);
-        if (!m) throw new Error(`${label}: cannot parse permissions entry ${JSON.stringify(l)}`);
-        if (m[1] in out) throw new Error(`${label}: duplicate scope ${m[1]}`);
-        out[m[1]] = m[2];
-      } else if (/^\s*#/.test(l)) continue;
-      else break;
+      if (isBlank(l) || isComment(l)) continue;
+      if (l.search(/\S/) < keyIndent) break;
+      const m = entry(l, keyIndent);
+      if (!m) throw new Error(`${label}: cannot parse permissions entry ${JSON.stringify(l)}`);
+      if (m[1] in out) throw new Error(`${label}: duplicate scope ${m[1]}`);
+      out[m[1]] = m[2];
     }
     return out;
   };
-  const topLines = lines.map((l, i) => [l, i]).filter(([l]) => /^permissions:/.test(l));
-  if (topLines.length !== 1 || !/^permissions:\s*$/.test(topLines[0][0])) throw new Error("top-level permissions: missing, repeated or not a block");
-  const top = block(topLines[0][1], 2, "top-level");
-  const jobsAt = lines.findIndex((l) => /^jobs:\s*$/.test(l));
-  if (jobsAt < 0) throw new Error("no jobs: section");
+
+  const topAt = lines.map((l, i) => [l, i]).filter(([l]) => /^permissions:\s*$/.test(l)).map(([, i]) => i);
+  if (topAt.length !== 1) throw new Error("top-level permissions: missing, repeated or not a block");
+  const top = block(topAt[0], 2, "top-level");
+
+  const jobsAt = lines.map((l, i) => [l, i]).filter(([l]) => /^jobs:\s*$/.test(l)).map(([, i]) => i);
+  if (jobsAt.length !== 1) throw new Error("jobs: missing, repeated or not a block");
+  // Under jobs: every line indented by 1 to 3 spaces must be a plain job id at exactly 2 (a quoted id, a flow-style
+  // job or odd indentation throws), and the FIRST content line must be such an id, so no job can sit before the
+  // first matched id and escape the job-id check.
   const ids = [];
-  for (let i = jobsAt + 1; i < lines.length; i++) {
-    if (/^\S/.test(lines[i]) && !/^#/.test(lines[i])) break; // next top-level key
-    const m = /^ {2}([A-Za-z0-9_-]+):\s*$/.exec(lines[i]);
-    if (m) ids.push([m[1], i]);
+  let end = lines.length;
+  for (let i = jobsAt[0] + 1; i < lines.length; i++) {
+    const l = lines[i];
+    if (isBlank(l) || isComment(l)) continue;
+    const indent = l.search(/\S/);
+    if (indent === 0) {
+      end = i; // next top-level key
+      break;
+    }
+    if (indent < 4) {
+      const m = /^ {2}([A-Za-z0-9_-]+):\s*(?:#.*)?$/.exec(l);
+      if (!m) throw new Error(`jobs: not a plain job id: ${JSON.stringify(l.trim().slice(0, 60))}`);
+      if (ids.some(([id]) => id === m[1])) throw new Error(`jobs: duplicate job id ${m[1]}`);
+      ids.push([m[1], i]);
+    } else if (ids.length === 0) {
+      throw new Error("jobs: the first line is not a job id");
+    }
   }
+  if (ids.length === 0) throw new Error("jobs: no job found");
+
   const jobs = {};
+  let blocks = 1; // the top-level one
   ids.forEach(([id, at], n) => {
-    const end = n + 1 < ids.length ? ids[n + 1][1] : lines.length;
+    const stop = n + 1 < ids.length ? ids[n + 1][1] : end;
     const own = [];
-    for (let i = at + 1; i < end; i++) if (/^ {4}permissions:/.test(lines[i]) || /^ {1,3}permissions:/.test(lines[i])) own.push(i);
+    for (let i = at + 1; i < stop; i++) if (/^ {4}permissions:\s*$/.test(lines[i])) own.push(i);
     if (own.length > 1) throw new Error(`job ${id}: permissions: repeated`);
     if (own.length === 0) jobs[id] = null;
     else {
-      if (!/^ {4}permissions:\s*$/.test(lines[own[0]])) throw new Error(`job ${id}: permissions is not a block`);
       jobs[id] = block(own[0], 6, `job ${id}`);
+      blocks++;
     }
   });
+
+  // Fail-closed cross-check: every non-comment line that mentions a `permissions` key in ANY spelling (quoted, space
+  // before the colon, inline or flow form, in a step or anywhere else) must be one of the blocks parsed above.
+  const mentions = code.filter((l) => /permissions["']?\s*:/.test(l)).length;
+  if (mentions !== blocks) throw new Error(`${mentions} lines mention a permissions key but ${blocks} blocks were parsed`);
   return { top, jobs };
 }
 

@@ -90,6 +90,25 @@ describe("workflow permissions are exact", () => {
     ["worker-ci.yml", "add pull-requests: write to the ci job", (t) => t.replace("      checks: write\n", "      checks: write\n      pull-requests: write\n")],
     ["worker-deploy.yml", "widen pull-requests to write in plan", (t) => t.replace("      pull-requests: read", "      pull-requests: write")],
     ["worker-deploy.yml", "widen contents to write in migrate", (t) => t.replace(/^( {2}migrate:\n[\s\S]*?\n {4}permissions:\n {6}contents: )read/m, "$1write")],
+
+    // Valid YAML that a naive line parser misses (review of #297): each must still be caught, on the real files.
+    ["worker-deploy.yml", "blank line inside the top-level block, then id-token: write", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, (m) => `${m}\n  id-token: write\n`)],
+    ["worker-ci.yml", "blank line inside the top-level block, then id-token: write", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, (m) => `${m}\n  id-token: write\n`)],
+    ["version.yml", "blank line inside the top-level block, then id-token: write", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, (m) => `${m}\n  id-token: write\n`)],
+    ["worker-deploy.yml", "blank line inside the migrate block, then packages: write", (t) => t.replace(/^( {2}migrate:\n[\s\S]*?\n {4}permissions:\n {6}contents: read\n)/m, (m) => `${m}\n      packages: write\n`)],
+    ["worker-ci.yml", "blank line inside the ci block, then pull-requests: write", (t) => t.replace("      checks: write\n", "      checks: write\n\n      pull-requests: write\n")],
+    ["worker-deploy.yml", 'quoted key "permissions": in a job without a block', (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    "permissions":\n      contents: write\n`)],
+    ["worker-deploy.yml", "single-quoted key 'permissions': in a job without a block", (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    'permissions':\n      contents: write\n`)],
+    ["version.yml", "space before the colon (permissions :) in a job without a block", (t) => t.replace(/^ {2}version:\n/m, (m) => `${m}    permissions :\n      contents: write\n`)],
+    ["worker-deploy.yml", "flow-style job as the FIRST entry under jobs:", (t) => t.replace(/^jobs:\n/m, (m) => `${m}  evil: {runs-on: ubuntu-latest, permissions: {contents: write}, steps: []}\n`)],
+    ["worker-ci.yml", "quoted job id as the FIRST entry under jobs:", (t) => t.replace(/^jobs:\n/m, (m) => `${m}  "evil":\n    permissions:\n      contents: write\n`)],
+    ["version.yml", "plain extra job with a write block as the first job", (t) => t.replace(/^jobs:\n/m, (m) => `${m}  evil:\n    permissions:\n      contents: write\n`)],
+    ["worker-deploy.yml", "second top-level permissions key (quoted duplicate)", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, (m) => `${m}"permissions":\n  contents: write\n`)],
+    ["worker-ci.yml", "second top-level permissions key (plain duplicate)", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, (m) => `${m}permissions:\n  contents: write\n`)],
+    ["worker-deploy.yml", "YAML anchor on the top-level block", (t) => t.replace(/^permissions:\n/m, "x-perms: &p\n  id-token: write\npermissions:\n")],
+    ["worker-deploy.yml", "alias as a job's permissions", (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    permissions: *p\n`)],
+    ["worker-deploy.yml", "merge key in a job block", (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    permissions:\n      <<: *p\n`)],
+    ["worker-deploy.yml", "tab indentation in the top-level block", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, "permissions:\n\tcontents: read\n")],
   ];
   it.each(mutationsOfPermissions)("%s: mutation is caught: %s", (name, _label, fn) => {
     const mutated = fn(texts[name]);
