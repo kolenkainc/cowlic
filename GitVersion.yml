@@ -1,7 +1,10 @@
-# GitVersion 6.x configuration (tool pinned in the job `version` of .github/workflows/ci.yml). Docs: docs/releasing.md
+# GitVersion 6.x configuration (tool pinned in the read-only job `version` of .github/workflows/ci.yml; the job
+# `release` tags every master commit with v + the validated MajorMinorPatch output of `version`). Docs: docs/releasing.md
 workflow: GitHubFlow/v1
 
-# Intermittent use only: remove this line in the PR that follows the first v3.0.0 tag (docs/releasing.md).
+# Intermittent use only: remove this line in the PR that follows the first v3.0.0 tag (docs/releasing.md). The release
+# job creates that tag on the first master commit after it exists; the line is expected to be harmless afterwards
+# (docs/releasing.md records that at the tag v3.0.0 a docs commit computes 3.0.1); the owner removes it when convenient.
 next-version: v3.0.0
 
 # Explicit on purpose: the tag `release-2` (pre-GitVersion) is not a version and must stay ignored.

@@ -1,11 +1,12 @@
 # CI. Contract: docs/worker-cicd.md (section 12.1, rules in 3 and 5.1 rule 5a, pins in 6) and docs/releasing.md.
 # One workflow for every check and for the Worker deploy (#290: part 1 merged version.yml and worker-ci.yml, part 2
-# folded worker-deploy.yml in; the release stage follows in part 3).
+# folded worker-deploy.yml in, part 3 added the release stage).
 #
 # Stages (jobs): changes (what changed), lint (typecheck, migrations), tests (migration lint tests and Vitest, with
 # reports), version (GitVersion, read-only), ci (the gate), then plan -> migrate -> deploy (D1 migrations and the Worker
-# deploy, #201 and #202). Check contexts (the job names; the UI shows "<workflow> / <job>"): `ci`, `changes`, `lint`,
-# `tests`, `version`, `plan`, `migrate`, `deploy`, plus the report check runs "Test Report" and "Test Report (Vitest)".
+# deploy, #201 and #202), then release (tag and GitHub Release, the only job with contents: write). Check contexts
+# (the job names; the UI shows "<workflow> / <job>"): `ci`, `changes`, `lint`, `tests`, `version`, `plan`, `migrate`,
+# `deploy`, `release`, plus the report check runs "Test Report" and "Test Report (Vitest)".
 # The owner's master ruleset requires the context `ci` (integration 15368): it is the gate job below, which always
 # runs and reports on pull_request, push to master and merge_group.
 #
@@ -345,13 +346,13 @@ jobs:
 
       # Vitest has no switch against skipped tests and no minimum count, so both are checked here on the numeric
       # outputs of the report step (no text parsing): skipped must be 0 (a skipped test is a silently dropped check)
-      # and passed must reach MIN_TESTS, a pinned number just below the real count (424 on 2026-10-14: 106 unit, 221
+      # and passed must reach MIN_TESTS, a pinned number just below the real count (551 on 2026-10-14: 106 unit, 348
       # workflow, 51 + 46 smoke) so a few removals do not trip it but a lost file or area does. NOT dynamic: raise it deliberately when tests are added,
       # lower it deliberately when tests are removed on purpose.
       - name: Minimum test count (Vitest)
         if: ${{ steps.vitest.outcome == 'success' }}
         env:
-          MIN_TESTS: "418"
+          MIN_TESTS: "545"
           PASSED: ${{ steps.vitest_report.outputs.passed }}
           SKIPPED: ${{ steps.vitest_report.outputs.skipped }}
         run: |
@@ -368,15 +369,25 @@ jobs:
             exit 1
           fi
 
-  # Calculates the GitVersion version and prints it in the job summary. Read-only: it never tags or releases.
+  # Calculates the GitVersion version and prints it in the job summary. Read-only (NO permissions block: the workflow
+  # `contents: read`, no write token, no secret): it never tags or releases. The ONLY job that runs the unlocked NuGet
+  # package GitVersion.Tool (pinned by version only). Its result also leaves as VALIDATED job outputs for the job
+  # `release` (which holds the write token and installs and runs no tool): sha, major_minor_patch, pre_release_label,
+  # branch_name; a value that does not match its strict pattern is written empty (`invalid` for the label), and
+  # `release` re-validates all of them.
   # Contract: docs/releasing.md. Config: GitVersion.yml (GitVersion 6.x, GitHubFlow/v1). Runs on every event, also on
   # merge_group. It is NOT part of the gate (as before: it was never a required check), so a GitVersion problem on
-  # an unusual ref cannot stall the queue; the job reports its own check `version`.
+  # an unusual ref cannot stall the queue; the job reports its own check `version`. `release` needs it.
   version:
     name: version
     # Pinned image (not -latest): the audited image ships .NET SDK 8, 9 and 10.
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.gv.outputs.sha }}
+      major_minor_patch: ${{ steps.gv.outputs.major_minor_patch }}
+      pre_release_label: ${{ steps.gv.outputs.pre_release_label }}
+      branch_name: ${{ steps.gv.outputs.branch_name }}
     env:
       # Exact tool version (audit in docs/releasing.md). Never upgrade without confirmation.
       GITVERSION_TOOL_VERSION: "6.8.2"
@@ -396,6 +407,7 @@ jobs:
 
       # Branch/ref names reach GitVersion through the runner environment (GITHUB_REF), never through the command line.
       - name: Calculate version
+        id: gv
         run: |
           "$RUNNER_TEMP/gitversion/dotnet-gitversion" . /output json /verbosity Quiet > "$RUNNER_TEMP/gitversion.json"
           {
@@ -408,6 +420,21 @@ jobs:
             done
           } >> "$GITHUB_STEP_SUMMARY"
           jq -r '"Calculated version: " + .FullSemVer' "$RUNNER_TEMP/gitversion.json"
+          # The outputs for `release`: strictly validated here, an unexpected value is written empty (label: invalid).
+          sha=$(git rev-parse HEAD)
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || sha=""
+          mmp=$(jq -r '.MajorMinorPatch // ""' "$RUNNER_TEMP/gitversion.json")
+          label=$(jq -r '.PreReleaseLabel // ""' "$RUNNER_TEMP/gitversion.json")
+          branch=$(jq -r '.BranchName // ""' "$RUNNER_TEMP/gitversion.json")
+          [[ "$mmp" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || mmp=""
+          [[ "$label" =~ ^[A-Za-z0-9.-]{0,50}$ ]] || label="invalid"
+          [[ "$branch" =~ ^[A-Za-z0-9._/-]{1,100}$ ]] || branch=""
+          {
+            echo "sha=$sha"
+            echo "major_minor_patch=$mmp"
+            echo "pre_release_label=$label"
+            echo "branch_name=$branch"
+          } >> "$GITHUB_OUTPUT"
 
   # The gate: the REQUIRED check `ci`. Always runs (a skipped required check counts as passed, so there is no other
   # condition, ever) and aggregates the needed jobs. `changes` must have succeeded and say true or false; when worker
@@ -1315,4 +1342,131 @@ jobs:
             echo '```'
             echo 'npx wrangler rollback --message "health check failed" -c wrangler.local.toml'
             echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Release stage (#290 part 3, owner decision (a) of 2026-10-14): tag EVERY master commit vX.Y.Z (idempotent), create
+  # the GitHub Release (generated notes) only for feat, fix, perf and breaking commits or on a manual dispatch.
+  # Runs only on push to master and workflow_dispatch from master in this repository (never pull_request,
+  # merge_group, fork) and only after the deploy chain is done: plan succeeded and EITHER nothing was to be deployed
+  # (migrate and deploy skipped by design) OR migrate and deploy both succeeded. A failed, cancelled or rejected
+  # migrate or deploy, a failed plan or a failed gate never releases. `!cancelled()` is needed because migrate and
+  # deploy are legitimately skipped when there is nothing to deploy (a skipped need would otherwise skip this job).
+  # The ONLY job with contents: write (to create the tag and the Release through the REST API with the job's
+  # GITHUB_TOKEN: no PAT, no push from a checkout, no environment, no deploy secret, nothing of Cloudflare). The group
+  # worker-deploy of the workflow serializes it with the other pushes.
+  # SUPPLY CHAIN: this job holds the write token, so it installs and runs NO package and uses NO action (no checkout:
+  # only `gh` of the runner image and the REST API). The version is computed by the job `version` (read-only, the only
+  # job that runs GitVersion.Tool) and arrives as validated job outputs; this job needs `version` to have succeeded and
+  # RE-VALIDATES every output (sha equal to github.sha, branch master, empty prerelease label, strict X.Y.Z), so an
+  # empty or tampered output fails closed. The tag name is built only from that value. A tag is never moved, deleted
+  # or forced: an existing tag on THIS commit is a no-op, on another commit or any unexpected state the job fails. If
+  # master moved on after this commit the job ends green WITHOUT a tag (a newer run tags its own commit); so under
+  # fast merging not every commit gets a tag.
+  release:
+    name: release
+    needs: [changes, lint, tests, ci, version, plan, migrate, deploy]
+    if: ${{ !cancelled() && needs.ci.result == 'success' && needs.version.result == 'success' && needs.plan.result == 'success' && ((needs.plan.outputs.deploy != 'true' && needs.migrate.result == 'skipped' && needs.deploy.result == 'skipped') || (needs.plan.outputs.deploy == 'true' && needs.migrate.result == 'success' && needs.deploy.result == 'success')) && github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Everything untrusted (the commit message is written by whoever merges) is data: it comes through the API into a
+      # shell variable and is only matched with [[ =~ ]], never put in a command line, a summary or an expression.
+      - name: Tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          V_SHA: ${{ needs.version.outputs.sha }}
+          V_MMP: ${{ needs.version.outputs.major_minor_patch }}
+          V_LABEL: ${{ needs.version.outputs.pre_release_label }}
+          V_BRANCH: ${{ needs.version.outputs.branch_name }}
+        run: |
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+          is_sha() {
+            case "$1" in
+              "" | *[!0-9a-f]*) return 1 ;;
+            esac
+            [ "${#1}" -eq 40 ]
+          }
+          is_sha "$EVENT_SHA" || fail "unexpected github.sha"
+          # Only the head of master is tagged. Fail closed when it cannot be read.
+          if ! master=$(gh api "repos/$REPO/git/ref/heads/master" --jq .object.sha); then
+            fail "cannot read the head of master"
+          fi
+          is_sha "$master" || fail "unexpected master head value"
+          if [ "$master" != "$EVENT_SHA" ]; then
+            echo "::notice::master moved on after this commit: no tag from this run, a newer run tags its own commit"
+            {
+              echo "### Release skipped"
+              echo
+              echo "- Commit \`$EVENT_SHA\` is no longer the head of master: no tag from this run."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # The version outputs of the job `version`, RE-VALIDATED here (an empty or tampered output fails closed): computed
+          # for this very commit, on the branch master, no prerelease label, strictly X.Y.Z. Nothing is tagged otherwise.
+          [ "$V_SHA" = "$EVENT_SHA" ] || fail "the version was not computed for this commit: nothing is tagged"
+          [ "$V_BRANCH" = "master" ] || fail "the version was not computed on the branch master: nothing is tagged"
+          [ -z "$V_LABEL" ] || fail "the version has a prerelease label: nothing is tagged"
+          [[ "$V_MMP" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "the version is not X.Y.Z: nothing is tagged"
+          tag="v$V_MMP"
+          # Idempotent and never moving: the same commit is a no-op, anything else fails. The tag state is read with the
+          # matching-refs listing: it answers 200 with an empty list when the tag does not exist, so no error text
+          # (404) has to be parsed; any API error fails the job. The exact ref is selected (v3.0.1 also matches v3.0.10).
+          if ! existing=$(gh api "repos/$REPO/git/matching-refs/tags/$tag" --jq ".[] | select(.ref == \"refs/tags/$tag\") | .object.type + \" \" + .object.sha"); then
+            fail "cannot read the tag $tag"
+          fi
+          if [ -n "$existing" ]; then
+            read -r obj_type obj_sha <<< "$existing"
+            [ "$obj_type" = "commit" ] || fail "the tag $tag exists and is not a lightweight tag: nothing is changed"
+            is_sha "$obj_sha" || fail "unexpected tag value"
+            [ "$obj_sha" = "$EVENT_SHA" ] || fail "the tag $tag exists on another commit: tags are never moved"
+            echo "tag $tag is already on this commit"
+            created=no
+          else
+            gh api -X POST "repos/$REPO/git/refs" -f "ref=refs/tags/$tag" -f "sha=$EVENT_SHA" > /dev/null || fail "cannot create the tag $tag"
+            echo "created tag $tag"
+            created=yes
+          fi
+          # The GitHub Release only for feat, fix, perf and breaking commits (Conventional Commit subject of the squash
+          # commit, or a BREAKING CHANGE footer) and for a manual dispatch.
+          if ! message=$(gh api "repos/$REPO/commits/$EVENT_SHA" --jq '.commit.message // ""'); then
+            fail "cannot read the commit message"
+          fi
+          subject="${message%%$'\n'*}"
+          re_type='^(feat|fix|perf)(\([^)]*\))?!?:'
+          re_breaking='^[A-Za-z]+(\([^)]*\))?!:'
+          re_footer=$'(^|\n)BREAKING[ -]CHANGE:'
+          release=no
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            release=yes
+          elif [[ "$subject" =~ $re_type ]] || [[ "$subject" =~ $re_breaking ]] || [[ "$message" =~ $re_footer ]]; then
+            release=yes
+          fi
+          released=no
+          if [ "$release" = "yes" ]; then
+            if gh release view "$tag" --repo "$REPO" > /dev/null 2>&1; then
+              echo "the release $tag already exists"
+            else
+              gh release create "$tag" --repo "$REPO" --verify-tag --generate-notes --title "$tag" > /dev/null || fail "cannot create the release $tag"
+              echo "created release $tag"
+              released=yes
+            fi
+          else
+            echo "no GitHub Release for this commit (only feat, fix, perf, breaking commits and manual runs get one)"
+          fi
+          {
+            echo "### Release"
+            echo
+            echo "- Tag: \`$tag\` on \`$EVENT_SHA\` (created now: $created)"
+            echo "- GitHub Release for this commit: $release (created now: $released)"
           } >> "$GITHUB_STEP_SUMMARY"
