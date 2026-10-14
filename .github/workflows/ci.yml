@@ -66,7 +66,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 # Section 3 rule 5: a run superseded by a new commit on the PR is cancelled (cancelling CI is fine; deploys are never
 # cancelled). cancel-in-progress is true only for the pull_request actions opened, reopened and synchronize. A label
