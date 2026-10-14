@@ -61,10 +61,12 @@ export function createChangesRunner(text, { tmp }) {
     }
     const tmpDir = join(dir, `t${id}`);
     mkdirSync(tmpDir);
-    const r2 = spawnSync("bash", ["-e", join(dir, "detect.sh")], { cwd, env: { ...env, BASE_SHA: base ?? "", RUNNER_TEMP: tmpDir, GITHUB_OUTPUT: out2 }, encoding: "utf8" });
-    const changed = /^worker_changed=(.*)$/m.exec(readFileSync(out2, "utf8"))?.[1] ?? null;
+    const r2 = spawnSync("bash", ["-e", join(dir, "detect.sh")], { cwd, env: { ...env, EVENT_NAME: event, BASE_SHA: base ?? "", RUNNER_TEMP: tmpDir, GITHUB_OUTPUT: out2 }, encoding: "utf8" });
+    const outputs = readFileSync(out2, "utf8");
+    const changed = /^worker_changed=(.*)$/m.exec(outputs)?.[1] ?? null;
+    const deployChanged = /^deploy_changed=(.*)$/m.exec(outputs)?.[1] ?? null;
     const outBase = r1 ? (/^base_sha=(.*)$/m.exec(readFileSync(out1, "utf8"))?.[1] ?? null) : base;
-    return { A, H, base, outBase, changed, status: [r1?.status ?? 0, r2.status] };
+    return { A, H, base, outBase, changed, deployChanged, status: [r1?.status ?? 0, r2.status] };
   };
   return { run };
 }
@@ -77,7 +79,10 @@ export const changesCases = [
   ["pull_request: docs only", { event: "pull_request", change: "docs" }, "A", "false"],
   ["pull_request: nothing changed", { event: "pull_request" }, "A", "false"],
   ["pull_request: ci.yml changed", { event: "pull_request", change: "ci" }, "A", "true"],
-  ["pull_request: worker-deploy.yml changed", { event: "pull_request", change: "deploy" }, "A", "true"],
+  ["workflow_dispatch: docs only still runs everything (base is the parent)", { event: "workflow_dispatch", change: "docs" }, "A", "true"],
+  ["workflow_dispatch: nothing changed still runs everything", { event: "workflow_dispatch" }, "A", "true"],
+  ["push: only ci.yml changed does not deploy", { event: "push", change: "ci", before: A_ }, "A", "true"],
+  ["push: a change of the removed worker-deploy.yml path is not tracked any more",{ event: "push", change: "deploy", before: A_ }, "A", "false"],
   ["pull_request: no origin/master (fail closed)", { event: "pull_request", change: "docs", noOriginMaster: true }, "", "true"],
   ["merge_group: valid base and head, docs only", { event: "merge_group", change: "docs", mgBase: A_, mgHead: H_ }, "A", "false"],
   ["merge_group: valid base and head, worker changed", { event: "merge_group", change: "worker", mgBase: A_, mgHead: H_ }, "A", "true"],
@@ -108,6 +113,10 @@ export function changesCaseFailures(runner, [name, opts, wantBase, wantChanged])
   if ((r.base ?? "") !== base) f.push(`${name}: base ${JSON.stringify(r.base)}, expected ${JSON.stringify(base)}`);
   if ((r.outBase ?? "") !== base) f.push(`${name}: base_sha output ${JSON.stringify(r.outBase)}`);
   if (r.changed !== wantChanged) f.push(`${name}: worker_changed=${r.changed}, expected ${wantChanged}`);
+  // deploy_changed: true for a manual dispatch, for a change under worker/ and whenever the check fails closed; a
+  // change of ci.yml alone (worker_changed true) must not deploy.
+  const wantDeploy = opts.event === "workflow_dispatch" || (wantChanged === "true" && opts.change !== "ci") ? "true" : "false";
+  if (r.deployChanged !== wantDeploy) f.push(`${name}: deploy_changed=${r.deployChanged}, expected ${wantDeploy}`);
   return f;
 }
 
@@ -116,5 +125,8 @@ export const changesMutations = [
   ["the no base branch writes worker_changed=false", (t) => t.replace('echo "no base: treating worker as changed"\n            echo "worker_changed=true"', 'echo "no base: treating worker as changed"\n            echo "worker_changed=false"')],
   ["the merge_group head check is replaced by true", (t) => t.replace('if [ "$head" = "$MG_HEAD_SHA" ]; then', "if true; then")],
   ["the merge_group is_sha check is replaced by true", (t) => t.replace('if is_sha "$MG_BASE_SHA" && is_sha "$MG_HEAD_SHA"; then', "if true; then")],
-  ["pull_request resolves the base to HEAD", (t) => t.replace("refs/remotes/origin/master^{commit}", "HEAD^{commit}")],
+  ["deploy_changed also watches ci.yml", (t) => t.replace("-- ':(top)worker' > \"$RUNNER_TEMP/deploy-changed.txt\"", "-- ':(top)worker' ':(top).github/workflows/ci.yml' > \"$RUNNER_TEMP/deploy-changed.txt\"")],
+  ["a manual dispatch is not forced to deploy", (t) => t.replace('if [ "$EVENT_NAME" = "workflow_dispatch" ]; then\n            echo "manual dispatch', 'if false; then\n            echo "manual dispatch')],
+  ["the no base branch writes deploy_changed=false", (t) => t.replace('echo "no base: treating worker as changed"\n            echo "worker_changed=true" >> "$GITHUB_OUTPUT"\n            echo "deploy_changed=true"', 'echo "no base: treating worker as changed"\n            echo "worker_changed=true" >> "$GITHUB_OUTPUT"\n            echo "deploy_changed=false"')],
+  ["pull_request resolves the base to HEAD",(t) => t.replace("refs/remotes/origin/master^{commit}", "HEAD^{commit}")],
 ];

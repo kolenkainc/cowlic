@@ -1,6 +1,6 @@
-// Regression tests of .github/workflows/worker-deploy.yml (#272) and of .github/workflows/ci.yml (#290, #292: the gate
-// `ci`, the triggers incl. merge_group, permissions, no secrets); was scripts/workflow-check.mjs. No network, no
-// secrets; needs bash. The logic is in ./lib.mjs.
+// Regression tests of .github/workflows/ci.yml (#290, #292): the gate `ci`, the triggers incl. merge_group, permissions,
+// secrets only in the deploy jobs, and the deploy jobs plan/migrate/deploy (#272; they were worker-deploy.yml until #290
+// part 2); was scripts/workflow-check.mjs. No network, no secrets; needs bash. The logic is in ./lib.mjs.
 // The mutation tests keep the repo's mutation-check practice: each in-memory mutation of the workflow text must be
 // caught by the static or the dynamic checks, so a weakened check turns a test red.
 import { existsSync, rmSync } from "node:fs";
@@ -8,13 +8,13 @@ import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
-  PERMISSIONS, ciFailures, ciFile, createRunner, createSandbox, deployFile, dynamicFailures, hostileTitleFailures, hostileTitles, mutations,
+  PERMISSIONS, ciFailures, ciFile, createRunner, createSandbox, dynamicFailures, hostileTitleFailures, hostileTitles, mutations,
   parsePermissions, permissionFailures, readText, staticFailures, steps, tamperCases,
 } from "./lib.mjs";
 import { changesCaseFailures, changesCases, changesMutations, createChangesRunner } from "./changes.mjs";
 
-const original = readText(deployFile);
 const ci = readText(ciFile);
+const original = ci; // the deploy jobs live in ci.yml
 let sandbox;
 let runner;
 
@@ -26,7 +26,7 @@ afterAll(() => {
   if (sandbox) rmSync(sandbox.tmp, { recursive: true, force: true });
 });
 
-describe("worker-deploy.yml: parser and static controls", () => {
+describe("ci.yml deploy jobs: parser and static controls", () => {
   it("parser sees the steps (guards against a vacuous run)", () => {
     const all = steps(original);
     expect(all.length).toBeGreaterThanOrEqual(30);
@@ -50,7 +50,7 @@ describe("behaviour and tampered inputs", () => {
   });
 });
 
-describe("mutations of worker-deploy.yml are caught", () => {
+describe("mutations of the deploy run blocks are caught", () => {
   it.each(mutations.map(([name, fn]) => [name, fn]))("mutation is caught: %s", (name, fn) => {
     const mutated = fn(original);
     // The pattern must still exist, otherwise the workflow changed and this test must be updated.
@@ -71,7 +71,7 @@ describe("mutations of worker-deploy.yml are caught", () => {
 // must make the check fail: an extra scope, a widened level, a block where there was none, or a form the parser does
 // not understand (fail closed).
 describe("workflow permissions are exact", () => {
-  const files = { "ci.yml": ciFile, "worker-deploy.yml": deployFile };
+  const files = { "ci.yml": ciFile };
   const texts = Object.fromEntries(Object.entries(files).map(([name, path]) => [name, readText(path)]));
 
   it.each(Object.keys(files))("%s: top-level and per-job permissions match the allowlist exactly", (name) => {
@@ -83,46 +83,45 @@ describe("workflow permissions are exact", () => {
   const appendTop = (line) => (t) => t.replace(/^permissions:\n {2}contents: read\n/m, (m) => `${m}  ${line}\n`);
   const mutationsOfPermissions = [
     ["ci.yml", "append id-token: write at top level", appendTop("id-token: write")],
-    ["worker-deploy.yml", "append id-token: write at top level", appendTop("id-token: write")],
-    ["worker-deploy.yml", "top-level contents: write", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, "permissions:\n  contents: write\n")],
-    ["worker-deploy.yml", "top-level write-all (inline form, parser fails closed)", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, "permissions: write-all\n")],
-    ["worker-deploy.yml", "add contents: write to a job that has no block (deploy)", addJobBlock("deploy", ["contents: write"])],
-    ["worker-deploy.yml", "widen checks to write in a job that has none (deploy)", addJobBlock("deploy", ["checks: write"])],
+    ["ci.yml", "top-level contents: write", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, "permissions:\n  contents: write\n")],
+    ["ci.yml", "top-level write-all (inline form, parser fails closed)", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, "permissions: write-all\n")],
+    ["ci.yml", "add contents: write to a job that has no block (deploy)", addJobBlock("deploy", ["contents: write"])],
+    ["ci.yml", "widen checks to write in a job that has none (deploy)", addJobBlock("deploy", ["checks: write"])],
     ["ci.yml", "add contents: write to a job that has no block (version)", addJobBlock("version", ["contents: write"])],
     ["ci.yml", "add contents: write to a job that has no block (lint)", addJobBlock("lint", ["contents: write"])],
     ["ci.yml", "add checks: write to the gate (ci), which has no block", addJobBlock("ci", ["checks: write"])],
     ["ci.yml", "contents: write in the tests job", (t) => t.replace("      contents: read\n      checks: write\n", "      contents: write\n      checks: write\n")],
     ["ci.yml", "add pull-requests: write to the tests job", (t) => t.replace("      checks: write\n", "      checks: write\n      pull-requests: write\n")],
-    ["worker-deploy.yml", "widen pull-requests to write in plan", (t) => t.replace("      pull-requests: read", "      pull-requests: write")],
-    ["worker-deploy.yml", "widen contents to write in migrate", (t) => t.replace(/^( {2}migrate:\n[\s\S]*?\n {4}permissions:\n {6}contents: )read/m, "$1write")],
+    ["ci.yml", "widen pull-requests to write in plan", (t) => t.replace("      pull-requests: read", "      pull-requests: write")],
+    ["ci.yml", "widen contents to write in migrate", (t) => t.replace(/^( {2}migrate:\n[\s\S]*?\n {4}permissions:\n {6}contents: )read/m, "$1write")],
 
     // Valid YAML that a naive line parser misses (review of #297): each must still be caught, on the real files.
-    ["worker-deploy.yml", "blank line inside the top-level block, then id-token: write", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, (m) => `${m}\n  id-token: write\n`)],
     ["ci.yml", "blank line inside the top-level block, then id-token: write", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, (m) => `${m}\n  id-token: write\n`)],
-    ["worker-deploy.yml", "blank line inside the migrate block, then packages: write", (t) => t.replace(/^( {2}migrate:\n[\s\S]*?\n {4}permissions:\n {6}contents: read\n)/m, (m) => `${m}\n      packages: write\n`)],
+    ["ci.yml", "blank line inside the top-level block, then id-token: write", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, (m) => `${m}\n  id-token: write\n`)],
+    ["ci.yml", "blank line inside the migrate block, then packages: write", (t) => t.replace(/^( {2}migrate:\n[\s\S]*?\n {4}permissions:\n {6}contents: read\n)/m, (m) => `${m}\n      packages: write\n`)],
     ["ci.yml", "blank line inside the tests block, then pull-requests: write", (t) => t.replace("      checks: write\n", "      checks: write\n\n      pull-requests: write\n")],
-    ["worker-deploy.yml", 'quoted key "permissions": in a job without a block', (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    "permissions":\n      contents: write\n`)],
-    ["worker-deploy.yml", "single-quoted key 'permissions': in a job without a block", (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    'permissions':\n      contents: write\n`)],
+    ["ci.yml", 'quoted key "permissions": in a job without a block', (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    "permissions":\n      contents: write\n`)],
+    ["ci.yml", "single-quoted key 'permissions': in a job without a block", (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    'permissions':\n      contents: write\n`)],
     ["ci.yml", "space before the colon (permissions :) in a job without a block", (t) => t.replace(/^ {2}version:\n/m, (m) => `${m}    permissions :\n      contents: write\n`)],
-    ["worker-deploy.yml", "flow-style job as the FIRST entry under jobs:", (t) => t.replace(/^jobs:\n/m, (m) => `${m}  evil: {runs-on: ubuntu-latest, permissions: {contents: write}, steps: []}\n`)],
+    ["ci.yml", "flow-style job as the FIRST entry under jobs:", (t) => t.replace(/^jobs:\n/m, (m) => `${m}  evil: {runs-on: ubuntu-latest, permissions: {contents: write}, steps: []}\n`)],
     ["ci.yml", "quoted job id as the FIRST entry under jobs:", (t) => t.replace(/^jobs:\n/m, (m) => `${m}  "evil":\n    permissions:\n      contents: write\n`)],
     ["ci.yml", "plain extra job with a write block as the first job", (t) => t.replace(/^jobs:\n/m, (m) => `${m}  evil:\n    permissions:\n      contents: write\n`)],
-    ["worker-deploy.yml", "second top-level permissions key (quoted duplicate)", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, (m) => `${m}"permissions":\n  contents: write\n`)],
+    ["ci.yml", "second top-level permissions key (quoted duplicate)", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, (m) => `${m}"permissions":\n  contents: write\n`)],
     ["ci.yml", "second top-level permissions key (plain duplicate)", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, (m) => `${m}permissions:\n  contents: write\n`)],
-    ["worker-deploy.yml", "YAML anchor on the top-level block", (t) => t.replace(/^permissions:\n/m, "x-perms: &p\n  id-token: write\npermissions:\n")],
-    ["worker-deploy.yml", "alias as a job's permissions", (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    permissions: *p\n`)],
-    ["worker-deploy.yml", "merge key in a job block", (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    permissions:\n      <<: *p\n`)],
-    ["worker-deploy.yml", "tab indentation in the top-level block", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, "permissions:\n\tcontents: read\n")],
+    ["ci.yml", "YAML anchor on the top-level block", (t) => t.replace(/^permissions:\n/m, "x-perms: &p\n  id-token: write\npermissions:\n")],
+    ["ci.yml", "alias as a job's permissions", (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    permissions: *p\n`)],
+    ["ci.yml", "merge key in a job block", (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    permissions:\n      <<: *p\n`)],
+    ["ci.yml", "tab indentation in the top-level block", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, "permissions:\n\tcontents: read\n")],
 
     // #290 parser hardening: case variants, complex keys, YAML-escaped keys (each a way to hide or rename a scope).
     ["ci.yml", "case variant Permissions: in a job without a block", (t) => t.replace(/^ {2}version:\n/m, (m) => `${m}    Permissions:\n      contents: write\n`)],
-    ["worker-deploy.yml", "case variant PERMISSIONS: in a job without a block", (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    PERMISSIONS:\n      contents: write\n`)],
+    ["ci.yml", "case variant PERMISSIONS: in a job without a block", (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    PERMISSIONS:\n      contents: write\n`)],
     ["ci.yml", "case variant PERMISSIONS: instead of the top-level key", (t) => t.replace(/^permissions:\n/m, "PERMISSIONS:\n")],
     ["ci.yml", "case variant Permissions: as a second top-level key", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, (m) => `${m}Permissions:\n  contents: write\n`)],
-    ["worker-deploy.yml", "complex key `? permissions` in a job without a block", (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    ? permissions\n    : {contents: write}\n`)],
+    ["ci.yml", "complex key `? permissions` in a job without a block", (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    ? permissions\n    : {contents: write}\n`)],
     ["ci.yml", "complex key `? permissions` as a second top-level key", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, (m) => `${m}? permissions\n: {contents: write}\n`)],
     ["ci.yml", "YAML-escaped key (x70) in a job without a block", (t) => t.replace(/^ {2}version:\n/m, (m) => `${m}    "\\x70ermissions":\n      contents: write\n`)],
-    ["worker-deploy.yml", "YAML-escaped key (u0069) in a job without a block", (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    "perm\\u0069ssions":\n      contents: write\n`)],
+    ["ci.yml", "YAML-escaped key (u0069) in a job without a block", (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    "perm\\u0069ssions":\n      contents: write\n`)],
     ["ci.yml", "YAML-escaped key in flow style on one line", (t) => t.replace(/^ {2}version:\n/m, (m) => `${m}    {"\\x70ermissions": {contents: write}}\n`)],
     ["ci.yml", "case variant and escape together (Perm x69 ssions)", (t) => t.replace(/^ {2}version:\n/m, (m) => `${m}    "Perm\\x69ssions":\n      contents: write\n`)],
   ];
@@ -198,7 +197,7 @@ describe("ci.yml reports `ci` on pull_request, push and merge_group (#290, #292)
   const ciMutations = [
     ["ci without merge_group", (t) => t.replace("  merge_group:\n    types: [checks_requested]\n", "")],
     ["merge_group with another type", (t) => t.replace("types: [checks_requested]", "types: [destroyed]")],
-    ["ci gate removed", (t) => t.replace(/^ {2}ci:\n[\s\S]*$/m, "")],
+    ["ci gate removed", (t) => t.replace(/^ {2}ci:\n(?: {4}.*\n| *#.*\n|\n)*/m, "")],
     ["ci gate renamed (job id and name)", (t) => t.replace("  ci:\n    name: ci\n", "  gate:\n    name: gate\n")],
     ["ci gate name changed (id kept)", (t) => t.replace("  ci:\n    name: ci\n", "  ci:\n    name: ci-gate\n")],
     ["ci job with a pull_request-only if", (t) => t.replace("    if: ${{ always() }}\n", "    if: ${{ github.event_name == 'pull_request' }}\n")],
@@ -216,12 +215,39 @@ describe("ci.yml reports `ci` on pull_request, push and merge_group (#290, #292)
     ["secrets: inherit on a job", (t) => t.replace("  version:\n", "  version:\n    secrets: inherit\n")],
     ["environment on a job", (t) => t.replace("  tests:\n", "  tests:\n    environment: production\n")],
     ["pull_request_target added", (t) => t.replace("  merge_group:\n", "  pull_request_target:\n  merge_group:\n")],
-    ["workflow_dispatch added", (t) => t.replace("  merge_group:\n", "  workflow_dispatch:\n  merge_group:\n")],
+    ["schedule trigger added", (t) => t.replace("  merge_group:\n", "  schedule:\n    - cron: '0 3 * * *'\n  merge_group:\n")],
+    ["workflow_run trigger added", (t) => t.replace("  merge_group:\n", "  workflow_run:\n    workflows: [CI]\n  merge_group:\n")],
+    ["workflow_dispatch with an input", (t) => t.replace("  workflow_dispatch:\n", "  workflow_dispatch:\n    inputs:\n      ref:\n        type: string\n")],
+    ["workflow_dispatch removed", (t) => t.replace("  workflow_dispatch:\n", "")],
     ["paths filter on pull_request", (t) => t.replace(prTypes, `${prTypes}    paths: ["worker/**"]\n`)],
     ["paths-ignore filter on pull_request", (t) => t.replace(prTypes, `${prTypes}    paths-ignore: ["docs/**"]\n`)],
     ["branches filter on merge_group", (t) => t.replace("    types: [checks_requested]\n", "    types: [checks_requested]\n    branches: [master]\n")],
     ["paths filter on push", (t) => t.replace("    branches: [master]\n", '    branches: [master]\n    paths: ["worker/**"]\n')],
-    ["shared concurrency group without the event", (t) => t.replace("group: ci-${{ github.event_name }}-${{ github.ref }}", "group: ci-${{ github.ref }}")],
+    ["shared concurrency group for push runs (a pending run with a deploy could be replaced)", (t) => t.replace("github.event_name == 'pull_request' && github.ref || github.run_id", "github.ref")],
+    ["shared concurrency group without the event", (t) => t.replace("group: ci-${{ github.event_name }}-", "group: ci-")],
+    // The deploy jobs (#290 part 2, #287): the graph, the conditions, the group, secrets only in migrate and deploy.
+    ["deploy job without needs", (t) => t.replace("    needs: [plan, migrate]\n", "")],
+    ["deploy needs only plan (can start without migrate)", (t) => t.replace("needs: [plan, migrate]", "needs: [plan]")],
+    ["migrate without needs", (t) => t.replace("  migrate:\n    name: migrate\n    needs: plan\n", "  migrate:\n    name: migrate\n")],
+    ["plan without the gate in needs (deploy without lint, tests and ci)", (t) => t.replace("needs: [changes, lint, tests, ci]", "needs: [changes]")],
+    ["plan without the repository condition (forks)", (t) => t.replace("github.repository == 'kolenkainc/cowlic' && ", "")],
+    ["plan without the master ref condition", (t) => t.replace("github.ref == 'refs/heads/master' && ", "")],
+    ["plan on every event except pull_request (merge_group deploys)", (t) => t.replace("github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && needs.changes.outputs.deploy_changed == 'true')", "github.event_name != 'pull_request'")],
+    ["plan on pull_request too", (t) => t.replace("(github.event_name == 'workflow_dispatch' ||", "(github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' ||")],
+    ["plan on every push (no deploy_changed condition)", (t) => t.replace(" && needs.changes.outputs.deploy_changed == 'true'", "")],
+    ["plan with an extra job-level if", (t) => t.replace("  plan:\n    name: plan\n", "  plan:\n    name: plan\n    if: ${{ true }}\n")],
+    ["plan with an environment", (t) => t.replace("  plan:\n    name: plan\n", "  plan:\n    name: plan\n    environment: production\n")],
+    ["deploy without an environment", (t) => t.replace("    environment: production\n", "")],
+    ["migrate without its environment", (t) => t.replace("    environment:\n      name: ${{ needs.plan.outputs.environment }}\n", "")],
+    ["shared cancellable concurrency group on deploy", (t) => t.replace(/(  deploy:\n[\s\S]*?concurrency:\n) {6}group: worker-deploy\n {6}cancel-in-progress: false\n/m, "$1      group: ci-${{ github.ref }}\n      cancel-in-progress: true\n")],
+    ["deploy with cancel-in-progress true", (t) => t.replace(/(  deploy:\n[\s\S]*?concurrency:\n {6}group: worker-deploy\n {6}cancel-in-progress: )false/m, "$1true")],
+    ["migrate without the deploy concurrency group", (t) => t.replace(/(  migrate:\n[\s\S]*?)    concurrency:\n {6}group: worker-deploy\n {6}cancel-in-progress: false\n/m, "$1")],
+    ["a cancellable job in the deploy group", (t) => t.replace("  lint:\n    name: lint\n", "  lint:\n    name: lint\n    concurrency:\n      group: worker-deploy\n      cancel-in-progress: true\n")],
+    ["secrets used in plan (outside an environment)", (t) => t.replace("      - name: Commit title\n        id: title\n", "      - name: Commit title\n        id: title\n        env:\n          X: ${{ secrets.CLOUDFLARE_API_TOKEN }}\n")],
+    ["secrets used in the tests job", (t) => t.replace("      - name: Migration lint tests\n", "      - name: Migration lint tests\n        env:\n          X: ${{ secrets.WORKER_URL }}\n")],
+    ["contents: write on the deploy job", (t) => t.replace("  deploy:\n    name: deploy\n", "  deploy:\n    name: deploy\n    permissions:\n      contents: write\n")],
+    ["plain npm ci with install scripts in deploy", (t) => t.replace(/(  deploy:\n[\s\S]*?)npm ci --ignore-scripts/m, "$1npm ci")],
+    ["a new job (a release job without review)", (t) => `${t}\n  release:\n    name: release\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n`],
     ["cancel-in-progress for every event", (t) => t.replace(/cancel-in-progress: .*\n/, "cancel-in-progress: true\n")],
     ["cancel-in-progress for every pull_request action (a label event cancels the run in progress)", (t) => t.replace(/cancel-in-progress: .*\n/, "cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n")],
     ["cancel-in-progress also on labeled", (t) => t.replace('["opened","reopened","synchronize"]', '["opened","reopened","synchronize","labeled"]')],
@@ -235,13 +261,8 @@ describe("ci.yml reports `ci` on pull_request, push and merge_group (#290, #292)
     expect(mutated, `the mutation pattern was not found: ${name}`).not.toBe(ci);
     expect(ciFailures(mutated).length).toBeGreaterThan(0);
   });
-  it("mutation is caught: deploy workflow with merge_group", () => {
-    const deployMg = original.replace("  workflow_dispatch:\n", "  workflow_dispatch:\n  merge_group:\n    types: [checks_requested]\n");
-    expect(deployMg, "the workflow_dispatch trigger was not found (update this test)").not.toBe(original);
-    expect(staticFailures(deployMg).length).toBeGreaterThan(0);
-  });
-  it("the unmodified deploy workflow has no merge_group trigger", () => {
-    expect(staticFailures(original).some((x) => x.includes("merge_group"))).toBe(false);
+  it("the deploy jobs never match merge_group or pull_request (the queue's squash commit is the push that deploys)", () => {
+    expect(staticFailures(original).some((x) => x.includes("merge_group") || x.includes("pull_request"))).toBe(false);
   });
 });
 

@@ -1,5 +1,6 @@
 // Helpers of the workflow tests (#272, #292; was scripts/workflow-check.mjs): no network, no secrets, needs bash.
-// Line-based parse of .github/workflows/worker-deploy.yml (no YAML parser), static controls, a runner that executes the
+// Line-based parse of .github/workflows/ci.yml (no YAML parser; the deploy jobs were worker-deploy.yml until #290
+// part 2), static controls, a runner that executes the
 // run blocks of the steps "Commit title" (plan) and "Deploy" (deploy) under `bash -eo pipefail` with stub gh / git / npx,
 // and the hostile / tampered cases. Every function returns a list of failure strings (empty = ok), so the same logic
 // serves the real file and the in-memory mutations that must be caught.
@@ -10,7 +11,6 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const workerDir = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-export const deployFile = join(workerDir, "../.github/workflows/worker-deploy.yml");
 export const ciFile = join(workerDir, "../.github/workflows/ci.yml");
 export const readText = (p) => readFileSync(p, "utf8");
 
@@ -74,11 +74,12 @@ export const runBlock = (text, name) => {
 export const PERMISSIONS = {
   "ci.yml": {
     top: { contents: "read" },
-    jobs: { changes: null, lint: null, tests: { contents: "read", checks: "write" }, version: null, ci: null },
-  },
-  "worker-deploy.yml": {
-    top: { contents: "read" },
     jobs: {
+      changes: null,
+      lint: null,
+      tests: { contents: "read", checks: "write" },
+      version: null,
+      ci: null,
       plan: { contents: "read", "pull-requests": "read", deployments: "read" },
       migrate: { contents: "read" },
       deploy: null,
@@ -218,18 +219,56 @@ function stepFailures(text) {
   return f;
 }
 
-// --- static controls of worker-deploy.yml
+// --- static controls of the deploy jobs (plan, migrate, deploy) of ci.yml (was worker-deploy.yml, #290 part 2)
+const DEPLOY_JOBS = ["plan", "migrate", "deploy"];
+const code = (t) => t.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
+const PLAN_IF = "    if: ${{ github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && needs.changes.outputs.deploy_changed == 'true')) }}";
 export function staticFailures(text) {
   const f = stepFailures(text);
   for (const s of steps(text)) {
     if (/CLOUDFLARE_API_TOKEN: /.test(s.text) && !(s.run ?? "").includes("wrangler")) f.push(`token in a step without wrangler: ${s.name}`);
-    if (s.name === "Install dependencies" && /^ {8}env:/m.test(s.text)) f.push("env on an install step");
-    if (s.name === "Install dependencies" && !s.text.includes("npm ci --ignore-scripts")) f.push("install without --ignore-scripts");
   }
-  f.push(...permissionFailures(text, PERMISSIONS["worker-deploy.yml"]));
-  if (!/^concurrency:\n {2}group: worker-deploy\n {2}cancel-in-progress: false\n/m.test(text)) f.push("concurrency changed");
-  // #292: nothing may deploy from the merge queue; the deploy workflow must not react to merge_group at all.
-  if (text.split("\n").some((l) => !/^\s*#/.test(l) && l.includes("merge_group"))) f.push("the deploy workflow mentions merge_group outside a comment");
+  // The install steps of the jobs WITH secrets: no env, no install scripts (the other jobs use plain `npm ci`).
+  for (const id of ["migrate", "deploy"]) {
+    for (const s of steps(jobBlock(text, id) ?? "")) {
+      if (s.name === "Install dependencies" && /^ {8}env:/m.test(s.text)) f.push(`env on the install step of ${id}`);
+      if (s.name === "Install dependencies" && !s.text.includes("npm ci --ignore-scripts")) f.push(`install without --ignore-scripts in ${id}`);
+    }
+  }
+  // Job graph and conditions (ORDER RULE, #287: deploy needs lint, tests and the gate; never pull_request or merge_group).
+  const block = Object.fromEntries(DEPLOY_JOBS.map((id) => [id, jobBlock(text, id)]));
+  for (const id of DEPLOY_JOBS) if (block[id] === null) f.push(`job ${id} is missing`);
+  const line = (id, re) => re.test(block[id] ?? "");
+  if (!line("plan", /^ {4}needs: \[changes, lint, tests, ci\]$/m)) f.push("plan must need exactly changes, lint, tests, ci");
+  if (!(block.plan ?? "").split("\n").includes(PLAN_IF)) f.push("plan has not the exact condition (repository, master ref, dispatch or push with deploy_changed)");
+  if ((block.plan ?? "").split("\n").filter((l) => /^ {4}if:/.test(l)).length !== 1) f.push("plan must have exactly one if");
+  if (!line("migrate", /^ {4}needs: plan$/m)) f.push("migrate must need exactly plan");
+  if (!line("migrate", /^ {4}if: needs\.plan\.outputs\.deploy == 'true' && \(needs\.plan\.outputs\.environment == 'production' \|\| needs\.plan\.outputs\.environment == 'production-destructive'\)$/m)) f.push("migrate has not the exact condition");
+  if (!line("migrate", /^ {4}environment:\n {6}name: \$\{\{ needs\.plan\.outputs\.environment \}\}$/m)) f.push("migrate must run in the environment chosen by plan");
+  if (!line("deploy", /^ {4}needs: \[plan, migrate\]$/m)) f.push("deploy must need exactly plan and migrate");
+  if (!line("deploy", /^ {4}if: needs\.plan\.outputs\.deploy == 'true'$/m)) f.push("deploy has not the exact condition");
+  if (!line("deploy", /^ {4}environment: production$/m)) f.push("deploy must run in the environment production");
+  if (line("plan", /^ {4}environment:/m)) f.push("plan must have no environment");
+  // Concurrency: a job-level group worker-deploy, never cancelling, on exactly these three jobs and no other.
+  for (const id of DEPLOY_JOBS) {
+    if (!line(id, /^ {4}concurrency:\n {6}group: worker-deploy\n {6}cancel-in-progress: false$/m)) f.push(`${id} must have the concurrency group worker-deploy with cancel-in-progress: false`);
+  }
+  for (const id of ["changes", "lint", "tests", "version", "ci"]) {
+    if (/worker-deploy/.test(code(jobBlock(text, id) ?? ""))) f.push(`the deploy group is shared with the cancellable job ${id}`);
+  }
+  // Secrets and environments: only in migrate and deploy (every secret there is an environment secret).
+  for (const id of ["changes", "lint", "tests", "version", "ci", "plan"]) {
+    const j = code(jobBlock(text, id) ?? "");
+    if (/\bsecrets\b/.test(j)) f.push(`secrets in the job ${id}`);
+    if (/^ {4}environment:/m.test(j)) f.push(`environment on the job ${id}`);
+  }
+  for (const id of ["migrate", "deploy"]) {
+    if (/\bsecrets\b/.test(code(jobBlock(text, id) ?? "")) && !line(id, /^ {4}environment:/m)) f.push(`secrets in ${id} without an environment`);
+  }
+  // #292: nothing may deploy from the merge queue or a pull request: the deploy jobs name neither event.
+  for (const id of DEPLOY_JOBS) {
+    if (/merge_group|pull_request/.test(code(jobBlock(text, id) ?? "").split("\n").filter((l) => /^ {4}if:/.test(l)).join("\n"))) f.push(`the condition of ${id} mentions merge_group or pull_request`);
+  }
   return f;
 }
 
@@ -259,9 +298,11 @@ export function ciFailures(text) {
   const on = onBlock(text);
   if (on === null) return ["ci.yml has no on: block"];
   const onCode = on.split("\n").filter((l) => !/^\s*#/.test(l));
-  // Triggers: exactly these three, at 2 spaces. pull_request_target, workflow_dispatch or schedule would be new surface.
+  // Triggers: exactly these four, at 2 spaces. pull_request_target, schedule or workflow_run would be new surface.
   const keys = onCode.filter((l) => /^ {2}\S/.test(l)).map((l) => /^ {2}([A-Za-z_-]+):/.exec(l)?.[1] ?? l.trim());
-  if (JSON.stringify([...keys].sort()) !== JSON.stringify(["merge_group", "pull_request", "push"])) f.push(`ci.yml triggers changed: ${keys.join(",")}`);
+  if (JSON.stringify([...keys].sort()) !== JSON.stringify(["merge_group", "pull_request", "push", "workflow_dispatch"])) f.push(`ci.yml triggers changed: ${keys.join(",")}`);
+  // The manual trigger has no inputs (nothing user-typed reaches the deploy).
+  if (!/^ {2}workflow_dispatch:\s*$/m.test(onCode.join("\n")) || (trigger(on, "workflow_dispatch") ?? "").split("\n").some((l) => l.trim() !== "" && !/^\s*#/.test(l))) f.push("workflow_dispatch must have no inputs");
   if (!/^on:\n(?:[ #].*\n|\n)*? {2}merge_group:\n {4}types: \[checks_requested\]\n/m.test(text)) f.push("ci.yml has no merge_group trigger with types [checks_requested]");
   // No filter that could stop `ci` from reporting: pull_request and merge_group only have `types`, push only branches: [master].
   const keysOf = (name) => (trigger(on, name) ?? "").split("\n").filter((l) => /^ {4}\S/.test(l) && !/^\s*#/.test(l)).map((l) => /^ {4}([A-Za-z_-]+):/.exec(l)?.[1] ?? l.trim());
@@ -281,15 +322,19 @@ export function ciFailures(text) {
     if (/continue-on-error/.test(ci)) f.push("continue-on-error in the gate");
   }
   for (const id of ["changes", "lint", "tests", "version"]) if (jobBlock(text, id) === null) f.push(`job ${id} is missing`);
+  // Only these jobs exist (a new job needs its permissions and conditions reviewed here on purpose).
+  const afterJobs = text.slice(text.search(/^jobs:\n/m));
+  const ids = [...afterJobs.matchAll(/^ {2}([A-Za-z0-9_-]+):\s*$/gm)].map((m) => m[1]);
+  if (JSON.stringify(ids) !== JSON.stringify(["changes", "lint", "tests", "version", "ci", "plan", "migrate", "deploy"])) f.push(`jobs changed: ${ids.join(",")}`);
   for (const id of ["lint", "tests"]) {
     const j = jobBlock(text, id);
     if (j !== null && !/^ {4}if: \$\{\{ needs\.changes\.outputs\.worker_changed == 'true' \}\}$/m.test(j)) f.push(`job ${id} has no condition on worker_changed`);
   }
 
-  if (!/^concurrency:\n {2}group: ci-\$\{\{ github\.event_name \}\}-\$\{\{ github\.ref \}\}\n {2}cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' && contains\(fromJSON\('\["opened","reopened","synchronize"\]'\), github\.event\.action\) \}\}\n/m.test(text)) f.push("concurrency: a queue, master or label-event run could cancel a run in progress");
+  if (!/^concurrency:\n {2}group: ci-\$\{\{ github\.event_name \}\}-\$\{\{ github\.event_name == 'pull_request' && github\.ref \|\| github\.run_id \}\}\n {2}cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' && contains\(fromJSON\('\["opened","reopened","synchronize"\]'\), github\.event\.action\) \}\}\n/m.test(text)) f.push("concurrency: a queue, master or label-event run could cancel a run in progress");
   f.push(...permissionFailures(text, PERMISSIONS["ci.yml"]));
   // A job that publishes a report needs checks: write (else the check run cannot be created), and only such a job has it.
-  for (const id of ["changes", "lint", "tests", "version", "ci"]) {
+  for (const id of ["changes", "lint", "tests", "version", "ci", "plan", "migrate", "deploy"]) {
     const j = jobBlock(text, id);
     if (j === null) continue;
     const reports = j.includes("mikepenz/action-junit-report@");
@@ -297,10 +342,9 @@ export function ciFailures(text) {
     if (reports && !hasChecks) f.push(`job ${id} publishes a report without checks: write`);
     if (!reports && hasChecks) f.push(`job ${id} has checks: write but publishes no report`);
   }
-  const code = text.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
-  if (/pull_request_target/.test(code)) f.push("pull_request_target in ci.yml");
-  if (/\bsecrets\b/.test(code)) f.push("secrets in ci.yml");
-  if (/^ {4}environment:/m.test(code)) f.push("environment in ci.yml");
+  if (/pull_request_target/.test(code(text))) f.push("pull_request_target in ci.yml");
+  // Secrets and environments outside the deploy jobs, the deploy graph and the install steps: see staticFailures.
+  f.push(...staticFailures(text));
   if (!text.includes("github.event.merge_group.base_sha") || !text.includes("github.event.merge_group.head_sha")) f.push("merge_group base/head not read");
   if (!/^ {10}fetch-depth: 0$/m.test(jobBlock(text, "version") ?? "")) f.push("version job without fetch-depth: 0 (GitVersion needs the full history)");
   f.push(...stepFailures(text));
