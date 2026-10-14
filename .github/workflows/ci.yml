@@ -1187,6 +1187,7 @@ jobs:
       # be github.sha (the head of master per the guard): the tag is then the SHA that is deployed.
       - name: Deploy
         id: deploy
+        if: always()
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
