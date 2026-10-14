@@ -380,8 +380,6 @@ jobs:
   # an unusual ref cannot stall the queue; the job reports its own check `version`. `release` needs it.
   version:
     name: version
-    permissions:
-      contents: write
     # Pinned image (not -latest): the audited image ships .NET SDK 8, 9 and 10.
     runs-on: ubuntu-24.04
     timeout-minutes: 10
