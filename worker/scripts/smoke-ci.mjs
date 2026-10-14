@@ -30,6 +30,7 @@ const MIN_PASS = 51; // the default suite has 51 PASS in CI mode (35 before the 
 const MIN_PASS_LEGACY = 46; // the same suite on the pre-0003 schema (46 PASS: no photo-fixture checks)
 
 const MIN_PASS_LOGCHECK = 28; // scripts/log-check.mjs (log leak check, #272)
+const MIN_PASS_CORSCHECK = 54; // scripts/cors-check.mjs (CORS check, #283)
 
 const workerDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const tmp = mkdtempSync(join(tmpdir(), "cowlic-smoke-"));
@@ -135,6 +136,12 @@ try {
   const logLines = (word) => logOut.split("\n").filter((l) => l.startsWith(`${word} `)).length;
   if (logLines("FAIL") !== 0 || logLines("PASS") < MIN_PASS_LOGCHECK) {
     throw new Error(`unexpected log-check counts: PASS=${logLines("PASS")} FAIL=${logLines("FAIL")}`);
+  }
+  // #283: CORS allowlist, preflight before authentication, Vary, exposed headers (stub D1 and Telegram).
+  const corsOut = await run("cors check", ["scripts/cors-check.mjs"]);
+  const corsLines = (word) => corsOut.split("\n").filter((l) => l.startsWith(`${word} `)).length;
+  if (corsLines("FAIL") !== 0 || corsLines("PASS") < MIN_PASS_CORSCHECK) {
+    throw new Error(`unexpected cors-check counts: PASS=${corsLines("PASS")} FAIL=${corsLines("FAIL")}`);
   }
 } catch (e) {
   failed = true;
