@@ -39,6 +39,11 @@ jobs:
     name: ci
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # #289: checks: write only for the "Test Report" check run (the report action creates it). Narrowest scope: this
+    # job, no other. No pull-requests: write (PR comments are off). The token is not passed to any step but the report.
+    permissions:
+      contents: read
+      checks: write
     defaults:
       run:
         shell: bash
@@ -163,37 +168,55 @@ jobs:
           if [ "$APPROVED" = "true" ]; then args+=(--approved); fi
           node scripts/lint-migrations.mjs "${args[@]}" "${added[@]}"
 
-      # #286: the linter gates destructive D1 migrations, and its own tests were wired nowhere. Runs exactly one
-      # file (deliberate: another *.test.mjs is not picked up silently). The node exit code fails the job on a
-      # failing test. The summary check below additionally fails it when the summary cannot be read, when
-      # pass != tests or fail != 0 (skipped, todo and cancelled tests), or when tests is below MIN_TESTS.
-      # MIN_TESTS: node:test counts a file that registers nothing as ONE passing test (tests 1, pass 1, exit 0),
-      # so "tests > 0" proves nothing. The floor is a pinned number below the real count (69 on 2026-10-14) so a
-      # few removals do not trip it but a mass loss does. It is NOT dynamic: raise it deliberately when tests
-      # are added, lower it deliberately when tests are removed on purpose.
-      # The reporter is explicit: the summary lines ("tests N", "pass N", "fail N") come from the spec reporter,
-      # not from the TTY-dependent default. sed runs with LC_ALL=C so the pattern does not depend on the locale.
+      # #286 / #289: the linter gates destructive D1 migrations, and its own tests were wired nowhere. Runs exactly
+      # one file (deliberate: another *.test.mjs is not picked up silently). Two reporters: spec to stdout (the
+      # human-readable log) and junit to a file under RUNNER_TEMP (read by the "Test Report" step below, never
+      # committed or uploaded). The node exit code is the verdict of THIS step: a failing test fails the job `ci`
+      # whether or not the report can be published (fork PRs have a read-only token).
       - name: Migration lint tests
+        id: lint_tests
         if: steps.changes.outputs.worker_changed == 'true'
+        run: |
+          node --test --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination="$RUNNER_TEMP/lint-tests.xml" scripts/lint-migrations.test.mjs
+
+      # #289: publishes the JUnit XML as an extra check run "Test Report" (NOT a required check, never read by the
+      # deploy gate). Pinned by full SHA (docs/worker-cicd.md section 6 audit). Runs after a failed test step too
+      # (to show the failure) but not when the test step was skipped (no XML) and not on a cancelled run.
+      # fail_on_failure / require_tests: red report on a failed test or on zero collected tests (fail_on_parse_error:
+      # an unreadable XML). comment is off, so no pull-requests: write. Fork PRs: the token is read-only, so creating
+      # the check run fails; the action only logs that, and continue-on-error covers the rest on forks, while the
+      # test step above still fails `ci` on a real failure.
+      - name: Test Report
+        id: test_report
+        if: ${{ !cancelled() && (steps.lint_tests.outcome == 'success' || steps.lint_tests.outcome == 'failure') }}
+        continue-on-error: ${{ github.event.pull_request.head.repo.fork == true }}
+        uses: mikepenz/action-junit-report@a9170d5795813c01ab4901ffb045b52bab4ab09d # v6.5.0
+        with:
+          report_paths: ${{ runner.temp }}/lint-tests.xml
+          check_name: Test Report
+          fail_on_failure: true
+          fail_on_parse_error: true
+          require_tests: true
+          comment: false
+
+      # MIN_TESTS: node:test counts a file that registers nothing as ONE passing test (tests 1, pass 1, exit 0), so
+      # require_tests (total > 0) cannot catch an import-only file; the report action has no minimum-count option.
+      # The floor is a pinned number below the real count (69 on 2026-10-14) so a few removals do not trip it but a
+      # mass loss does. It compares the numeric `passed` output of the report step (no text parsing); skipped,
+      # todo and cancelled tests do not count as passed. NOT dynamic: raise it deliberately when tests are added,
+      # lower it deliberately when tests are removed on purpose.
+      - name: Minimum test count
+        if: ${{ steps.lint_tests.outcome == 'success' }}
         env:
           MIN_TESTS: "60"
+          PASSED: ${{ steps.test_report.outputs.passed }}
         run: |
-          status=0
-          node --test --test-reporter=spec scripts/lint-migrations.test.mjs > "$RUNNER_TEMP/lint-tests.txt" 2>&1 || status=$?
-          cat "$RUNNER_TEMP/lint-tests.txt"
-          if [ "$status" -ne 0 ]; then
-            echo "migration lint tests failed (node exit $status)"
-            exit 1
-          fi
-          tests=$(LC_ALL=C sed -nE 's/^.* tests ([0-9]+)$/\1/p' "$RUNNER_TEMP/lint-tests.txt")
-          pass=$(LC_ALL=C sed -nE 's/^.* pass ([0-9]+)$/\1/p' "$RUNNER_TEMP/lint-tests.txt")
-          fail=$(LC_ALL=C sed -nE 's/^.* fail ([0-9]+)$/\1/p' "$RUNNER_TEMP/lint-tests.txt")
-          echo "summary: tests=$tests pass=$pass fail=$fail (floor $MIN_TESTS)"
-          case "$tests$pass$fail" in
-            "" | *[!0-9]*) echo "summary missing or not a single number per line"; exit 1 ;;
+          case "$PASSED" in
+            "" | *[!0-9]*) echo "passed count missing or not a number: '$PASSED'"; exit 1 ;;
           esac
-          if [ "$tests" -lt "$MIN_TESTS" ] || [ "$pass" != "$tests" ] || [ "$fail" != "0" ]; then
-            echo "too few tests (floor $MIN_TESTS) or summary not clean"
+          echo "passed=$PASSED (floor $MIN_TESTS)"
+          if [ "$PASSED" -lt "$MIN_TESTS" ]; then
+            echo "too few passed tests: a test file registers nothing or tests were lost"
             exit 1
           fi
 
