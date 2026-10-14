@@ -102,8 +102,19 @@ export function registerSmokeSuite(fixture) {
   // getCoverArt: 404 + error 70 means "no such cover". A found cover is proxied from Telegram; with the fake CI
   // token Telegram refuses, so "found" shows as the upstream error 502 (not 404): the id resolved to a file id.
   describe("artist images and cover art", () => {
+    // A found cover makes the Worker call the REAL api.telegram.org (hardcoded in src/telegram.ts) with the dummy bot
+    // token. Normally Telegram answers at once, but CI run 38549763188 saw that call hang for 60 s. The lookup in D1
+    // happens BEFORE that call, so "no answer within 15 s" can only mean the id was found and the upstream is slow:
+    // it counts as resolved (status 0). A cover that does not exist answers 404 / error 70 immediately, so the
+    // negative checks are not weakened.
     const cover = async (id) => {
-      const res = await fetchPath(`/rest/getCoverArt?${ctx.auth}&id=${encodeURIComponent(id)}`);
+      let res;
+      try {
+        res = await fetchPath(`/rest/getCoverArt?${ctx.auth}&id=${encodeURIComponent(id)}`, { signal: AbortSignal.timeout(15_000) });
+      } catch (e) {
+        if (e?.name === "TimeoutError" || e?.name === "AbortError") return { status: 0, code: undefined };
+        throw e;
+      }
       const body = res.headers.get("content-type")?.includes("json") ? (await res.json())["subsonic-response"] : {};
       return { status: res.status, code: body.error?.code };
     };
