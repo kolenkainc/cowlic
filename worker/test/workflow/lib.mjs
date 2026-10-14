@@ -11,8 +11,7 @@ import { fileURLToPath } from "node:url";
 
 const workerDir = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 export const deployFile = join(workerDir, "../.github/workflows/worker-deploy.yml");
-export const ciFile = join(workerDir, "../.github/workflows/worker-ci.yml");
-export const versionFile = join(workerDir, "../.github/workflows/version.yml");
+export const ciFile = join(workerDir, "../.github/workflows/ci.yml");
 export const readText = (p) => readFileSync(p, "utf8");
 
 const SHA = "0123456789abcdef0123456789abcdef01234567";
@@ -73,9 +72,9 @@ const runBlock = (text, name) => {
 // top-level one). A new job, a new scope, a widened level or a changed block fails until this table is changed on
 // purpose, in the same PR as the workflow.
 export const PERMISSIONS = {
-  "worker-ci.yml": {
+  "ci.yml": {
     top: { contents: "read" },
-    jobs: { ci: { contents: "read", checks: "write" } },
+    jobs: { changes: null, lint: null, tests: { contents: "read", checks: "write" }, version: null, ci: null },
   },
   "worker-deploy.yml": {
     top: { contents: "read" },
@@ -84,10 +83,6 @@ export const PERMISSIONS = {
       migrate: { contents: "read" },
       deploy: null,
     },
-  },
-  "version.yml": {
-    top: { contents: "read" },
-    jobs: { version: null },
   },
 };
 
@@ -106,6 +101,21 @@ export function parsePermissions(text) {
   if (text.includes("\r")) throw new Error("a carriage return in the file");
   for (const l of code) {
     if (/(^|:|-)\s+[&*][A-Za-z0-9_-]+(\s|$)/.test(l) || /^\s*<<\s*:/.test(l)) throw new Error(`YAML anchor, alias or merge key: ${JSON.stringify(l.trim().slice(0, 60))}`);
+  }
+
+  // Hardening (review of #297, #290): forms that could hide or rename a `permissions` key are rejected, not skipped.
+  //  - a complex key (`? permissions` followed by a `: ...` line) is a mapping key the line regexes would never see;
+  //  - a quoted key (`"permissions":`, `'permissions':`) at the start of a line (an `- ` before it is allowed);
+  //  - a double-quoted key with a YAML escape (`"\x70ermissions":`, `"permissions":`) anywhere in a line, also in
+  //    flow style: the escape decodes to a different spelling than the text shows.
+  // GitHub's documentation (workflow syntax and contexts pages, read 2026-10-14) says nothing about the case of
+  // workflow keys (only: concurrency group names and matrix variable names are case insensitive), so a `Permissions:` or
+  // `PERMISSIONS:` variant is not assumed to be the same key: it is counted by the case-insensitive mention check below
+  // and, as it is never a parsed block, fails closed.
+  for (const l of code) {
+    if (/^\s*(?:-\s+)?\?(?:\s|$)/.test(l)) throw new Error(`YAML complex key: ${JSON.stringify(l.trim().slice(0, 60))}`);
+    if (/"[^"\n]*\\[^"\n]*"\s*:(?:\s|$)/.test(l)) throw new Error(`YAML-escaped key: ${JSON.stringify(l.trim().slice(0, 60))}`);
+    if (/^\s*(?:-\s+)?(["'])[^"'\n]*\1\s*:(?:\s|$)/.test(l)) throw new Error(`quoted key: ${JSON.stringify(l.trim().slice(0, 60))}`);
   }
 
   const entry = (l, indent) => new RegExp(`^ {${indent}}([a-z-]+): (read|write|none)(?: #.*)?$`).exec(l);
@@ -170,9 +180,10 @@ export function parsePermissions(text) {
     }
   });
 
-  // Fail-closed cross-check: every non-comment line that mentions a `permissions` key in ANY spelling (quoted, space
-  // before the colon, inline or flow form, in a step or anywhere else) must be one of the blocks parsed above.
-  const mentions = code.filter((l) => /permissions["']?\s*:/.test(l)).length;
+  // Fail-closed cross-check: every non-comment line that mentions a `permissions` key in ANY spelling (any letter case,
+  // quoted, space before the colon, inline or flow form, in a step or anywhere else) must be one of the blocks parsed
+  // above (those only match the exact lowercase key).
+  const mentions = code.filter((l) => /permissions["']?\s*:/i.test(l)).length;
   if (mentions !== blocks) throw new Error(`${mentions} lines mention a permissions key but ${blocks} blocks were parsed`);
   return { top, jobs };
 }
@@ -196,13 +207,21 @@ export function permissionFailures(text, expected) {
   return f;
 }
 
-// --- static controls of worker-deploy.yml
-export function staticFailures(text) {
+// --- step-level controls shared by the workflows: no expression in a run block, every action pinned to a full SHA
+function stepFailures(text) {
   const f = [];
   for (const s of steps(text)) {
     if (s.run !== null && s.run.includes("${{")) f.push(`\${{ }} in the run block of "${s.name}"`);
     const uses = /^ {8}uses: (\S+)/m.exec(s.text) ?? /^ {6}- uses: (\S+)/m.exec(s.text);
     if (uses && !/^[\w./-]+@[0-9a-f]{40}$/.test(uses[1])) f.push(`unpinned action ${uses[1]}`);
+  }
+  return f;
+}
+
+// --- static controls of worker-deploy.yml
+export function staticFailures(text) {
+  const f = stepFailures(text);
+  for (const s of steps(text)) {
     if (/CLOUDFLARE_API_TOKEN: /.test(s.text) && !(s.run ?? "").includes("wrangler")) f.push(`token in a step without wrangler: ${s.name}`);
     if (s.name === "Install dependencies" && /^ {8}env:/m.test(s.text)) f.push("env on an install step");
     if (s.name === "Install dependencies" && !s.text.includes("npm ci --ignore-scripts")) f.push("install without --ignore-scripts");
@@ -214,17 +233,77 @@ export function staticFailures(text) {
   return f;
 }
 
-// --- #292: worker-ci.yml must report the required check `ci` on the merge queue
+// The text of one job: from `  <id>:` to the next 2-space key (or the end), or null.
+export function jobBlock(text, id) {
+  const lines = text.split("\n");
+  const at = lines.findIndex((l) => l === `  ${id}:`);
+  if (at < 0) return null;
+  let end = lines.length;
+  for (let i = at + 1; i < lines.length; i++) {
+    if (/^ {0,2}\S/.test(lines[i]) && !/^\s*#/.test(lines[i])) {
+      end = i;
+      break;
+    }
+  }
+  return lines.slice(at, end).join("\n");
+}
+
+// The text of the `on:` block (until the next top-level key), and the text of one trigger inside it.
+const onBlock = (text) => /^on:\n((?:(?: .*|)\n)*)/m.exec(text)?.[1] ?? null;
+const trigger = (on, name) => new RegExp(`^ {2}${name}:.*\\n((?: {4,}.*\\n|\\n)*)`, "m").exec(on)?.[1] ?? null;
+
+// --- #290, #292: ci.yml must report the required check `ci` on pull_request, push and merge_group, and the gate must
+// be a real gate. Static, on the text; every rule has a mutation test.
 export function ciFailures(text) {
   const f = [];
-  if (!/^on:\n(?:[ #].*\n|\n)*? {2}merge_group:\n {4}types: \[checks_requested\]\n/m.test(text)) f.push("worker-ci.yml has no merge_group trigger with types [checks_requested]");
-  if (!/^ {2}ci:\n {4}name: ci\n/m.test(text)) f.push("job id or name is not ci");
-  if (/^ {4}if:/m.test(text)) f.push("job-level if on the ci job (it could report skipped)");
-  if (!/^concurrency:\n {2}group: worker-ci-\$\{\{ github\.event_name \}\}-\$\{\{ github\.ref \}\}\n {2}cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}\n/m.test(text)) f.push("concurrency: a queue run could be cancelled");
-  f.push(...permissionFailures(text, PERMISSIONS["worker-ci.yml"]));
+  const on = onBlock(text);
+  if (on === null) return ["ci.yml has no on: block"];
+  const onCode = on.split("\n").filter((l) => !/^\s*#/.test(l));
+  // Triggers: exactly these three, at 2 spaces. pull_request_target, workflow_dispatch or schedule would be new surface.
+  const keys = onCode.filter((l) => /^ {2}\S/.test(l)).map((l) => /^ {2}([A-Za-z_-]+):/.exec(l)?.[1] ?? l.trim());
+  if (JSON.stringify([...keys].sort()) !== JSON.stringify(["merge_group", "pull_request", "push"])) f.push(`ci.yml triggers changed: ${keys.join(",")}`);
+  if (!/^on:\n(?:[ #].*\n|\n)*? {2}merge_group:\n {4}types: \[checks_requested\]\n/m.test(text)) f.push("ci.yml has no merge_group trigger with types [checks_requested]");
+  // No filter that could stop `ci` from reporting: pull_request and merge_group only have `types`, push only branches: [master].
+  const keysOf = (name) => (trigger(on, name) ?? "").split("\n").filter((l) => /^ {4}\S/.test(l) && !/^\s*#/.test(l)).map((l) => /^ {4}([A-Za-z_-]+):/.exec(l)?.[1] ?? l.trim());
+  for (const name of ["pull_request", "merge_group"]) {
+    if (keysOf(name).some((k) => k !== "types")) f.push(`${name} has a key other than types (a filter could stop ci from reporting): ${keysOf(name).join(",")}`);
+  }
+  if (JSON.stringify(keysOf("push")) !== JSON.stringify(["branches"]) || !/^ {4}branches: \[master\]$/m.test(trigger(on, "push") ?? "")) f.push("push must have exactly branches: [master] (no paths filter)");
+
+  // The gate: job id and name ci, always() as the ONLY condition, needs every other gating job.
+  const ci = jobBlock(text, "ci");
+  if (ci === null) f.push("no job ci (the required check would never report)");
+  else {
+    if (!/^ {4}name: ci$/m.test(ci)) f.push("job ci has not the name ci");
+    const ifs = ci.split("\n").filter((l) => /^ {4}if:/.test(l));
+    if (ifs.length !== 1 || ifs[0] !== "    if: ${{ always() }}") f.push(`job ci must have exactly "if: \${{ always() }}" (a skipped required check counts as passed): ${JSON.stringify(ifs)}`);
+    if (!/^ {4}needs: \[changes, lint, tests\]$/m.test(ci)) f.push("job ci does not need exactly changes, lint, tests");
+    if (/continue-on-error/.test(ci)) f.push("continue-on-error in the gate");
+  }
+  for (const id of ["changes", "lint", "tests", "version"]) if (jobBlock(text, id) === null) f.push(`job ${id} is missing`);
+  for (const id of ["lint", "tests"]) {
+    const j = jobBlock(text, id);
+    if (j !== null && !/^ {4}if: \$\{\{ needs\.changes\.outputs\.worker_changed == 'true' \}\}$/m.test(j)) f.push(`job ${id} has no condition on worker_changed`);
+  }
+
+  if (!/^concurrency:\n {2}group: ci-\$\{\{ github\.event_name \}\}-\$\{\{ github\.ref \}\}\n {2}cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}\n/m.test(text)) f.push("concurrency: a queue or master run could be cancelled");
+  f.push(...permissionFailures(text, PERMISSIONS["ci.yml"]));
+  // A job that publishes a report needs checks: write (else the check run cannot be created), and only such a job has it.
+  for (const id of ["changes", "lint", "tests", "version", "ci"]) {
+    const j = jobBlock(text, id);
+    if (j === null) continue;
+    const reports = j.includes("mikepenz/action-junit-report@");
+    const hasChecks = /^ {6}checks: write$/m.test(j);
+    if (reports && !hasChecks) f.push(`job ${id} publishes a report without checks: write`);
+    if (!reports && hasChecks) f.push(`job ${id} has checks: write but publishes no report`);
+  }
   const code = text.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
-  if (/pull_request_target|secrets\.|^ {4}environment:/m.test(code)) f.push("pull_request_target, secrets or environment in worker-ci.yml");
+  if (/pull_request_target/.test(code)) f.push("pull_request_target in ci.yml");
+  if (/\bsecrets\b/.test(code)) f.push("secrets in ci.yml");
+  if (/^ {4}environment:/m.test(code)) f.push("environment in ci.yml");
   if (!text.includes("github.event.merge_group.base_sha") || !text.includes("github.event.merge_group.head_sha")) f.push("merge_group base/head not read");
+  if (!/^ {10}fetch-depth: 0$/m.test(jobBlock(text, "version") ?? "")) f.push("version job without fetch-depth: 0 (GitVersion needs the full history)");
+  f.push(...stepFailures(text));
   return f;
 }
 

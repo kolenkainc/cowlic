@@ -9,7 +9,7 @@
 ## GitHub Flow
 
 1. Branch from an up-to-date master: `feat|fix|chore|docs|test/<slug>`.
-2. Open a PR; the required check is `Worker CI / ci`.
+2. Open a PR; the required check is `ci` (shown as `CI / ci`; the gate job of `.github/workflows/ci.yml`).
 3. Squash merge to master. The PR title becomes the one commit on master, so it must be a Conventional Commit: it drives the version.
 4. Master is always releasable. To release, tag a master commit whose checks are green.
 
@@ -28,7 +28,7 @@ Decision: chore/docs/ci/test/refactor DO increment (patch), so every master comm
 
 On a PR the version is computed from the commits of the PR branch (merged with master by GitHub), not from the PR title. The title matters after the squash merge, when it becomes the master commit message.
 
-The calculated version is printed in the job summary of the `Version / version` workflow (`.github/workflows/version.yml`) on every PR and on master. It is read-only: it never tags, releases or writes anything. The version is NOT embedded into the Worker or ingest.
+The calculated version is printed in the job summary of the job `version` (shown as `CI / version`) of `.github/workflows/ci.yml` on every PR, on master and in the merge queue (it is not part of the gate `ci`). It is read-only: it never tags, releases or writes anything. The version is NOT embedded into the Worker or ingest.
 
 Quirk found while verifying: with the strict `tag-prefix: 'v'`, `next-version` must also carry the prefix (`v3.0.0`); a bare `3.0.0` fails with "Failed to parse 3.0.0 into a Semantic Version".
 
@@ -50,7 +50,7 @@ Owner decision, NOT implemented: a workflow that creates the tag/release on a tr
 - Version 6.8.2 published 2026-07-10 (older than two weeks), listed, latest stable release of the 6.x line.
 - Installed as a .NET tool with an exact version (`dotnet tool install --tool-path`), no third-party GitHub Action (`gittools/actions` is not used: one more supply-chain link for no gain).
 - The runner image `ubuntu-24.04` ships .NET SDK 8, 9 and 10 (runner-images Ubuntu2404 readme, image 20261004.327.1), so no `setup-dotnet` is needed. The workflow runs on `ubuntu-24.04`, not `-latest`, so the audited image does not change under it.
-- Only `actions/checkout` (same pinned SHA as `worker-ci.yml`) is used as an action. Never upgrade the tool without confirmation.
+- In the job `version` only `actions/checkout` (same pinned SHA as the other jobs of `ci.yml`) is used as an action. Never upgrade the tool without confirmation.
 - Residual risk: the NuGet package is not hash-locked; the version pin is the control.
 
 ## Follow-up question for the owner

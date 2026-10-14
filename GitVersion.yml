@@ -1,4 +1,4 @@
-# GitVersion 6.x configuration (tool pinned in .github/workflows/version.yml). Docs: docs/releasing.md
+# GitVersion 6.x configuration (tool pinned in the job `version` of .github/workflows/ci.yml). Docs: docs/releasing.md
 workflow: GitHubFlow/v1
 
 # Intermittent use only: remove this line in the PR that follows the first v3.0.0 tag (docs/releasing.md).
