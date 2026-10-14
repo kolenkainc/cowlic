@@ -192,7 +192,7 @@ All in `ingest/`:
 
 1. Migration `0003_artist_images.sql`: `ALTER TABLE artists ADD COLUMN image_file_id TEXT;` Additive. The lint treats
    `ADD COLUMN` as a warning, not idempotent (D1 tracks applied files in `d1_migrations`) [V `docs/worker-cicd.md`
-   section 5 rule 3]. It reaches production through the sanctioned workflow (plan -> migrate -> deploy) on merge,
+   section 5 rule 3]. It reaches production through the sanctioned workflow (plan -> ship: migrate, then deploy) on merge,
    or by the owner; the Worker code must work with and without the column (rule 2): select the column only after it
    exists, or deploy the migration first (`needs: migrate` on `deploy`). Rollback in a comment: SQLite can
    `ALTER TABLE artists DROP COLUMN image_file_id` [R], leave the column otherwise. The ticket text says a production
