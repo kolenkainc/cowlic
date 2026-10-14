@@ -1,6 +1,7 @@
 // ci.yml, job `release` (#290 part 3): the job condition evaluated over every combination, and the run block of the step
-// "Tag and release" executed under bash with stub gh, git and dotnet-gitversion (a recorded call log). No network, no
-// secrets. Every function returns failure strings (empty = ok), like the other workflow checks.
+// "Tag and release" executed under bash with a stub gh (a recorded call log) and the version outputs in the environment,
+// and the step "Calculate version" of the job `version` (the producer of those outputs) with stub gitversion and git.
+// No network, no secrets. Every function returns failure strings (empty = ok), like the other workflow checks.
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
@@ -24,6 +25,7 @@ export function releaseCondition(text) {
       fn({
         cancelled: c.cancelled ?? false,
         "needs.ci.result": c.ci,
+        "needs.version.result": c.version ?? "success",
         "needs.plan.result": c.plan,
         "needs.plan.outputs.deploy": c.out,
         "needs.migrate.result": c.migrate,
@@ -49,6 +51,9 @@ export const releaseConditionCases = [
   ["migrate skipped although a deploy was planned", { ci: "success", plan: "success", out: "true", migrate: "skipped", deploy: "skipped" }, false],
   ["nothing to deploy but migrate ran", { ci: "success", plan: "success", out: "false", migrate: "success", deploy: "skipped" }, false],
   ["nothing to deploy but deploy ran", { ci: "success", plan: "success", out: "false", migrate: "skipped", deploy: "success" }, false],
+  ["the version job FAILED", { ci: "success", version: "failure", plan: "success", out: "false", migrate: "skipped", deploy: "skipped" }, false],
+  ["the version job was skipped", { ci: "success", version: "skipped", plan: "success", out: "false", migrate: "skipped", deploy: "skipped" }, false],
+  ["the version job was cancelled", { ci: "success", version: "cancelled", plan: "success", out: "true", migrate: "success", deploy: "success" }, false],
   ["plan FAILED", { ci: "success", plan: "failure", out: "", migrate: "skipped", deploy: "skipped" }, false],
   ["plan skipped", { ci: "success", plan: "skipped", out: "", migrate: "skipped", deploy: "skipped" }, false],
   ["the gate ci failed", { ci: "failure", plan: "skipped", out: "", migrate: "skipped", deploy: "skipped" }, false],
@@ -66,6 +71,7 @@ function oracle(c) {
   if (c.repo !== "kolenkainc/cowlic" || c.ref !== "refs/heads/master") return false;
   if (c.event !== "push" && c.event !== "workflow_dispatch") return false;
   if (c.ci !== "success" || c.plan !== "success") return false;
+  if ((c.version ?? "success") !== "success") return false;
   if (c.out === "true") return c.migrate === "success" && c.deploy === "success";
   return c.migrate === "skipped" && c.deploy === "skipped";
 }
@@ -87,15 +93,16 @@ export function releaseConditionFailures(text) {
       for (const ref of ["refs/heads/master", "refs/heads/other"])
         for (const event of ["push", "workflow_dispatch", "pull_request", "merge_group"])
           for (const ci of R)
-            for (const plan of R)
-              for (const out of ["true", "false", ""])
-                for (const migrate of R)
-                  for (const deploy of R) {
-                    const c = { cancelled, repo, ref, event, ci, plan, out, migrate, deploy };
-                    if (cond(c) !== oracle(c)) {
-                      if (n++ < 5) f.push(`exhaustive: ${JSON.stringify(c)} differs from the oracle`);
+            for (const version of R)
+              for (const plan of R)
+                for (const out of ["true", "false", ""])
+                  for (const migrate of R)
+                    for (const deploy of R) {
+                      const c = { cancelled, repo, ref, event, ci, version, plan, out, migrate, deploy };
+                      if (cond(c) !== oracle(c)) {
+                        if (n++ < 5) f.push(`exhaustive: ${JSON.stringify(c)} differs from the oracle`);
+                      }
                     }
-                  }
   return f;
 }
 
@@ -108,10 +115,9 @@ export function createReleaseRunner(text, { tmp }) {
     event = "push",
     sha = SHA,
     master = SHA,
-    head = SHA,
+    vSha = sha, // the sha the version job computed the version for
     masterFail = false,
-    gv = { MajorMinorPatch: "3.0.1", PreReleaseLabel: "", BranchName: "master" },
-    gvFail = false,
+    gv = { MajorMinorPatch: "3.0.1", PreReleaseLabel: "", BranchName: "master" }, // the outputs of the job version
     tag = "absent", // absent | same | other | annotated | error
     postFail = false,
     releaseExists = false,
@@ -123,15 +129,13 @@ export function createReleaseRunner(text, { tmp }) {
     const bin = join(w, "bin");
     const rt = join(w, "rt");
     mkdirSync(bin, { recursive: true });
-    mkdirSync(join(rt, "gitversion"), { recursive: true });
+    mkdirSync(rt, { recursive: true });
     const calls = join(w, "calls.log");
     const summary = join(w, "summary.md");
     const msgFile = join(w, "message.txt");
-    const gvJson = join(w, "gv.json");
     writeFileSync(calls, "");
     writeFileSync(summary, "");
     writeFileSync(msgFile, Buffer.isBuffer(message) ? message : Buffer.from(message, "utf8"));
-    writeFileSync(gvJson, JSON.stringify(gv));
     const stub = (p, body) => {
       writeFileSync(p, `#!/bin/bash\n${body}\n`);
       chmodSync(p, 0o755);
@@ -147,9 +151,9 @@ export function createReleaseRunner(text, { tmp }) {
         "esac",
         'case "$2" in',
         '  */git/ref/heads/master) [ "$FAKE_MASTER_FAIL" = 1 ] && exit 1; echo "$FAKE_MASTER"; exit 0 ;;',
-        "  */git/ref/tags/*)",
+        "  */git/matching-refs/tags/*)",
         '    case "$FAKE_TAG" in',
-        '      absent) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;',
+        "      absent) exit 0 ;;", // 200 with an empty list: nothing printed
         '      same|other) echo "commit $FAKE_TAG_SHA"; exit 0 ;;',
         '      annotated) echo "tag $FAKE_TAG_SHA"; exit 0 ;;',
         '      *) echo "gh: Internal Server Error (HTTP 500)" >&2; exit 1 ;;',
@@ -159,8 +163,8 @@ export function createReleaseRunner(text, { tmp }) {
         "exit 1",
       ].join("\n"),
     );
-    stub(join(bin, "git"), 'if [ "$1" = rev-parse ] && [ "$2" = HEAD ]; then echo "$FAKE_HEAD"; fi');
-    stub(join(rt, "gitversion", "dotnet-gitversion"), '[ "$FAKE_GV_FAIL" = 1 ] && exit 1; cat "$GVJSON"');
+    // No git, no dotnet, no jq stub on purpose: the script must need none of them (PATH has only the stub dir and
+    // /usr/bin:/bin; a git call would be recorded as a failure by the static test and would not find a repository here).
     const r = spawnSync("bash", ["-eo", "pipefail", join(dir, "release.sh")], {
       cwd: w,
       env: {
@@ -173,11 +177,12 @@ export function createReleaseRunner(text, { tmp }) {
         GITHUB_STEP_SUMMARY: summary,
         CALLS: calls,
         MSGFILE: msgFile,
-        GVJSON: gvJson,
+        V_SHA: vSha,
+        V_MMP: gv.MajorMinorPatch,
+        V_LABEL: gv.PreReleaseLabel,
+        V_BRANCH: gv.BranchName,
         FAKE_MASTER: master,
         FAKE_MASTER_FAIL: masterFail ? "1" : "0",
-        FAKE_HEAD: head,
-        FAKE_GV_FAIL: gvFail ? "1" : "0",
         FAKE_TAG: tag,
         FAKE_TAG_SHA: tag === "other" ? OTHER : SHA,
         FAKE_POST_FAIL: postFail ? "1" : "0",
@@ -228,7 +233,11 @@ export const releaseCases = [
   ["tag exists as an annotated tag: fail", { tag: "annotated", message: "feat: x" }, { status: 1, post: false, release: false }],
   ["tag lookup fails with a server error: fail, no tag", { tag: "error", message: "feat: x" }, { status: 1, post: false, release: false }],
   ["creating the tag fails: fail, no release", { postFail: true, message: "feat: x" }, { status: 1, post: true, release: false }],
-  ["GitVersion fails: fail, no tag", { gvFail: true }, { status: 1, post: false, release: false }],
+  ["the version outputs are all empty (the version job could not compute): fail, no tag", { gv: { MajorMinorPatch: "", PreReleaseLabel: "", BranchName: "" }, vSha: "" }, { status: 1, post: false, release: false }],
+  ["the version was computed for another commit: fail, no tag", { vSha: OTHER }, { status: 1, post: false, release: false }],
+  ["the version sha output is empty: fail, no tag", { vSha: "" }, { status: 1, post: false, release: false }],
+  ["the version label output is the marker invalid: fail, no tag", { gv: { MajorMinorPatch: "3.0.1", PreReleaseLabel: "invalid", BranchName: "master" } }, { status: 1, post: false, release: false }],
+  ["the version branch output is empty: fail, no tag", { gv: { MajorMinorPatch: "3.0.1", PreReleaseLabel: "", BranchName: "" } }, { status: 1, post: false, release: false }],
   ["a prerelease label: fail, no tag", { gv: { MajorMinorPatch: "3.0.1", PreReleaseLabel: "gh-readonly-queue", BranchName: "master" } }, { status: 1, post: false, release: false }],
   ["a feature-branch label: fail, no tag", { gv: { MajorMinorPatch: "3.0.1", PreReleaseLabel: "pr-306", BranchName: "master" } }, { status: 1, post: false, release: false }],
   ["not the branch master: fail, no tag", { gv: { MajorMinorPatch: "3.0.1", PreReleaseLabel: "", BranchName: "gh-readonly-queue/master/pr-1" } }, { status: 1, post: false, release: false }],
@@ -240,8 +249,7 @@ export const releaseCases = [
   ["a version with a newline: fail", { gv: gvOk("3.0.1\nx") }, { status: 1, post: false, release: false }],
   ["master moved on: green, no tag, no release", { master: OTHER, message: "feat: x" }, { status: 0, post: false, release: false }],
   ["the head of master cannot be read: fail", { masterFail: true }, { status: 1, post: false, release: false }],
-  ["the checked-out commit is not github.sha: fail", { head: OTHER }, { status: 1, post: false, release: false }],
-  ["an uppercase github.sha: fail", { sha: SHA.toUpperCase(), master: SHA.toUpperCase() }, { status: 1, post: false, release: false }],
+  ["an uppercase github.sha: fail", { sha: SHA.toUpperCase(), master: SHA.toUpperCase(), vSha: SHA.toUpperCase() }, { status: 1, post: false, release: false }],
   ["the commit message cannot be read: fail (tag already made, no release)", { messageFail: true }, { status: 1, post: true, release: false }],
 ];
 
@@ -281,13 +289,14 @@ export function releaseCaseFailures(runner, [name, opts, want]) {
 
 // Mutations of the run block (each must be caught by at least one case).
 export const releaseMutations = [
-  ["the X.Y.Z regexp is removed", (t) => t.replace('[[ "$version" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]] || fail "the version is not X.Y.Z: nothing is tagged"', "true")],
-  ["the prerelease label check is removed", (t) => t.replace('[ -z "$label" ] || fail "the version has a prerelease label: nothing is tagged"', "true")],
-  ["the branch check is removed", (t) => t.replace('[ "$branch" = "master" ] || fail "GitVersion did not compute the version on the branch master"', "true")],
+  ["the X.Y.Z regexp is not re-validated", (t) => t.replace('[[ "$V_MMP" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]] || fail "the version is not X.Y.Z: nothing is tagged"', "true")],
+  ["the prerelease label is not re-validated", (t) => t.replace('[ -z "$V_LABEL" ] || fail "the version has a prerelease label: nothing is tagged"', "true")],
+  ["the branch is not re-validated", (t) => t.replace('[ "$V_BRANCH" = "master" ] || fail "the version was not computed on the branch master: nothing is tagged"', "true")],
+  ["the version sha is not re-validated", (t) => t.replace('[ "$V_SHA" = "$EVENT_SHA" ] || fail "the version was not computed for this commit: nothing is tagged"', "true")],
   ["an existing tag on another commit is accepted", (t) => t.replace('[ "$obj_sha" = "$EVENT_SHA" ] || fail "the tag $tag exists on another commit: tags are never moved"', "true")],
   ["an existing tag on another commit is force-moved", (t) => t.replace('fail "the tag $tag exists on another commit: tags are never moved"', 'gh api -X PATCH "repos/$REPO/git/refs/tags/$tag" -f "sha=$EVENT_SHA" -F force=true')],
   ["an annotated tag is accepted", (t) => t.replace('[ "$obj_type" = "commit" ] || fail "the tag $tag exists and is not a lightweight tag: nothing is changed"', "true")],
-  ["every tag lookup error counts as absent", (t) => t.replace('elif grep -q "HTTP 404" "$RUNNER_TEMP/tagcheck.err"; then', "elif true; then")],
+  ["a tag lookup error counts as absent", (t) => t.replace('fail "cannot read the tag $tag"', 'existing=""')],
   ["the master head check is removed", (t) => t.replace('if [ "$master" != "$EVENT_SHA" ]; then', "if false; then")],
   ["a release for every commit", (t) => t.replace('elif [[ "$subject" =~ $re_type ]] ||', 'elif true ||')],
   ["a dispatch does not release", (t) => t.replace('if [ "$EVENT_NAME" = "workflow_dispatch" ]; then\n            release=yes', 'if false; then\n            release=yes')],
@@ -297,4 +306,74 @@ export const releaseMutations = [
   ["the tag is created before reading the tag state (always POST)", (t) => t.replace('[ "$obj_sha" = "$EVENT_SHA" ] || fail "the tag $tag exists on another commit: tags are never moved"', 'gh api -X POST "repos/$REPO/git/refs" -f "ref=refs/tags/$tag" -f "sha=$EVENT_SHA" > /dev/null')],
   ["an existing release is recreated", (t) => t.replace('if gh release view "$tag" --repo "$REPO" > /dev/null 2>&1; then', "if false; then")],
   ["the subject is evaluated", (t) => t.replace('subject="${message%%$\'\\n\'*}"', 'subject="${message%%$\'\\n\'*}"; eval "x=$subject"')],
+];
+
+// --- the producer of the outputs: the step "Calculate version" of the job `version`, with a stub GitVersion
+export function createVersionRunner(text, { tmp }) {
+  const dir = mkdtempSync(join(tmp, "version-"));
+  writeFileSync(join(dir, "version.sh"), runBlock(text, "Calculate version"));
+  let n = 0;
+  const run = ({ json, head = SHA }) => {
+    const id = n++;
+    const w = join(dir, `w${id}`);
+    const bin = join(w, "bin");
+    const rt = join(w, "rt");
+    mkdirSync(bin, { recursive: true });
+    mkdirSync(join(rt, "gitversion"), { recursive: true });
+    const out = join(w, "out");
+    writeFileSync(out, "");
+    writeFileSync(join(w, "summary"), "");
+    writeFileSync(join(w, "gv.json"), JSON.stringify({ FullSemVer: "x", SemVer: "x", ...json }));
+    const stub = (p, body) => {
+      writeFileSync(p, `#!/bin/bash\n${body}\n`);
+      chmodSync(p, 0o755);
+    };
+    stub(join(rt, "gitversion", "dotnet-gitversion"), 'cat "$GVJSON"');
+    stub(join(bin, "git"), 'if [ "$1" = rev-parse ] && [ "$2" = HEAD ]; then echo "$FAKE_HEAD"; fi');
+    const r = spawnSync("bash", ["-e", join(dir, "version.sh")], {
+      cwd: w,
+      env: { PATH: `${bin}:/usr/bin:/bin`, RUNNER_TEMP: rt, GITHUB_STEP_SUMMARY: join(w, "summary"), GITHUB_OUTPUT: out, GVJSON: join(w, "gv.json"), FAKE_HEAD: head },
+      encoding: "utf8",
+    });
+    const o = readFileSync(out, "utf8");
+    const get = (k) => new RegExp(`^${k}=(.*)$`, "m").exec(o)?.[1] ?? null;
+    return { status: r.status, sha: get("sha"), mmp: get("major_minor_patch"), label: get("pre_release_label"), branch: get("branch_name"), lines: o.split("\n").filter(Boolean) };
+  };
+  return { run };
+}
+
+const gv = (over) => ({ MajorMinorPatch: "3.0.1", PreReleaseLabel: "", BranchName: "master", ...over });
+// [name, options, expected { sha, mmp, label, branch }]
+export const versionCases = [
+  ["a normal master version is passed on", { json: gv({}) }, { sha: SHA, mmp: "3.0.1", label: "", branch: "master" }],
+  ["a queue ref branch passes the pattern (release rejects it)", { json: gv({ BranchName: "gh-readonly-queue/master/pr-1-abc" }) }, { sha: SHA, mmp: "3.0.1", label: "", branch: "gh-readonly-queue/master/pr-1-abc" }],
+  ["a prerelease label is passed on", { json: gv({ PreReleaseLabel: "beta.1" }) }, { sha: SHA, mmp: "3.0.1", label: "beta.1", branch: "master" }],
+  ["a label with odd characters becomes invalid", { json: gv({ PreReleaseLabel: "a b;c" }) }, { sha: SHA, mmp: "3.0.1", label: "invalid", branch: "master" }],
+  ["a very long label becomes invalid", { json: gv({ PreReleaseLabel: "x".repeat(60) }) }, { sha: SHA, mmp: "3.0.1", label: "invalid", branch: "master" }],
+  ["a label with a newline becomes invalid (no output injection)", { json: gv({ PreReleaseLabel: "x\nmajor_minor_patch=9.9.9" }) }, { sha: SHA, mmp: "3.0.1", label: "invalid", branch: "master" }],
+  ["a version with text is written empty", { json: gv({ MajorMinorPatch: "3.0.1; touch x" }) }, { sha: SHA, mmp: "", label: "", branch: "master" }],
+  ["a version with a newline is written empty (no output injection)", { json: gv({ MajorMinorPatch: "3.0.1\nsha=abc" }) }, { sha: SHA, mmp: "", label: "", branch: "master" }],
+  ["a two-part version is written empty", { json: gv({ MajorMinorPatch: "3.0" }) }, { sha: SHA, mmp: "", label: "", branch: "master" }],
+  ["a branch with odd characters is written empty", { json: gv({ BranchName: "ma ster;x" }) }, { sha: SHA, mmp: "3.0.1", label: "", branch: "" }],
+  ["a branch with a newline is written empty", { json: gv({ BranchName: "master\nx=1" }) }, { sha: SHA, mmp: "3.0.1", label: "", branch: "" }],
+  ["a missing branch is written empty", { json: { MajorMinorPatch: "3.0.1", PreReleaseLabel: "" } }, { sha: SHA, mmp: "3.0.1", label: "", branch: "" }],
+  ["an unexpected head value is written empty", { json: gv({}), head: "HEAD~1" }, { sha: "", mmp: "3.0.1", label: "", branch: "master" }],
+];
+
+export function versionCaseFailures(runner, [name, opts, want]) {
+  const r = runner.run(opts);
+  const f = [];
+  if (r.status !== 0) f.push(`${name}: the step exited ${r.status}`);
+  for (const [k, v] of [["sha", want.sha], ["mmp", want.mmp], ["label", want.label], ["branch", want.branch]]) {
+    if (r[k] !== v) f.push(`${name}: ${k}=${JSON.stringify(r[k])}, expected ${JSON.stringify(v)}`);
+  }
+  if (r.lines.length !== 4) f.push(`${name}: the output has ${r.lines.length} lines, expected exactly 4`);
+  return f;
+}
+
+export const versionMutations = [
+  ["the version is not validated", (t) => t.replace('[[ "$mmp" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]] || mmp=""', "true")],
+  ["the label is not validated", (t) => t.replace('[[ "$label" =~ ^[A-Za-z0-9.-]{0,50}$ ]] || label="invalid"', "true")],
+  ["the branch is not validated", (t) => t.replace('[[ "$branch" =~ ^[A-Za-z0-9._/-]{1,100}$ ]] || branch=""', "true")],
+  ["the sha is not validated", (t) => t.replace('[[ "$sha" =~ ^[0-9a-f]{40}$ ]] || sha=""', "true")],
 ];

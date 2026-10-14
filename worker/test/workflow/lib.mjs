@@ -309,9 +309,10 @@ const onBlock = (text) => /^on:\n((?:(?: .*|)\n)*)/m.exec(text)?.[1] ?? null;
 const trigger = (on, name) => new RegExp(`^ {2}${name}:.*\\n((?: {4,}.*\\n|\\n)*)`, "m").exec(on)?.[1] ?? null;
 
 // --- #290 part 3: the release job. Exact condition and needs, the only write scope, no environment, no secrets or
-// Cloudflare, only the job's GITHUB_TOKEN, GitVersion as in the job `version`, and a run block that never moves,
-// deletes or forces a tag and validates the version (also executed by release.mjs).
-export const RELEASE_IF = "    if: ${{ !cancelled() && needs.ci.result == 'success' && needs.plan.result == 'success' && ((needs.plan.outputs.deploy != 'true' && needs.migrate.result == 'skipped' && needs.deploy.result == 'skipped') || (needs.plan.outputs.deploy == 'true' && needs.migrate.result == 'success' && needs.deploy.result == 'success')) && github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}";
+// Cloudflare, only the job's GITHUB_TOKEN, NO tool and NO action (the version comes from the read-only job `version`
+// as outputs that the script re-validates), and a run block that never moves, deletes or forces a tag (also executed by
+// release.mjs).
+export const RELEASE_IF = "    if: ${{ !cancelled() && needs.ci.result == 'success' && needs.version.result == 'success' && needs.plan.result == 'success' && ((needs.plan.outputs.deploy != 'true' && needs.migrate.result == 'skipped' && needs.deploy.result == 'skipped') || (needs.plan.outputs.deploy == 'true' && needs.migrate.result == 'success' && needs.deploy.result == 'success')) && github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}";
 export function releaseFailures(text) {
   const f = [];
   const b = jobBlock(text, "release");
@@ -319,7 +320,7 @@ export function releaseFailures(text) {
   const c = code(b);
   const lines = b.split("\n");
   if (!lines.includes(RELEASE_IF) || lines.filter((l) => /^ {4}if:/.test(l)).length !== 1) f.push("release has not the exact condition (gate, plan, deploy chain done or skipped by design, repository, master, push or dispatch)");
-  if (!/^ {4}needs: \[changes, lint, tests, ci, plan, migrate, deploy\]$/m.test(b)) f.push("release must need exactly changes, lint, tests, ci, plan, migrate, deploy");
+  if (!/^ {4}needs: \[changes, lint, tests, ci, version, plan, migrate, deploy\]$/m.test(b)) f.push("release must need exactly changes, lint, tests, ci, version, plan, migrate, deploy");
   if (!/^ {4}runs-on: ubuntu-24\.04$/m.test(b)) f.push("release must run on the audited image ubuntu-24.04");
   if (!/^ {4}permissions:\n {6}contents: write\n(?! {6})/m.test(b)) f.push("release must have exactly contents: write");
   if (/^ {4}environment:/m.test(c)) f.push("environment on the release job");
@@ -328,23 +329,23 @@ export function releaseFailures(text) {
   if ((code(text).match(/contents: write/g) ?? []).length !== 1) f.push("contents: write must appear exactly once in the file (in the release job)");
   if (/CLOUDFLARE|WRANGLER|wrangler|D1_DATABASE|WORKER_URL|\bsecrets\b/i.test(c)) f.push("deploy secrets, Cloudflare or secrets in the release job");
   // Only the job's own token and the event data reach the steps through expressions.
-  const allowed = [/^ {4}if: \$\{\{ /, /^ {10}GH_TOKEN: \$\{\{ github\.token \}\}$/, /^ {10}EVENT_NAME: \$\{\{ github\.event_name \}\}$/, /^ {10}EVENT_SHA: \$\{\{ github\.sha \}\}$/, /^ {10}REPO: \$\{\{ github\.repository \}\}$/];
+  const allowed = [/^ {4}if: \$\{\{ /, /^ {10}GH_TOKEN: \$\{\{ github\.token \}\}$/, /^ {10}EVENT_NAME: \$\{\{ github\.event_name \}\}$/, /^ {10}EVENT_SHA: \$\{\{ github\.sha \}\}$/, /^ {10}REPO: \$\{\{ github\.repository \}\}$/, /^ {10}V_SHA: \$\{\{ needs\.version\.outputs\.sha \}\}$/, /^ {10}V_MMP: \$\{\{ needs\.version\.outputs\.major_minor_patch \}\}$/, /^ {10}V_LABEL: \$\{\{ needs\.version\.outputs\.pre_release_label \}\}$/, /^ {10}V_BRANCH: \$\{\{ needs\.version\.outputs\.branch_name \}\}$/];
   for (const l of c.split("\n")) if (l.includes("${{") && !allowed.some((re) => re.test(l))) f.push(`unexpected expression in the release job: ${l.trim()}`);
-  // GitVersion exactly as in the job `version`, no third-party action.
-  const sv = steps(jobBlock(text, "version") ?? "").find((s) => s.name === "Install GitVersion.Tool");
-  const sr = steps(b).find((s) => s.name === "Install GitVersion.Tool");
-  if (!sv || !sr || sv.run !== sr.run) f.push("the GitVersion install of release differs from the job version");
-  if (!/^ {6}GITVERSION_TOOL_VERSION: "6\.8\.2"$/m.test(b)) f.push("GitVersion.Tool must be pinned to the exact version 6.8.2 in release");
-  const uses = [...b.matchAll(/^ {6,8}(?:- )?uses: (\S+)/gm)].map((m) => m[1]);
-  if (uses.length !== 1 || !/^actions\/checkout@[0-9a-f]{40}$/.test(uses[0])) f.push(`release must use only actions/checkout (pinned): ${uses.join(",")}`);
-  if (!/^ {10}persist-credentials: false$/m.test(b) || !/^ {10}fetch-depth: 0$/m.test(b)) f.push("release checkout needs persist-credentials: false and fetch-depth: 0");
+  // The job with the write token installs and runs NO tool and uses NO action (no checkout, no dotnet, no NuGet, no
+  // GitVersion): the supply-chain exposure of an unlocked package stays in the read-only job `version`.
+  if (/^ {6,8}(?:- )?uses:/m.test(c)) f.push("the release job must use no action");
+  if (/dotnet|nuget|gitversion|npm |npx |pip |curl|wget|apt/i.test(c)) f.push("the release job must install and run no tool or package");
+  if (steps(b).length !== 1 || steps(b)[0].name !== "Tag and release") f.push("the release job must have exactly one step: Tag and release");
   // The decision script.
   const run = steps(b).find((s) => s.name === "Tag and release")?.run ?? "";
   if (run === "") f.push("release has no step Tag and release");
   const need = [
-    '[[ "$version" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]]',
-    '[ -z "$label" ]',
-    '[ "$branch" = "master" ]',
+    '[ "$V_SHA" = "$EVENT_SHA" ]',
+    '[ "$V_BRANCH" = "master" ]',
+    '[ -z "$V_LABEL" ]',
+    '[[ "$V_MMP" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]]',
+    'tag="v$V_MMP"',
+    'git/matching-refs/tags/$tag',
     '[ "$obj_sha" = "$EVENT_SHA" ]',
     '[ "$obj_type" = "commit" ]',
     'gh api -X POST "repos/$REPO/git/refs" -f "ref=refs/tags/$tag" -f "sha=$EVENT_SHA"',
@@ -353,7 +354,20 @@ export function releaseFailures(text) {
     "re_footer=",
   ];
   for (const n of need) if (!run.includes(n)) f.push(`the release script lacks: ${n}`);
-  if (/git push|git tag|--force|-F force|-X (DELETE|PATCH|PUT)|--delete|release delete|\beval\b|git fetch/.test(run)) f.push("the release script moves, deletes, forces or pushes a tag, or evals");
+  if (/git |--force|-F force|-X (DELETE|PATCH|PUT)|--delete|release delete|\beval\b|(?<!-)\bjq /.test(run.replace(/git\/(refs|ref|matching-refs)/g, ""))) f.push("the release script runs git, moves, deletes, forces a tag, evals or parses with a tool");
+  // The job `version`: read-only (no permissions block), the validated outputs, and the output step.
+  const v = jobBlock(text, "version");
+  if (v !== null) {
+    if (/^ {4}permissions:/m.test(code(v))) f.push("the job version must have no permissions block (it is the read-only job that runs the package)");
+    const outs = code(v).split("\n").filter((l) => /^ {6}[a-z_]+: \$\{\{ steps\.gv\.outputs\./.test(l));
+    const want = ["      sha: ${{ steps.gv.outputs.sha }}", "      major_minor_patch: ${{ steps.gv.outputs.major_minor_patch }}", "      pre_release_label: ${{ steps.gv.outputs.pre_release_label }}", "      branch_name: ${{ steps.gv.outputs.branch_name }}"];
+    if (JSON.stringify(outs) !== JSON.stringify(want)) f.push("the outputs of the job version are not exactly sha, major_minor_patch, pre_release_label, branch_name");
+    const calc = steps(v).find((s) => s.name === "Calculate version");
+    if (!calc || !/^ {8}id: gv$/m.test(calc.text)) f.push("the version step has not the id gv");
+    for (const n of ['[[ "$mmp" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]] || mmp=""', '[[ "$label" =~ ^[A-Za-z0-9.-]{0,50}$ ]] || label="invalid"', '[[ "$branch" =~ ^[A-Za-z0-9._/-]{1,100}$ ]] || branch=""', '[[ "$sha" =~ ^[0-9a-f]{40}$ ]] || sha=""']) {
+      if (!(calc?.run ?? "").includes(n)) f.push(`the version step lacks the validation: ${n}`);
+    }
+  }
   return f;
 }
 

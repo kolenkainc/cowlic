@@ -11,7 +11,7 @@ import {
   PERMISSIONS, ciFailures, ciFile, createRunner, createSandbox, dynamicFailures, hostileTitleFailures, hostileTitles, mutations,
   parsePermissions, permissionFailures, readText, staticFailures, steps, tamperCases,
 } from "./lib.mjs";
-import { createReleaseRunner, hostileCases, releaseCaseFailures, releaseCases, releaseConditionFailures, releaseMutations } from "./release.mjs";
+import { createReleaseRunner, createVersionRunner, hostileCases, releaseCaseFailures, releaseCases, releaseConditionFailures, releaseMutations, versionCaseFailures, versionCases, versionMutations } from "./release.mjs";
 import { changesCaseFailures, changesCases, changesMutations, createChangesRunner, createScopeRunner, scopeCaseFailures, scopeCases, scopeMutations } from "./changes.mjs";
 
 const ci = readText(ciFile);
@@ -266,8 +266,20 @@ describe("ci.yml reports `ci` on pull_request, push and merge_group (#290, #292)
     ["a new unreviewed job", (t) => `${t}\n  extra:\n    name: extra\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n`],
     // The release job (#290 part 3).
     ["release job removed", (t) => t.replace(/^ {2}release:\n[\s\S]*$/m, "")],
-    ["release without needs", (t) => t.replace("    needs: [changes, lint, tests, ci, plan, migrate, deploy]\n", "")],
-    ["release not needing deploy", (t) => t.replace("needs: [changes, lint, tests, ci, plan, migrate, deploy]", "needs: [changes, lint, tests, ci, plan]")],
+    ["release without needs", (t) => t.replace("    needs: [changes, lint, tests, ci, version, plan, migrate, deploy]\n", "")],
+    ["release not needing deploy", (t) => t.replace("needs: [changes, lint, tests, ci, version, plan, migrate, deploy]", "needs: [changes, lint, tests, ci, version, plan]")],
+    ["release without needs.version", (t) => t.replace("needs: [changes, lint, tests, ci, version, plan, migrate, deploy]", "needs: [changes, lint, tests, ci, plan, migrate, deploy]")],
+    ["release without needs.version.result in its condition", (t) => t.replace(" && needs.version.result == 'success' && needs.plan.result", " && needs.plan.result")],
+    ["release when the version job failed or was skipped (any result accepted)", (t) => t.replace("needs.version.result == 'success'", "needs.version.result != 'cancelled'")],
+    ["release installing GitVersion again (a tool in the write-token job)", (t) => t.replace("      - name: Tag and release\n", "      - name: Install GitVersion.Tool\n        run: |\n          dotnet tool install GitVersion.Tool --tool-path \"$RUNNER_TEMP/gitversion\" --version 6.8.2\n\n      - name: Tag and release\n")],
+    ["release with a checkout", (t) => t.replace("      - name: Tag and release\n", "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          persist-credentials: false\n\n      - name: Tag and release\n")],
+    ["release running npm", (t) => t.replace("          fail() {\n            echo \"::error::$1\"\n            exit 1\n          }\n          is_sha()", "          npm install left-pad\n          fail() {\n            echo \"::error::$1\"\n            exit 1\n          }\n          is_sha()")],
+    ["the version job given a write permission", (t) => t.replace("  version:\n    name: version\n", "  version:\n    name: version\n    permissions:\n      contents: write\n")],
+    ["the version job given a read permission block", (t) => t.replace("  version:\n    name: version\n", "  version:\n    name: version\n    permissions:\n      contents: read\n")],
+    ["the version job with an extra output", (t) => t.replace("      branch_name: ${{ steps.gv.outputs.branch_name }}\n", "      branch_name: ${{ steps.gv.outputs.branch_name }}\n      extra: ${{ steps.gv.outputs.sha }}\n")],
+    ["the version output is not validated", (t) => t.replace('[[ "$mmp" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]] || mmp=""', "true")],
+    ["the version job inside the gate (could stall the queue)", (t) => t.replace("needs: [changes, lint, tests]", "needs: [changes, lint, tests, version]")],
+    ["release with a version output read by the wrong name", (t) => t.replace("V_MMP: ${{ needs.version.outputs.major_minor_patch }}", "V_MMP: ${{ needs.version.outputs.semver }}")],
     ["release with contents: write at workflow level", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, "permissions:\n  contents: write\n")],
     ["release without its write permission", (t) => t.replace("    permissions:\n      contents: write\n", "")],
     ["release with an extra scope", (t) => t.replace("      contents: write\n", "      contents: write\n      id-token: write\n")],
@@ -280,19 +292,19 @@ describe("ci.yml reports `ci` on pull_request, push and merge_group (#290, #292)
     ["release tagging on a failed deploy (deploy result not checked)", (t) => t.replace(" && needs.deploy.result == 'success')) && github.repository", ")) && github.repository")],
     ["release after a failed or cancelled migrate", (t) => t.replace("needs.migrate.result == 'success' && ", "")],
     ["release when plan failed or was skipped", (t) => t.replace("needs.plan.result == 'success' && ", "")],
-    ["release without the gate", (t) => t.replace("needs.ci.result == 'success' && needs.plan.result", "needs.plan.result")],
-    ["release without !cancelled() (skipped by design would skip it)", (t) => t.replace("${{ !cancelled() && needs.ci.result == 'success' && needs.plan.result", "${{ needs.ci.result == 'success' && needs.plan.result")],
-    ["release with always() (runs after failures)", (t) => t.replace("${{ !cancelled() && needs.ci.result == 'success' && needs.plan.result == 'success' && ((", "${{ always() && ((")],
-    ["release with the X.Y.Z regexp removed", (t) => t.replace('[[ "$version" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]]', "true")],
+    ["release without the gate", (t) => t.replace("needs.ci.result == 'success' && needs.version.result", "needs.version.result")],
+    ["release without !cancelled() (skipped by design would skip it)", (t) => t.replace("${{ !cancelled() && needs.ci.result == 'success' && needs.version.result", "${{ needs.ci.result == 'success' && needs.version.result")],
+    ["release with always() (runs after failures)", (t) => t.replace("${{ !cancelled() && needs.ci.result == 'success' && needs.version.result == 'success' && needs.plan.result == 'success' && ((", "${{ always() && ((")],
+    ["release with the X.Y.Z regexp removed", (t) => t.replace('[[ "$V_MMP" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]]', "true")],
+    ["release without the sha re-validation", (t) => t.replace('[ "$V_SHA" = "$EVENT_SHA" ]', "true")],
+    ["release without the branch re-validation", (t) => t.replace('[ "$V_BRANCH" = "master" ]', "true")],
+    ["release without the prerelease re-validation", (t) => t.replace('[ -z "$V_LABEL" ]', "true")],
     ["release force-moving a tag", (t) => t.replace('fail "the tag $tag exists on another commit: tags are never moved"', 'gh api -X PATCH "repos/$REPO/git/refs/tags/$tag" -f "sha=$EVENT_SHA" -F force=true')],
     ["release pushing a tag from the checkout", (t) => t.replace('echo "created tag $tag"', 'git push origin "$tag"')],
-    ["release with a PAT", (t) => t.replace("          GH_TOKEN: ${{ github.token }}\n          EVENT_NAME: ${{ github.event_name }}\n          EVENT_SHA: ${{ github.sha }}\n          REPO: ${{ github.repository }}\n        run: |\n          fail()", "          GH_TOKEN: ${{ github.token }}\n          PAT: ${{ vars.RELEASE_PAT }}\n          EVENT_NAME: ${{ github.event_name }}\n          EVENT_SHA: ${{ github.sha }}\n          REPO: ${{ github.repository }}\n        run: |\n          fail()")],
-    ["release with a secret", (t) => t.replace("          GH_TOKEN: ${{ github.token }}\n          EVENT_NAME: ${{ github.event_name }}\n          EVENT_SHA: ${{ github.sha }}\n          REPO: ${{ github.repository }}\n        run: |\n          fail()", "          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}\n          EVENT_NAME: ${{ github.event_name }}\n          EVENT_SHA: ${{ github.sha }}\n          REPO: ${{ github.repository }}\n        run: |\n          fail()")],
-    ["release with Cloudflare variables", (t) => t.replace("      DOTNET_NOLOGO: \"1\"\n      DOTNET_CLI_TELEMETRY_OPTOUT: \"1\"\n    defaults:\n      run:\n        shell: bash\n    steps:\n      # fetch-depth 0: GitVersion needs the full history and all tags. No credentials", "      DOTNET_NOLOGO: \"1\"\n      CLOUDFLARE_ACCOUNT_ID: x\n      DOTNET_CLI_TELEMETRY_OPTOUT: \"1\"\n    defaults:\n      run:\n        shell: bash\n    steps:\n      # fetch-depth 0: GitVersion needs the full history and all tags. No credentials")],
-    ["release with a persisted checkout token", (t) => t.replace(/(  release:\n[\s\S]*?)persist-credentials: false/m, "$1persist-credentials: true")],
-    ["release without full history", (t) => t.replace(/(  release:\n[\s\S]*?) {10}fetch-depth: 0\n/m, "$1")],
-    ["release on a mutable runner image", (t) => t.replace("  release:\n    name: release\n", "  release:\n    name: release\n").replace(/(  release:\n[\s\S]*?)runs-on: ubuntu-24\.04/m, "$1runs-on: ubuntu-latest")],
-    ["release with another GitVersion version", (t) => t.replace(/(  release:\n[\s\S]*?)GITVERSION_TOOL_VERSION: "6\.8\.2"/m, '$1GITVERSION_TOOL_VERSION: "6.8.3"')],
+    ["release with a PAT", (t) => t.replace("          REPO: ${{ github.repository }}\n          V_SHA:", "          REPO: ${{ github.repository }}\n          PAT: ${{ vars.RELEASE_PAT }}\n          V_SHA:")],
+    ["release with a secret", (t) => t.replace("          REPO: ${{ github.repository }}\n          V_SHA:", "          REPO: ${{ github.repository }}\n          TOKEN: ${{ secrets.RELEASE_TOKEN }}\n          V_SHA:")],
+    ["release with Cloudflare variables", (t) => t.replace("          REPO: ${{ github.repository }}\n          V_SHA:", "          REPO: ${{ github.repository }}\n          CLOUDFLARE_ACCOUNT_ID: x\n          V_SHA:")],
+    ["release on a mutable runner image", (t) => t.replace(/(  release:\n[\s\S]*?)runs-on: ubuntu-24\.04/m, "$1runs-on: ubuntu-latest")],
     ["release with a third-party action", (t) => t.replace("      - name: Tag and release\n", "      - uses: softprops/action-gh-release@0123456789abcdef0123456789abcdef01234567\n\n      - name: Tag and release\n")],
     ["cancel-in-progress for every event", (t) => t.replace(/cancel-in-progress: .*\n/, "cancel-in-progress: true\n")],
     ["cancel-in-progress for every pull_request action (a label event cancels the run in progress)", (t) => t.replace(/cancel-in-progress: .*\n/, "cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n")],
@@ -369,8 +381,28 @@ describe("ci.yml: the release job", () => {
     const failedDeploy = ci.replace(" && needs.deploy.result == 'success')) && github.repository", ")) && github.repository");
     expect(failedDeploy).not.toBe(ci);
     expect(releaseConditionFailures(failedDeploy).length).toBeGreaterThan(0);
-    const noCancel = ci.replace("${{ !cancelled() && needs.ci.result == 'success' && needs.plan.result", "${{ needs.ci.result == 'success' && needs.plan.result");
+    const noCancel = ci.replace("${{ !cancelled() && needs.ci.result == 'success' && needs.version.result", "${{ needs.ci.result == 'success' && needs.version.result");
     expect(noCancel).not.toBe(ci);
     expect(releaseConditionFailures(noCancel).length).toBeGreaterThan(0);
+    const noVersion = ci.replace(" && needs.version.result == 'success' && needs.plan.result", " && needs.plan.result");
+    expect(noVersion).not.toBe(ci);
+    expect(releaseConditionFailures(noVersion).length).toBeGreaterThan(0);
+  });
+});
+
+// The producer of the release inputs: the output step of the read-only job `version`.
+describe("ci.yml: the validated outputs of the job version", () => {
+  let versionRunner;
+  beforeAll(() => {
+    versionRunner = createVersionRunner(ci, sandbox);
+  });
+  it.each(versionCases.map((c) => [c[0], c]))("%s", (_name, c) => {
+    expect(versionCaseFailures(versionRunner, c)).toEqual([]);
+  });
+  it.each(versionMutations)("mutation is caught: %s", (name, fn) => {
+    const mutated = fn(ci);
+    expect(mutated, `the mutation pattern was not found: ${name}`).not.toBe(ci);
+    const runner = createVersionRunner(mutated, sandbox);
+    expect(versionCases.flatMap((c) => versionCaseFailures(runner, c)).length).toBeGreaterThan(0);
   });
 });
