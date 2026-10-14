@@ -752,6 +752,7 @@ jobs:
         id: title
         if: steps.guard.outputs.deploy == 'true'
         env:
+          X: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           GH_TOKEN: ${{ github.token }}
           EVENT_SHA: ${{ github.sha }}
           REPO: ${{ github.repository }}
