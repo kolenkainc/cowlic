@@ -1,4 +1,5 @@
 import { authenticate, type AuthEnv } from "./auth";
+import { preflight, withCors } from "./cors";
 import { coverFileId, getAlbum, getAlbumList2, getArtist, getArtists, getSong, search3 } from "./library";
 import { logEvent, routeName } from "./log";
 import { fail, ok } from "./subsonic";
@@ -26,7 +27,9 @@ export default {
     const route = routeName(new URL(request.url).pathname);
     let res: Response;
     try {
-      res = await handle(request, env, route);
+      // A preflight carries no credentials: answer it before authentication.
+      const pre = preflight(request);
+      res = withCors(request, pre ?? (await handle(request, env, route)));
     } catch (e) {
       // Route and error class only: the message may embed query values.
       logEvent("unhandled_error", { route, error: e });

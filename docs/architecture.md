@@ -75,6 +75,8 @@ CREATE INDEX idx_tracks_album ON tracks(album_id);
 
 **Аутентификация.** Subsonic-токен: `t = md5(password + salt)`, где `s = salt`. MD5 здесь навязан протоколом, а не нашим выбором. Мера защиты: только HTTPS (Cloudflare) и длинный случайный пароль, который хранится как Worker secret. Если Symfonium поддерживает `apiKey` из OpenSubsonic, предпочесть его.
 
+**CORS (#283).** The Worker allows CORS for an exact-match allowlist of origins (initially only `https://feishin.vercel.app`, the Feishin web player); the list is the `ALLOWED_ORIGINS` constant in `worker/src/cors.ts`, there are no wildcards, and a preflight is answered before authentication. Warning: using the Feishin web player means typing the Subsonic password into a third-party hosted web app (feishin.vercel.app); prefer a self-hosted Feishin, or a dedicated low-privilege password if the project later supports one. A merge to master auto-deploys the Worker, so a change of the list goes live through the deploy workflow.
+
 ### 2.4 Стриминг: прокси вместо 302 (отличие от исходной схемы)
 Исходная идея была отдавать 302 на CDN Telegram. Так делать нельзя: Telegram не даёт отдельного CDN-URL. Ссылка имеет вид `https://api.telegram.org/file/bot<BOT_TOKEN>/<file_path>`, то есть **содержит токен бота**. Редирект передал бы токен клиенту, а он дал бы полный доступ к боту и каналу.
 
