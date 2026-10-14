@@ -18,8 +18,9 @@
 # never on pull_request or merge_group (the queue's squash commit is the push to master that deploys) and never in a
 # fork (job-level `if:` on the event, the ref and github.repository), and only when the gate `ci` of the SAME run
 # succeeded (#287: the gate succeeds only when lint and tests succeeded or were not needed). Whether there is anything
-# to deploy is decided in `plan` (step "Anything to deploy"): worker/ at this commit vs the last successful deployment
-# to production (BASE), always yes for a dispatch.
+# to deploy is decided in `plan` (step "Anything to deploy"): worker/ at this commit vs BASE, the commit of the most
+# recent successful `production` deployment record (it moves once `migrate` succeeds; after a failed deploy or health
+# check a later docs-only push does not retry, recovery is a workflow_dispatch), always yes for a dispatch.
 # CONCURRENCY. The WORKFLOW-level group of a push to master or a dispatch from master is `worker-deploy`, with
 # cancel-in-progress false: whole runs are serialized in push order, a running run (and so a running deploy or a
 # migrate waiting for approval) is never cancelled, and GitHub keeps one pending run and replaces an older pending run
@@ -645,7 +646,9 @@ jobs:
       # #290 part 2 (the only step added to the old plan job). The old workflow decided "is there anything to deploy"
       # outside, with the path filter `worker/**` of the push. Every push to master reaches this job now, so that the run
       # that survives a replaced pending run can deploy what the replaced run would have: the question is asked against
-      # what is LIVE, BASE (the last successful deployment to production, resolved above) vs this commit, worker/ only.
+      # what is LIVE, BASE (the commit of the most recent successful `production` deployment record, resolved above; it
+      # moves once `migrate` succeeds, so after a failed deploy or health check recovery is a workflow_dispatch) vs this
+      # commit, worker/ only.
       # A manual dispatch always deploys. Any git failure means deploy (a redundant deploy is idempotent and still behind
       # the guard, the gate and the migrate approval; a missed one is silent). The later steps of this job run for a
       # docs-only push too (they find nothing to check between BASE and the commit); the job output `deploy` is what
