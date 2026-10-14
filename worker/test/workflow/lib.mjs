@@ -83,6 +83,8 @@ export const PERMISSIONS = {
       plan: { contents: "read", "pull-requests": "read", deployments: "read" },
       migrate: { contents: "read" },
       deploy: null,
+      // The ONLY job with a write scope: it creates the tag and the Release with the job's GITHUB_TOKEN (#290 part 3).
+      release: { contents: "write" },
     },
   },
 };
@@ -260,7 +262,7 @@ export function staticFailures(text) {
   if (line("plan", /^ {4}environment:/m)) f.push("plan must have no environment");
   // Concurrency: the deploy runs are serialized by the WORKFLOW-level group (see ciFailures); a job-level group on any
   // job would be a second mechanism (and the same name at both levels deadlocks): none may exist.
-  for (const id of ["changes", "lint", "tests", "version", "ci", ...DEPLOY_JOBS]) {
+  for (const id of ["changes", "lint", "tests", "version", "ci", ...DEPLOY_JOBS, "release"]) {
     if (/^ {4}concurrency:/m.test(code(jobBlock(text, id) ?? ""))) f.push(`job-level concurrency on ${id}`);
   }
   // `changes` exposes exactly worker_changed and base_sha: no deploy decision leaves it (plan decides).
@@ -273,7 +275,7 @@ export function staticFailures(text) {
   for (const id of ["migrate", "deploy"]) rest = rest.replace(jobBlock(text, id) ?? "\u0000", "");
   if (/\bsecrets\b/i.test(code(rest))) f.push("secrets outside the jobs migrate and deploy (workflow level or another job)");
   // Environments: only on migrate and deploy.
-  for (const id of ["changes", "lint", "tests", "version", "ci", "plan"]) {
+  for (const id of ["changes", "lint", "tests", "version", "ci", "plan", "release"]) {
     if (/^ {4}environment:/m.test(code(jobBlock(text, id) ?? ""))) f.push(`environment on the job ${id}`);
   }
   if (/^environment:|^env:/m.test(code(text.split(/^jobs:/m)[0]))) f.push("workflow-level env or environment");
@@ -305,6 +307,55 @@ export function jobBlock(text, id) {
 // The text of the `on:` block (until the next top-level key), and the text of one trigger inside it.
 const onBlock = (text) => /^on:\n((?:(?: .*|)\n)*)/m.exec(text)?.[1] ?? null;
 const trigger = (on, name) => new RegExp(`^ {2}${name}:.*\\n((?: {4,}.*\\n|\\n)*)`, "m").exec(on)?.[1] ?? null;
+
+// --- #290 part 3: the release job. Exact condition and needs, the only write scope, no environment, no secrets or
+// Cloudflare, only the job's GITHUB_TOKEN, GitVersion as in the job `version`, and a run block that never moves,
+// deletes or forces a tag and validates the version (also executed by release.mjs).
+export const RELEASE_IF = "    if: ${{ !cancelled() && needs.ci.result == 'success' && needs.plan.result == 'success' && ((needs.plan.outputs.deploy != 'true' && needs.migrate.result == 'skipped' && needs.deploy.result == 'skipped') || (needs.plan.outputs.deploy == 'true' && needs.migrate.result == 'success' && needs.deploy.result == 'success')) && github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}";
+export function releaseFailures(text) {
+  const f = [];
+  const b = jobBlock(text, "release");
+  if (b === null) return ["job release is missing"];
+  const c = code(b);
+  const lines = b.split("\n");
+  if (!lines.includes(RELEASE_IF) || lines.filter((l) => /^ {4}if:/.test(l)).length !== 1) f.push("release has not the exact condition (gate, plan, deploy chain done or skipped by design, repository, master, push or dispatch)");
+  if (!/^ {4}needs: \[changes, lint, tests, ci, plan, migrate, deploy\]$/m.test(b)) f.push("release must need exactly changes, lint, tests, ci, plan, migrate, deploy");
+  if (!/^ {4}runs-on: ubuntu-24\.04$/m.test(b)) f.push("release must run on the audited image ubuntu-24.04");
+  if (!/^ {4}permissions:\n {6}contents: write\n(?! {6})/m.test(b)) f.push("release must have exactly contents: write");
+  if (/^ {4}environment:/m.test(c)) f.push("environment on the release job");
+  if (/^ {4}concurrency:/m.test(c)) f.push("job-level concurrency on release");
+  // contents: write exists exactly once in the file, inside this job.
+  if ((code(text).match(/contents: write/g) ?? []).length !== 1) f.push("contents: write must appear exactly once in the file (in the release job)");
+  if (/CLOUDFLARE|WRANGLER|wrangler|D1_DATABASE|WORKER_URL|\bsecrets\b/i.test(c)) f.push("deploy secrets, Cloudflare or secrets in the release job");
+  // Only the job's own token and the event data reach the steps through expressions.
+  const allowed = [/^ {4}if: \$\{\{ /, /^ {10}GH_TOKEN: \$\{\{ github\.token \}\}$/, /^ {10}EVENT_NAME: \$\{\{ github\.event_name \}\}$/, /^ {10}EVENT_SHA: \$\{\{ github\.sha \}\}$/, /^ {10}REPO: \$\{\{ github\.repository \}\}$/];
+  for (const l of c.split("\n")) if (l.includes("${{") && !allowed.some((re) => re.test(l))) f.push(`unexpected expression in the release job: ${l.trim()}`);
+  // GitVersion exactly as in the job `version`, no third-party action.
+  const sv = steps(jobBlock(text, "version") ?? "").find((s) => s.name === "Install GitVersion.Tool");
+  const sr = steps(b).find((s) => s.name === "Install GitVersion.Tool");
+  if (!sv || !sr || sv.run !== sr.run) f.push("the GitVersion install of release differs from the job version");
+  if (!/^ {6}GITVERSION_TOOL_VERSION: "6\.8\.2"$/m.test(b)) f.push("GitVersion.Tool must be pinned to the exact version 6.8.2 in release");
+  const uses = [...b.matchAll(/^ {6,8}(?:- )?uses: (\S+)/gm)].map((m) => m[1]);
+  if (uses.length !== 1 || !/^actions\/checkout@[0-9a-f]{40}$/.test(uses[0])) f.push(`release must use only actions/checkout (pinned): ${uses.join(",")}`);
+  if (!/^ {10}persist-credentials: false$/m.test(b) || !/^ {10}fetch-depth: 0$/m.test(b)) f.push("release checkout needs persist-credentials: false and fetch-depth: 0");
+  // The decision script.
+  const run = steps(b).find((s) => s.name === "Tag and release")?.run ?? "";
+  if (run === "") f.push("release has no step Tag and release");
+  const need = [
+    '[[ "$version" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]]',
+    '[ -z "$label" ]',
+    '[ "$branch" = "master" ]',
+    '[ "$obj_sha" = "$EVENT_SHA" ]',
+    '[ "$obj_type" = "commit" ]',
+    'gh api -X POST "repos/$REPO/git/refs" -f "ref=refs/tags/$tag" -f "sha=$EVENT_SHA"',
+    '--verify-tag --generate-notes',
+    'if [ "$master" != "$EVENT_SHA" ]; then',
+    "re_footer=",
+  ];
+  for (const n of need) if (!run.includes(n)) f.push(`the release script lacks: ${n}`);
+  if (/git push|git tag|--force|-F force|-X (DELETE|PATCH|PUT)|--delete|release delete|\beval\b|git fetch/.test(run)) f.push("the release script moves, deletes, forces or pushes a tag, or evals");
+  return f;
+}
 
 // --- #290, #292: ci.yml must report the required check `ci` on pull_request, push and merge_group, and the gate must
 // be a real gate. Static, on the text; every rule has a mutation test.
@@ -340,7 +391,7 @@ export function ciFailures(text) {
   // Only these jobs exist (a new job needs its permissions and conditions reviewed here on purpose).
   const afterJobs = text.slice(text.search(/^jobs:\n/m));
   const ids = [...afterJobs.matchAll(/^ {2}([A-Za-z0-9_-]+):\s*$/gm)].map((m) => m[1]);
-  if (JSON.stringify(ids) !== JSON.stringify(["changes", "lint", "tests", "version", "ci", "plan", "migrate", "deploy"])) f.push(`jobs changed: ${ids.join(",")}`);
+  if (JSON.stringify(ids) !== JSON.stringify(["changes", "lint", "tests", "version", "ci", "plan", "migrate", "deploy", "release"])) f.push(`jobs changed: ${ids.join(",")}`);
   for (const id of ["lint", "tests"]) {
     const j = jobBlock(text, id);
     if (j !== null && !/^ {4}if: \$\{\{ needs\.changes\.outputs\.worker_changed == 'true' \}\}$/m.test(j)) f.push(`job ${id} has no condition on worker_changed`);
@@ -353,7 +404,7 @@ export function ciFailures(text) {
   if (!text.includes(`\nconcurrency:\n${WORKFLOW_GROUP}\n${wantCancel}\n`)) f.push("workflow concurrency changed: a queue, master or label-event run could be cancelled, or a deploy run could share a cancellable group");
   f.push(...permissionFailures(text, PERMISSIONS["ci.yml"]));
   // A job that publishes a report needs checks: write (else the check run cannot be created), and only such a job has it.
-  for (const id of ["changes", "lint", "tests", "version", "ci", "plan", "migrate", "deploy"]) {
+  for (const id of ["changes", "lint", "tests", "version", "ci", "plan", "migrate", "deploy", "release"]) {
     const j = jobBlock(text, id);
     if (j === null) continue;
     const reports = j.includes("mikepenz/action-junit-report@");
@@ -367,6 +418,7 @@ export function ciFailures(text) {
   if (!text.includes("github.event.merge_group.base_sha") || !text.includes("github.event.merge_group.head_sha")) f.push("merge_group base/head not read");
   if (!/^ {10}fetch-depth: 0$/m.test(jobBlock(text, "version") ?? "")) f.push("version job without fetch-depth: 0 (GitVersion needs the full history)");
   f.push(...stepFailures(text));
+  f.push(...releaseFailures(text));
   return f;
 }
 

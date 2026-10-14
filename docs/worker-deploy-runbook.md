@@ -24,7 +24,9 @@ Order matters: migrate first, deploy second, so for a moment the OLD code runs o
 
 Reading a run: Actions -> CI -> the run -> Summary (the summaries above) and each job's log (`plan`, `migrate`, `deploy`). From a terminal: `gh run list --workflow ci.yml`, `gh run view <run-id> --log` (summaries are not in that output; use the run page).
 
-Releases and tags are separate: a version tag (`v3.0.0`, GitVersion) is made by hand with `gh release create vX.Y.Z --target <sha> --generate-notes` after the owner's go-ahead; nothing tags automatically and a tag does not deploy [V docs/releasing.md]. What is live is whatever the last green run deployed.
+Releases and tags follow the deploy but do not cause it: the job `release` tags every master commit after the deploy chain is done (see the paragraph above and docs/releasing.md), and a tag does not deploy [V docs/releasing.md]. What is live is whatever the last green run deployed.
+
+**Release after the deploy (#290 part 3).** After `deploy` succeeded, or when `plan` found nothing to deploy, the job `release` tags the commit `vX.Y.Z` (every master commit) and creates a GitHub Release (generated notes) for feat, fix, perf and breaking commits and for a manual dispatch; the rules are in docs/releasing.md "Who tags" and worker-cicd.md 12.5. A failed or cancelled `migrate` or `deploy` means NO tag: fix, dispatch CI on master, and the dispatch run tags and releases the head. If `release` is red: "tag exists on another commit" or an annotated tag means something outside the workflow touched the tags, nothing was changed, ask the owner (never delete or move a tag by script); "not X.Y.Z", a prerelease label or a wrong branch means GitVersion computed something unexpected, nothing was tagged. A green `release` with "Release skipped" means master moved on and the newer run tags its own commit. To see what would be tagged, read the summary of the job `version`. The first run after this feature merged created the first tag (see docs/releasing.md).
 
 ## 2. The FIRST production run
 

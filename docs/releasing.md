@@ -11,7 +11,7 @@
 1. Branch from an up-to-date master: `feat|fix|chore|docs|test/<slug>`.
 2. Open a PR; the required check is `ci` (shown as `CI / ci`; the gate job of `.github/workflows/ci.yml`).
 3. Squash merge to master. The PR title becomes the one commit on master, so it must be a Conventional Commit: it drives the version.
-4. Master is always releasable. To release, tag a master commit whose checks are green.
+4. Master is always releasable. Every master commit is tagged automatically after its checks and (when `worker/` changed) its deploy succeeded; see "Who tags".
 
 ## Version rules (`GitVersion.yml`)
 
@@ -28,7 +28,7 @@ Decision: chore/docs/ci/test/refactor DO increment (patch), so every master comm
 
 On a PR the version is computed from the commits of the PR branch (merged with master by GitHub), not from the PR title. The title matters after the squash merge, when it becomes the master commit message.
 
-The calculated version is printed in the job summary of the job `version` (shown as `CI / version`) of `.github/workflows/ci.yml` on every PR, on master and in the merge queue (it is not part of the gate `ci`). It is read-only: it never tags, releases or writes anything. The version is NOT embedded into the Worker or ingest.
+The calculated version is printed in the job summary of the job `version` (shown as `CI / version`) of `.github/workflows/ci.yml` on every PR, on master and in the merge queue (it is not part of the gate `ci`). The job `version` is read-only: it never tags, releases or writes anything (the job `release` does, see "Who tags"). To see what the next release will be BEFORE merging, read the summary of `version` on the PR (variable `MajorMinorPatch`, the tag would be `v` plus that value; on a PR it is computed from the PR branch, so the master value can differ by the commits merged meanwhile). The version is NOT embedded into the Worker or ingest.
 
 Quirk found while verifying: with the strict `tag-prefix: 'v'`, `next-version` must also carry the prefix (`v3.0.0`); a bare `3.0.0` fails with "Failed to parse 3.0.0 into a Semantic Version".
 
@@ -36,13 +36,18 @@ Quirk found while verifying: with the strict `tag-prefix: 'v'`, `next-version` m
 
 `next-version: v3.0.0` makes master compute 3.0.0-based versions before any `v*` tag exists. It is meant for intermittent use: in the PR that follows the first `v3.0.0` tag, delete that line from `GitVersion.yml`.
 
+Since the release job exists (#290 part 3), the first master run after it merges tags the FIRST master commit that reaches it as `v3.0.0` (no `v*` tag exists, so `MajorMinorPatch` is `3.0.0`; the log of the `version` job on master printed `3.0.0-104` before, i.e. `MajorMinorPatch` 3.0.0 with 104 commits since the start), and every later commit gets the next version (`v3.0.1`, `v3.0.2`, ...; a `feat` commit bumps the minor, a breaking one the major). So `v3.0.0` no longer marks the end of Release 3 by itself: it is the tag of the commit that merged the release stage. If the owner wants `v3.0.0` to mean "bootstrap done", change `next-version` BEFORE merging the release PR (for example to `v2.1.0`, so the first tag is `v2.1.0`), and bump it to `v3.0.0` in the PR that completes Release 3. Deleting the line after the first tag is optional and harmless.
+
 ## Who tags
 
-Nothing tags automatically. Tagging `v3.0.0` is a later step that needs the owner's approval. Default (manual, no write permission anywhere in CI): after the checks of the target commit are green and the owner gives the go-ahead (it is a publish), the coordinator or an agent runs
+The job `release` of `.github/workflows/ci.yml` tags and releases (owner decision (a), 2026-10-14, #290 part 3; it replaces the earlier rule "nothing tags automatically, no workflow has write permission"):
 
-    gh release create vX.Y.Z --target <sha> --generate-notes
-
-Owner decision, NOT implemented: a workflow that creates the tag/release on a trigger would need `permissions: contents: write`. Until the owner decides otherwise no workflow has write permission.
+- It is the ONLY job with `contents: write` (the workflow stays `contents: read`). It uses the job's `GITHUB_TOKEN` through `gh` and the REST API: no PAT, no push from a checkout, no environment, no deploy secret, no third-party action.
+- When it runs: push to master and `workflow_dispatch` from master in this repository (never `pull_request`, `merge_group` or a fork), only after the gate `ci` succeeded and the deploy chain is done: plan succeeded and either nothing was to be deployed (migrate and deploy skipped by design) or migrate and deploy both succeeded. A failed, cancelled or rejected deploy never releases.
+- What it creates: a tag `vX.Y.Z` on the master commit for EVERY commit (X.Y.Z = GitVersion `MajorMinorPatch`, validated: branch `master`, no prerelease label, strict `X.Y.Z`, anything else fails the job). Because every commit increments at least the patch version (see above), tags are frequent (one per master commit, docs and chore included). A GitHub Release with generated notes is created only when the squash commit subject (the PR title) is `feat`, `fix`, `perf`, a breaking one (`type!:` or a `BREAKING CHANGE:` footer), and on a manual dispatch.
+- Idempotent and never moving: a tag that already exists on THIS commit is a no-op (a missing Release is still created); a tag on another commit, an annotated tag, or an unreadable tag state fails the job; a tag is never moved, deleted or forced.
+- If master moved on after the commit (a newer push), the job ends green WITHOUT a tag and the newer run tags its own commit; a run replaced while pending never tags. So under fast merging not every commit gets a tag. To tag by hand: `gh release create vX.Y.Z --target <sha> --generate-notes` (owner or coordinator), or dispatch CI on master for the head (that also creates the Release).
+- The commit subject is data: read through the API into a shell variable, matched only, never put into a command line, expression or summary.
 
 ## Tool audit (GitVersion.Tool 6.8.2)
 
@@ -50,7 +55,7 @@ Owner decision, NOT implemented: a workflow that creates the tag/release on a tr
 - Version 6.8.2 published 2026-07-10 (older than two weeks), listed, latest stable release of the 6.x line.
 - Installed as a .NET tool with an exact version (`dotnet tool install --tool-path`), no third-party GitHub Action (`gittools/actions` is not used: one more supply-chain link for no gain).
 - The runner image `ubuntu-24.04` ships .NET SDK 8, 9 and 10 (runner-images Ubuntu2404 readme, image 20261004.327.1), so no `setup-dotnet` is needed. The workflow runs on `ubuntu-24.04`, not `-latest`, so the audited image does not change under it.
-- In the job `version` only `actions/checkout` (same pinned SHA as the other jobs of `ci.yml`) is used as an action. Never upgrade the tool without confirmation.
+- In the jobs `version` and `release` (same install steps, same exact version) only `actions/checkout` (same pinned SHA as the other jobs of `ci.yml`) is used as an action. Never upgrade the tool without confirmation.
 - Residual risk: the NuGet package is not hash-locked; the version pin is the control.
 
 ## Follow-up question for the owner
