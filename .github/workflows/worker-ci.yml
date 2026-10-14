@@ -138,6 +138,30 @@ jobs:
           if [ "$APPROVED" = "true" ]; then args+=(--approved); fi
           node scripts/lint-migrations.mjs "${args[@]}" "${added[@]}"
 
+      # #286: the linter gates destructive D1 migrations, and its own tests were wired nowhere. Runs exactly one
+      # file (deliberate: another *.test.mjs is not picked up silently). The node exit code fails the job on a
+      # failing test; the summary check below also fails it when zero tests were collected or pass != tests
+      # (a file that loads but registers nothing exits 0). The reporter is explicit: the summary lines
+      # ("tests N", "pass N", "fail N") come from the spec reporter, not from the TTY-dependent default.
+      - name: Migration lint tests
+        if: steps.changes.outputs.worker_changed == 'true'
+        run: |
+          status=0
+          node --test --test-reporter=spec scripts/lint-migrations.test.mjs > "$RUNNER_TEMP/lint-tests.txt" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/lint-tests.txt"
+          if [ "$status" -ne 0 ]; then
+            echo "migration lint tests failed (node exit $status)"
+            exit 1
+          fi
+          tests=$(sed -nE 's/^[^0-9A-Za-z]* tests ([0-9]+)$/\1/p' "$RUNNER_TEMP/lint-tests.txt")
+          pass=$(sed -nE 's/^[^0-9A-Za-z]* pass ([0-9]+)$/\1/p' "$RUNNER_TEMP/lint-tests.txt")
+          fail=$(sed -nE 's/^[^0-9A-Za-z]* fail ([0-9]+)$/\1/p' "$RUNNER_TEMP/lint-tests.txt")
+          echo "summary: tests=$tests pass=$pass fail=$fail"
+          if [ -z "$tests" ] || [ "$tests" -eq 0 ] || [ "$pass" != "$tests" ] || [ "$fail" != "0" ]; then
+            echo "no tests collected or summary not clean"
+            exit 1
+          fi
+
       # Expected: 35 PASS, 6 SKIPPED (stream checks need real Telegram), no secrets used.
       - name: Smoke test
         if: steps.changes.outputs.worker_changed == 'true'
