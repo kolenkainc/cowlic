@@ -60,7 +60,7 @@ export function steps(text) {
   }
   return out;
 }
-const runBlock = (text, name) => {
+export const runBlock = (text, name) => {
   const s = steps(text).find((x) => x.name === name);
   if (!s || s.run === null) throw new Error(`no run block for step ${name}`);
   return s.run;
@@ -286,7 +286,7 @@ export function ciFailures(text) {
     if (j !== null && !/^ {4}if: \$\{\{ needs\.changes\.outputs\.worker_changed == 'true' \}\}$/m.test(j)) f.push(`job ${id} has no condition on worker_changed`);
   }
 
-  if (!/^concurrency:\n {2}group: ci-\$\{\{ github\.event_name \}\}-\$\{\{ github\.ref \}\}\n {2}cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}\n/m.test(text)) f.push("concurrency: a queue or master run could be cancelled");
+  if (!/^concurrency:\n {2}group: ci-\$\{\{ github\.event_name \}\}-\$\{\{ github\.ref \}\}\n {2}cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' && contains\(fromJSON\('\["opened","reopened","synchronize"\]'\), github\.event\.action\) \}\}\n/m.test(text)) f.push("concurrency: a queue, master or label-event run could cancel a run in progress");
   f.push(...permissionFailures(text, PERMISSIONS["ci.yml"]));
   // A job that publishes a report needs checks: write (else the check run cannot be created), and only such a job has it.
   for (const id of ["changes", "lint", "tests", "version", "ci"]) {

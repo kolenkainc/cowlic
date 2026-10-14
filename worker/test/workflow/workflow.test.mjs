@@ -11,6 +11,7 @@ import {
   PERMISSIONS, ciFailures, ciFile, createRunner, createSandbox, deployFile, dynamicFailures, hostileTitleFailures, hostileTitles, mutations,
   parsePermissions, permissionFailures, readText, staticFailures, steps, tamperCases,
 } from "./lib.mjs";
+import { changesCaseFailures, changesCases, changesMutations, createChangesRunner } from "./changes.mjs";
 
 const original = readText(deployFile);
 const ci = readText(ciFile);
@@ -221,7 +222,9 @@ describe("ci.yml reports `ci` on pull_request, push and merge_group (#290, #292)
     ["branches filter on merge_group", (t) => t.replace("    types: [checks_requested]\n", "    types: [checks_requested]\n    branches: [master]\n")],
     ["paths filter on push", (t) => t.replace("    branches: [master]\n", '    branches: [master]\n    paths: ["worker/**"]\n')],
     ["shared concurrency group without the event", (t) => t.replace("group: ci-${{ github.event_name }}-${{ github.ref }}", "group: ci-${{ github.ref }}")],
-    ["cancel-in-progress for every event", (t) => t.replace("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", "cancel-in-progress: true")],
+    ["cancel-in-progress for every event", (t) => t.replace(/cancel-in-progress: .*\n/, "cancel-in-progress: true\n")],
+    ["cancel-in-progress for every pull_request action (a label event cancels the run in progress)", (t) => t.replace(/cancel-in-progress: .*\n/, "cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n")],
+    ["cancel-in-progress also on labeled", (t) => t.replace('["opened","reopened","synchronize"]', '["opened","reopened","synchronize","labeled"]')],
     ["merge_group base_sha not read", (t) => t.replaceAll("github.event.merge_group.base_sha", "github.event.merge_group.x")],
     ["version job without full history", (t) => t.replace(/^( {2}version:\n[\s\S]*?) {10}fetch-depth: 0\n/m, "$1")],
     ["unpinned action", (t) => t.replace(/actions\/checkout@[0-9a-f]{40} # v7\.0\.1/, "actions/checkout@v7")],
@@ -239,5 +242,22 @@ describe("ci.yml reports `ci` on pull_request, push and merge_group (#290, #292)
   });
   it("the unmodified deploy workflow has no merge_group trigger", () => {
     expect(staticFailures(original).some((x) => x.includes("merge_group"))).toBe(false);
+  });
+});
+
+// The steps that decide worker_changed, which the gate trusts: run in a real temp git repo, fail closed (#290 review).
+describe("ci.yml: Resolve base commit and Detect worker changes", () => {
+  let changesRunner;
+  beforeAll(() => {
+    changesRunner = createChangesRunner(ci, sandbox);
+  });
+  it.each(changesCases.map((c) => [c[0], c]))("%s", (_name, c) => {
+    expect(changesCaseFailures(changesRunner, c)).toEqual([]);
+  });
+  it.each(changesMutations)("mutation is caught: %s", (name, fn) => {
+    const mutated = fn(ci);
+    expect(mutated, `the mutation pattern was not found: ${name}`).not.toBe(ci);
+    const runner = createChangesRunner(mutated, sandbox);
+    expect(changesCases.flatMap((c) => changesCaseFailures(runner, c)).length).toBeGreaterThan(0);
   });
 });

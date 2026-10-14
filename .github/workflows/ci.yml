@@ -31,12 +31,16 @@ on:
 permissions:
   contents: read
 
-# Section 3 rule 5: superseded PR runs are cancelled (cancelling CI is fine; deploys are never cancelled).
-# The event name is in the group and cancel-in-progress is true only for pull_request: a push to master and a
-# merge-queue run are never cancelled by a PR run or by another queue entry (each queue entry also has its own ref).
+# Section 3 rule 5: a run superseded by a new commit on the PR is cancelled (cancelling CI is fine; deploys are never
+# cancelled). cancel-in-progress is true only for the pull_request actions opened, reopened and synchronize. A label
+# event (labeled/unlabeled, for example review-completed being added) must NOT cancel the run in progress on the same
+# commit: with always() the gate of a cancelled run would report a red `ci`. The label run waits in the group instead.
+# The event name is in the group, so a push to master or a merge-queue run is never cancelled by a PR run, and
+# cancel-in-progress is false for them. Note: GitHub still drops an OLDER PENDING run of a group for a newer pending one
+# even with cancel-in-progress false; only runs already in progress are kept.
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && contains(fromJSON('["opened","reopened","synchronize"]'), github.event.action) }}
 
 jobs:
   # Stage 1: what changed. fetch-depth 0 is required: with depth 1 there is no origin/master and no base commit.
@@ -293,13 +297,13 @@ jobs:
 
       # Vitest has no switch against skipped tests and no minimum count, so both are checked here on the numeric
       # outputs of the report step (no text parsing): skipped must be 0 (a skipped test is a silently dropped check)
-      # and passed must reach MIN_TESTS, a pinned number just below the real count (341 on 2026-10-14: 106 unit, 138
+      # and passed must reach MIN_TESTS, a pinned number just below the real count (372 on 2026-10-14: 106 unit, 169
       # workflow, 51 + 46 smoke) so a few removals do not trip it but a lost file or area does. NOT dynamic: raise it deliberately when tests are added,
       # lower it deliberately when tests are removed on purpose.
       - name: Minimum test count (Vitest)
         if: ${{ steps.vitest.outcome == 'success' }}
         env:
-          MIN_TESTS: "335"
+          MIN_TESTS: "366"
           PASSED: ${{ steps.vitest_report.outputs.passed }}
           SKIPPED: ${{ steps.vitest_report.outputs.skipped }}
         run: |
