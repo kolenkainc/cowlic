@@ -472,7 +472,7 @@ jobs:
   plan:
     name: plan
     needs: [changes, lint, tests, ci]
-    if: ${{ github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && needs.changes.outputs.deploy_changed == 'true')) }}
+    if: ${{ github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && needs.changes.outputs.deploy_changed == 'true')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # One deploy at a time, a running job is never cancelled (section 3 rule 5); shared with migrate and deploy only.
