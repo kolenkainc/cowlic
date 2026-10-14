@@ -1376,6 +1376,10 @@ jobs:
     steps:
       # Everything untrusted (the commit message is written by whoever merges) is data: it comes through the API into a
       # shell variable and is only matched with [[ =~ ]], never put in a command line, a summary or an expression.
+      - name: Install GitVersion.Tool
+        run: |
+          dotnet tool install GitVersion.Tool --tool-path "$RUNNER_TEMP/gitversion" --version 6.8.2
+
       - name: Tag and release
         env:
           GH_TOKEN: ${{ github.token }}
