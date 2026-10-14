@@ -70,9 +70,6 @@ permissions:
 # cancelled). cancel-in-progress is true only for the pull_request actions opened, reopened and synchronize. A label
 # event (labeled/unlabeled, for example review-completed being added) must NOT cancel the run in progress on the same
 # commit: with always() the gate of a cancelled run would report a red `ci`. The label run waits in the group instead.
-env:
-  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-
 # Groups: push to master and dispatch from master -> `worker-deploy` (never cancelled, see DEPLOY RULES above);
 # pull_request -> per PR ref; any other run (merge_group, a dispatch from another ref) -> its own run id, so a queue run
 # is never cancelled or replaced and a dispatch from a feature branch can never take the place of a pending deploy run.
