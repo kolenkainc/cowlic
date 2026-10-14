@@ -5,69 +5,74 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
-import { jobBlock, runBlock } from "./lib.mjs";
+import { runBlock } from "./lib.mjs";
+import { R, WC, gateOracle, jobCondition } from "./gate.mjs";
 
 const SHA = "0123456789abcdef0123456789abcdef01234567";
 const OTHER = "fedcba9876543210fedcba9876543210fedcba98";
 
-// --- the job-level `if:` of the release job, evaluated with a small evaluator (the GitHub expression subset used there)
+// --- the job-level `if:` of the release job, evaluated with the small evaluator of gate.mjs (the GitHub expression
+// subset used there). #307: the gate part names the results of changes, lint and tests (there is no `ci` job).
 export function releaseCondition(text) {
-  const line = (jobBlock(text, "release") ?? "").split("\n").find((l) => /^ {4}if: /.test(l));
-  if (!line) throw new Error("no if on the release job");
-  const expr = /^ {4}if: \$\{\{ (.*) \}\}$/.exec(line)?.[1];
-  if (!expr) throw new Error("the if of the release job is not a single expression");
-  const js = expr.replace(/!cancelled\(\)/g, "(!ctx.cancelled)").replace(/\b(needs|github)\.[A-Za-z_.]+/g, (m) => `ctx[${JSON.stringify(m)}]`);
-  if (/[^A-Za-z0-9_\s.'"()\[\]!=&|\/-]/.test(js)) throw new Error(`unexpected characters in the expression: ${js}`);
-  // eslint-disable-next-line no-new-func
-  const fn = new Function("ctx", `return (${js});`);
+  const raw = jobCondition(text, "release");
   return (c) =>
-    Boolean(
-      fn({
-        cancelled: c.cancelled ?? false,
-        "needs.ci.result": c.ci,
-        "needs.version.result": c.version ?? "success",
-        "needs.plan.result": c.plan,
-        "needs.plan.outputs.deploy": c.out,
-        "needs.ship.result": c.ship,
-        "github.repository": c.repo ?? "kolenkainc/cowlic",
-        "github.ref": c.ref ?? "refs/heads/master",
-        "github.event_name": c.event ?? "push",
-      }),
-    );
+    raw({
+      cancelled: c.cancelled ?? false,
+      "needs.changes.result": c.changes ?? "success",
+      "needs.changes.outputs.worker_changed": c.wc ?? "true",
+      "needs.lint.result": c.lint ?? "success",
+      "needs.tests.result": c.tests ?? "success",
+      "needs.version.result": c.version ?? "success",
+      "needs.plan.result": c.plan,
+      "needs.plan.outputs.deploy": c.out,
+      "needs.ship.result": c.ship,
+      "github.repository": c.repo ?? "kolenkainc/cowlic",
+      "github.ref": c.ref ?? "refs/heads/master",
+      "github.event_name": c.event ?? "push",
+    });
 }
 
-const R = ["success", "failure", "cancelled", "skipped"];
-// Named combinations: [name, context, expected]
+// Named combinations: [name, context, expected]. The gate fields default to changes success, worker_changed true, lint
+// and tests success.
+const docs = { wc: "false", lint: "skipped", tests: "skipped" };
 export const releaseConditionCases = [
-  ["deploy done: plan succeeded and ship succeeded", { ci: "success", plan: "success", out: "true", ship: "success" }, true],
-  ["nothing to deploy: plan succeeded, ship skipped by design", { ci: "success", plan: "success", out: "false", ship: "skipped" }, true],
-  ["manual dispatch with a completed ship", { ci: "success", plan: "success", out: "true", ship: "success", event: "workflow_dispatch" }, true],
-  ["ship FAILED (a migration step, the deploy or the health check)", { ci: "success", plan: "success", out: "true", ship: "failure" }, false],
-  ["ship CANCELLED or rejected (the approval of production-destructive)", { ci: "success", plan: "success", out: "true", ship: "cancelled" }, false],
-  ["ship skipped although a deploy was planned", { ci: "success", plan: "success", out: "true", ship: "skipped" }, false],
-  ["nothing to deploy but ship ran and succeeded", { ci: "success", plan: "success", out: "false", ship: "success" }, false],
-  ["nothing to deploy but ship failed", { ci: "success", plan: "success", out: "false", ship: "failure" }, false],
-  ["the version job FAILED", { ci: "success", version: "failure", plan: "success", out: "false", ship: "skipped" }, false],
-  ["the version job was skipped", { ci: "success", version: "skipped", plan: "success", out: "false", ship: "skipped" }, false],
-  ["the version job was cancelled", { ci: "success", version: "cancelled", plan: "success", out: "true", ship: "success" }, false],
-  ["plan FAILED", { ci: "success", plan: "failure", out: "", ship: "skipped" }, false],
-  ["plan skipped", { ci: "success", plan: "skipped", out: "", ship: "skipped" }, false],
-  ["the gate ci failed", { ci: "failure", plan: "skipped", out: "", ship: "skipped" }, false],
-  ["the gate ci cancelled", { ci: "cancelled", plan: "skipped", out: "", ship: "skipped" }, false],
-  ["the run was cancelled", { cancelled: true, ci: "success", plan: "success", out: "false", ship: "skipped" }, false],
-  ["pull_request", { ci: "success", plan: "success", out: "false", ship: "skipped", event: "pull_request" }, false],
-  ["merge_group", { ci: "success", plan: "success", out: "false", ship: "skipped", event: "merge_group" }, false],
-  ["another ref (dispatch from a branch)", { ci: "success", plan: "success", out: "false", ship: "skipped", event: "workflow_dispatch", ref: "refs/heads/feat/x" }, false],
-  ["a fork", { ci: "success", plan: "success", out: "false", ship: "skipped", repo: "someone/cowlic" }, false],
+  ["deploy done: plan succeeded and ship succeeded", { plan: "success", out: "true", ship: "success" }, true],
+  ["nothing to deploy: plan succeeded, ship skipped by design", { plan: "success", out: "false", ship: "skipped" }, true],
+  ["docs-only push: lint and tests skipped, nothing to deploy", { ...docs, plan: "success", out: "false", ship: "skipped" }, true],
+  ["manual dispatch with a completed ship", { plan: "success", out: "true", ship: "success", event: "workflow_dispatch" }, true],
+  ["ship FAILED (a migration step, the deploy or the health check)", { plan: "success", out: "true", ship: "failure" }, false],
+  ["ship CANCELLED or rejected (the approval of production-destructive)", { plan: "success", out: "true", ship: "cancelled" }, false],
+  ["ship skipped although a deploy was planned", { plan: "success", out: "true", ship: "skipped" }, false],
+  ["nothing to deploy but ship ran and succeeded", { plan: "success", out: "false", ship: "success" }, false],
+  ["nothing to deploy but ship failed", { plan: "success", out: "false", ship: "failure" }, false],
+  ["the version job FAILED", { version: "failure", plan: "success", out: "false", ship: "skipped" }, false],
+  ["the version job was skipped", { version: "skipped", plan: "success", out: "false", ship: "skipped" }, false],
+  ["the version job was cancelled", { version: "cancelled", plan: "success", out: "true", ship: "success" }, false],
+  ["plan FAILED", { plan: "failure", out: "", ship: "skipped" }, false],
+  ["plan skipped", { plan: "skipped", out: "", ship: "skipped" }, false],
+  ["lint FAILED", { lint: "failure", plan: "skipped", out: "", ship: "skipped" }, false],
+  ["tests FAILED", { tests: "failure", plan: "skipped", out: "", ship: "skipped" }, false],
+  ["tests cancelled", { tests: "cancelled", plan: "success", out: "false", ship: "skipped" }, false],
+  ["worker changed but lint and tests were skipped (the skip hole) although plan succeeded", { lint: "skipped", tests: "skipped", plan: "success", out: "false", ship: "skipped" }, false],
+  ["worker_changed missing and lint and tests skipped", { wc: "", lint: "skipped", tests: "skipped", plan: "success", out: "false", ship: "skipped" }, false],
+  ["changes FAILED", { changes: "failure", plan: "success", out: "false", ship: "skipped" }, false],
+  ["changes cancelled", { changes: "cancelled", plan: "success", out: "false", ship: "skipped" }, false],
+  ["the run was cancelled", { cancelled: true, plan: "success", out: "false", ship: "skipped" }, false],
+  ["pull_request", { plan: "success", out: "false", ship: "skipped", event: "pull_request" }, false],
+  ["merge_group", { plan: "success", out: "false", ship: "skipped", event: "merge_group" }, false],
+  ["another ref (dispatch from a branch)", { plan: "success", out: "false", ship: "skipped", event: "workflow_dispatch", ref: "refs/heads/feat/x" }, false],
+  ["a fork", { plan: "success", out: "false", ship: "skipped", repo: "someone/cowlic" }, false],
 ];
 
-// The independent oracle for the exhaustive run: written as a decision list, not as the expression.
+// The independent oracle for the exhaustive run: written as a decision list, not as the expression. The gate part is the
+// one of gate.mjs (the same decision list that proves `plan`).
 function oracle(c) {
   if (c.cancelled) return false;
   if (c.repo !== "kolenkainc/cowlic" || c.ref !== "refs/heads/master") return false;
   if (c.event !== "push" && c.event !== "workflow_dispatch") return false;
-  if (c.ci !== "success" || c.plan !== "success") return false;
-  if ((c.version ?? "success") !== "success") return false;
+  if (!gateOracle(c)) return false;
+  if (c.plan !== "success") return false;
+  if (c.version !== "success") return false;
   if (c.out === "true") return c.ship === "success";
   return c.ship === "skipped";
 }
@@ -83,20 +88,30 @@ export function releaseConditionFailures(text) {
   for (const [name, ctx, want] of releaseConditionCases) {
     if (cond(ctx) !== want) f.push(`${name}: expected ${want}`);
   }
+  // Exhaustive over the results of changes, lint, tests, version, plan and ship, the outputs worker_changed and deploy,
+  // and seven event contexts (the good push and dispatch, a cancelled run, a fork, another ref, pull_request, merge_group).
+  const contexts = [
+    {},
+    { event: "workflow_dispatch" },
+    { cancelled: true },
+    { repo: "x/y" },
+    { ref: "refs/heads/other" },
+    { event: "pull_request" },
+    { event: "merge_group" },
+  ];
   let n = 0;
-  for (const cancelled of [false, true])
-    for (const repo of ["kolenkainc/cowlic", "x/y"])
-      for (const ref of ["refs/heads/master", "refs/heads/other"])
-        for (const event of ["push", "workflow_dispatch", "pull_request", "merge_group"])
-          for (const ci of R)
+  for (const base of contexts)
+    for (const changes of R)
+      for (const wc of WC)
+        for (const lint of R)
+          for (const tests of R)
             for (const version of R)
               for (const plan of R)
                 for (const out of ["true", "false", ""])
                   for (const ship of R) {
-                    const c = { cancelled, repo, ref, event, ci, version, plan, out, ship };
-                    if (cond(c) !== oracle(c)) {
-                      if (n++ < 5) f.push(`exhaustive: ${JSON.stringify(c)} differs from the oracle`);
-                    }
+                    const c = { cancelled: false, repo: "kolenkainc/cowlic", ref: "refs/heads/master", event: "push", ...base, changes, wc, lint, tests, version, plan, out, ship };
+                    const lc = (s) => String(s).toLowerCase(); // GitHub == ignores case
+                    if (cond(c) !== oracle({ ...c, wc: ["true", "false"].includes(lc(wc)) ? lc(wc) : wc }) && n++ < 5) f.push(`exhaustive: ${JSON.stringify(c)} differs from the oracle`);
                   }
   return f;
 }

@@ -2,23 +2,28 @@
 # One workflow for every check and for the Worker deploy (#290: part 1 merged version.yml and worker-ci.yml, part 2
 # folded worker-deploy.yml in, part 3 added the release stage, #312 merged migrate and deploy into `ship`).
 #
-# Stages (jobs): changes (what changed), lint (typecheck, migrations), tests (migration lint tests and Vitest, with
-# reports), version (GitVersion, read-only), ci (the gate), then plan -> ship (the D1 migrations and then the Worker
-# deploy in ONE job, #201, #202, #312), then release (tag and GitHub Release, the only job with contents: write). Check
-# contexts (the job names; the UI shows "<workflow> / <job>"): `ci`, `changes`, `lint`, `tests`, `version`, `plan`,
-# `ship`, `release`, plus the report check runs "Test Report" and "Test Report (Vitest)".
-# The owner's master ruleset requires the context `ci` (integration 15368): it is the gate job below, which always
-# runs and reports on pull_request, push to master and merge_group.
+# Stages (jobs): changes (what changed, with a fail-closed validation of its outputs), lint (typecheck, migrations),
+# tests (migration lint tests and Vitest, with reports), version (GitVersion, read-only), then plan -> ship (the D1
+# migrations and then the Worker deploy in ONE job, #201, #202, #312), then release (tag and GitHub Release, the only
+# job with contents: write). Check contexts (the job names; the UI shows "<workflow> / <job>"): `changes`, `lint`,
+# `tests`, `version`, `plan`, `ship`, `release`, plus the report check runs "Test Report" and "Test Report (Vitest)".
+# There is NO aggregating gate job (#307, owner decision of 2026-10-14, option C). The owner's master ruleset requires
+# exactly the contexts `changes`, `lint` and `tests` (integration 15368), and every future change of that set needs an
+# owner ruleset edit.
 #
-# pull_request, push and merge_group have NO path or branch filter: a skipped workflow would leave the required check
+# pull_request, push and merge_group have NO path or branch filter: a skipped workflow would leave the required checks
 # missing and block the PR or the queue. What is skipped instead is whole jobs (lint, tests) by the job-level `if:` on
-# the output of `changes`, and the gate `ci` accepts a skipped job only when `changes` said it was not needed.
-# `ci` itself has no condition except `always()` (a skipped required check counts as passed).
+# the output of `changes`. A SKIPPED required job counts as passed, so two things keep that safe: `changes` is itself
+# required and FAILS CLOSED (its last step exits 1 unless worker_changed is exactly true or false and base_sha is valid,
+# so lint and tests can only be skipped on a worker_changed that really was `false`), and `lint` and `tests` carry no
+# condition but that one (none on the event: they run on pull_request, push and merge_group). A failed or cancelled
+# `changes` is not a pass, so it blocks the merge.
 #
 # DEPLOY RULES. plan and ship run ONLY on push to master and on the manual workflow_dispatch from master,
 # never on pull_request or merge_group (the queue's squash commit is the push to master that deploys) and never in a
-# fork (job-level `if:` on the event, the ref and github.repository), and only when the gate `ci` of the SAME run
-# succeeded (#287: the gate succeeds only when lint and tests succeeded or were not needed). Whether there is anything
+# fork (job-level `if:` on the event, the ref and github.repository), and only when `changes` succeeded and, in the
+# SAME run, lint and tests succeeded (#287, #307: `plan` and `release` check each result explicitly; lint and tests
+# may be skipped only when worker_changed is `false`, the documented docs-only case). Whether there is anything
 # to deploy is decided in `plan` (step "Anything to deploy"): worker/ at this commit vs BASE, the commit of the most
 # recent successful deployment record of `production` or `production-destructive` (it moves once `ship` succeeds; after
 # a failed ship, for example a failed health check, it does not move: recovery is a workflow_dispatch), always yes for
@@ -56,8 +61,10 @@ on:
     types: [opened, synchronize, reopened, labeled, unlabeled]
   push:
     branches: [master]
-  # #292: the master ruleset has a merge queue and requires `ci`; the queue sends merge_group (checks_requested)
-  # and waits for the required check on the gh-readonly-queue/* commit. No path filter: `ci` must always report.
+  # #292: the master ruleset has a merge queue and requires `changes`, `lint` and `tests`; the queue sends merge_group
+  # (checks_requested) and waits for the required checks on the gh-readonly-queue/* commit. No path filter and no event
+  # condition on those jobs: `changes` always reports, `lint` and `tests` report (or are skipped, which counts as passed,
+  # only when `changes` validated worker_changed=false).
   # The deploy jobs never run on merge_group (their `if:` names push and workflow_dispatch only; asserted by test/workflow).
   merge_group:
     types: [checks_requested]
@@ -71,7 +78,8 @@ permissions:
 # Section 3 rule 5: a run superseded by a new commit on the PR is cancelled (cancelling CI is fine; deploys are never
 # cancelled). cancel-in-progress is true only for the pull_request actions opened, reopened and synchronize. A label
 # event (labeled/unlabeled, for example review-completed being added) must NOT cancel the run in progress on the same
-# commit: with always() the gate of a cancelled run would report a red `ci`. The label run waits in the group instead.
+# commit: the required checks are now the real jobs, and a cancelled required job is not a pass, so cancelling a run
+# that is needed would leave the PR without green required checks. The label run waits in the group instead.
 # Groups: push to master and dispatch from master -> `worker-deploy` (never cancelled, see DEPLOY RULES above);
 # pull_request -> per PR ref; any other run (merge_group, a dispatch from another ref) -> its own run id, so a queue run
 # is never cancelled or replaced and a dispatch from a feature branch can never take the place of a pending deploy run.
@@ -204,7 +212,9 @@ jobs:
           fi
           echo "worker_changed=$OUT_WORKER_CHANGED base_sha=${OUT_BASE_SHA:-none}"
 
-  # Stage 2: typecheck and migrations. A job-level `if:` is fine here: the gate `ci` decides what a skip means.
+  # Stage 2: typecheck and migrations. REQUIRED check. The job-level `if:` is the ONLY condition (no event, no ref):
+  # it is skipped only when `changes` (itself required, and failing closed) said worker_changed is `false`. A skipped
+  # required job counts as passed; `plan` and `release` do not rely on that and check the results themselves.
   lint:
     name: lint
     needs: changes
@@ -302,7 +312,7 @@ jobs:
       # one file (deliberate: another *.test.mjs is not picked up silently). Two reporters: spec to stdout (the
       # human-readable log) and junit to a file under RUNNER_TEMP (read by the "Test Report" step below, never
       # committed or uploaded). The node exit code is the verdict of THIS step: a failing test fails the job `tests`
-      # (and so the gate `ci`) whether or not the report can be published (fork PRs have a read-only token).
+      # (and so the required check `tests`) whether or not the report can be published (fork PRs have a read-only token).
       - name: Migration lint tests
         id: lint_tests
         run: |
@@ -377,13 +387,13 @@ jobs:
 
       # Vitest has no switch against skipped tests and no minimum count, so both are checked here on the numeric
       # outputs of the report step (no text parsing): skipped must be 0 (a skipped test is a silently dropped check)
-      # and passed must reach MIN_TESTS, a pinned number just below the real count (691 on 2026-10-14: 106 unit, 488
+      # and passed must reach MIN_TESTS, a pinned number just below the real count (712 on 2026-10-14: 106 unit, 509
       # workflow, 51 + 46 smoke) so a few removals do not trip it but a lost file or area does. NOT dynamic: raise it deliberately when tests are added,
       # lower it deliberately when tests are removed on purpose.
       - name: Minimum test count (Vitest)
         if: ${{ steps.vitest.outcome == 'success' }}
         env:
-          MIN_TESTS: "685"
+          MIN_TESTS: "706"
           PASSED: ${{ steps.vitest_report.outputs.passed }}
           SKIPPED: ${{ steps.vitest_report.outputs.skipped }}
         run: |
@@ -407,8 +417,8 @@ jobs:
   # branch_name; a value that does not match its strict pattern is written empty (`invalid` for the label), and
   # `release` re-validates all of them.
   # Contract: docs/releasing.md. Config: GitVersion.yml (GitVersion 6.x, GitHubFlow/v1). Runs on every event, also on
-  # merge_group. It is NOT part of the gate (as before: it was never a required check), so a GitVersion problem on
-  # an unusual ref cannot stall the queue; the job reports its own check `version`. `release` needs it.
+  # merge_group. It is NOT a required check and plan does not need it (as before), so a GitVersion problem on
+  # an unusual ref cannot stall the queue or block a deploy; the job reports its own check `version`. `release` needs it.
   version:
     name: version
     # Pinned image (not -latest): the audited image ships .NET SDK 8, 9 and 10.
@@ -467,67 +477,28 @@ jobs:
             echo "branch_name=$branch"
           } >> "$GITHUB_OUTPUT"
 
-  # The gate: the REQUIRED check `ci`. Always runs (a skipped required check counts as passed, so there is no other
-  # condition, ever) and aggregates the needed jobs. `changes` must have succeeded and say true or false; when worker
-  # files changed, `lint` and `tests` must have succeeded; otherwise they may be skipped (not needed). Failed,
-  # cancelled or any unexpected result fails the gate. No checkout, no secrets: only the results come in, through env.
-  ci:
-    name: ci
-    needs: [changes, lint, tests]
-    if: ${{ always() }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Aggregate results
-        env:
-          CHANGES_RESULT: ${{ needs.changes.result }}
-          WORKER_CHANGED: ${{ needs.changes.outputs.worker_changed }}
-          LINT_RESULT: ${{ needs.lint.result }}
-          TESTS_RESULT: ${{ needs.tests.result }}
-        run: |
-          echo "changes=$CHANGES_RESULT worker_changed=$WORKER_CHANGED lint=$LINT_RESULT tests=$TESTS_RESULT"
-          if [ "$CHANGES_RESULT" != "success" ]; then
-            echo "changes did not succeed"
-            exit 1
-          fi
-          case "$WORKER_CHANGED" in
-            true) allowed="success" ;;
-            false) allowed="success skipped" ;;
-            *) echo "worker_changed is missing or invalid: '$WORKER_CHANGED'"; exit 1 ;;
-          esac
-          fail=0
-          for pair in "lint=$LINT_RESULT" "tests=$TESTS_RESULT"; do
-            name="${pair%%=*}"
-            result="${pair#*=}"
-            ok=0
-            for a in $allowed; do
-              if [ "$result" = "$a" ]; then ok=1; fi
-            done
-            if [ "$ok" -ne 1 ]; then
-              echo "$name: '$result' is not acceptable (allowed: $allowed)"
-              fail=1
-            fi
-          done
-          exit "$fail"
-
   # ORDER RULE (enforced by `needs` and by the step order inside `ship`): plan -> ship. Inside ship the migration
   # steps run first and the deploy steps second: a failed migration step stops the job before any deploy step, and a
   # rejected or cancelled approval means nothing runs at all (see the comment of `ship`).
   #
-  # plan runs only when: the gate `ci` of this run succeeded (it succeeds only when lint and tests succeeded or were
-  # legitimately skipped because nothing relevant changed; `!cancelled()` is there because lint and tests are skipped
-  # for a docs-only push and a skipped need would otherwise skip plan, which must still run to ask what is live), this
-  # is the repository itself (not a fork), the ref is master, and the event is a push or a manual dispatch.
-  # pull_request and merge_group never match. Whether there is anything to deploy is decided by the step "Anything to
-  # deploy" below (worker/ vs the last deployment), not by the path of the push.
+  # plan runs only when, in this run (#307: there is no aggregating job, every result is named here): `changes`
+  # succeeded AND EITHER worker_changed is `true` and lint and tests both succeeded OR worker_changed is `false` (the
+  # documented docs-only case: nothing under worker/ or ci.yml changed) and lint and tests each succeeded or were
+  # skipped. A missing or invalid worker_changed matches neither branch, a failed, cancelled or skipped need never lets a
+  # deploy start. `!cancelled()` is there because lint and tests are skipped for a docs-only push and a skipped need
+  # would otherwise skip plan, which must still run to ask what is live; it does not weaken the result conditions (a
+  # cancelled run matches nothing). The repository is the repository itself (not a fork), the ref is master, and the
+  # event is a push or a manual dispatch. pull_request and merge_group never match. Whether there is anything to
+  # deploy is decided by the step "Anything to deploy" below (worker/ vs the last deployment), not by the path of the
+  # push.
   # Guard (section 3 rule 5): an older run that was queued must not deploy after a newer commit landed on master.
   # Then (#202, section 12.2): BASE, immutability of applied migrations, lint of the migrations added since BASE and
   # the routing of `ship` to `production` or `production-destructive`. No secrets, no environment: only the default
   # GITHUB_TOKEN, with the two extra read permissions this job needs (deployments for BASE, pull-requests for the label).
   plan:
     name: plan
-    needs: [changes, lint, tests, ci]
-    if: ${{ !cancelled() && needs.ci.result == 'success' && github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}
+    needs: [changes, lint, tests]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && ((needs.changes.outputs.worker_changed == 'true' && needs.lint.result == 'success' && needs.tests.result == 'success') || (needs.changes.outputs.worker_changed == 'false' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') && (needs.tests.result == 'success' || needs.tests.result == 'skipped'))) && github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -726,7 +697,7 @@ jobs:
       # record, resolved above; it moves once `ship` succeeds, so after a failed ship, for example a failed health check,
       # recovery is a workflow_dispatch) vs this commit, worker/ only.
       # A manual dispatch always deploys. Any git failure means deploy (a redundant deploy is idempotent and still behind
-      # the guard, the gate and the approval of `ship`; a missed one is silent). The later steps of this job run for a
+      # the guard, the checks of this run and the approval of `ship`; a missed one is silent). The later steps of this job run for a
       # docs-only push too (they find nothing to check between BASE and the commit); the job output `deploy` is what
       # `ship` reads.
       - name: Anything to deploy (worker/ since BASE)
@@ -1360,7 +1331,7 @@ jobs:
   # Runs only on push to master and workflow_dispatch from master in this repository (never pull_request,
   # merge_group, fork) and only after the deploy chain is done: plan succeeded and EITHER nothing was to be deployed
   # (ship skipped by design) OR ship succeeded (its migration and deploy steps and the health check). A failed,
-  # cancelled or rejected ship, a failed plan or a failed gate never releases. `!cancelled()` is needed because ship is
+  # cancelled or rejected ship, a failed plan or a failed or cancelled changes, lint or tests never releases. `!cancelled()` is needed because ship is
   # legitimately skipped when there is nothing to deploy (a skipped need would otherwise skip this job).
   # The ONLY job with contents: write (to create the tag and the Release through the REST API with the job's
   # GITHUB_TOKEN: no PAT, no push from a checkout, no environment, no deploy secret, nothing of Cloudflare). The group
@@ -1375,8 +1346,8 @@ jobs:
   # fast merging not every commit gets a tag.
   release:
     name: release
-    needs: [changes, lint, tests, ci, version, plan, ship]
-    if: ${{ !cancelled() && needs.ci.result == 'success' && needs.version.result == 'success' && needs.plan.result == 'success' && ((needs.plan.outputs.deploy != 'true' && needs.ship.result == 'skipped') || (needs.plan.outputs.deploy == 'true' && needs.ship.result == 'success')) && github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}
+    needs: [changes, lint, tests, version, plan, ship]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && ((needs.changes.outputs.worker_changed == 'true' && needs.lint.result == 'success' && needs.tests.result == 'success') || (needs.changes.outputs.worker_changed == 'false' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') && (needs.tests.result == 'success' || needs.tests.result == 'skipped'))) && needs.version.result == 'success' && needs.plan.result == 'success' && ((needs.plan.outputs.deploy != 'true' && needs.ship.result == 'skipped') || (needs.plan.outputs.deploy == 'true' && needs.ship.result == 'success')) && github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
