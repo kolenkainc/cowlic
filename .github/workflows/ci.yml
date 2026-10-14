@@ -14,13 +14,21 @@
 # the output of `changes`, and the gate `ci` accepts a skipped job only when `changes` said it was not needed.
 # `ci` itself has no condition except `always()` (a skipped required check counts as passed).
 #
-# DEPLOY RULES. plan, migrate and deploy run ONLY on push to master (when worker/ changed, output deploy_changed) and on
-# the manual workflow_dispatch from master, never on pull_request or merge_group (the queue's squash commit is the push
-# to master that deploys) and never in a fork (job-level `if:` on the event, the ref and github.repository). They need
-# lint, tests and the gate `ci` of the SAME run to have succeeded (#287). Their concurrency group `worker-deploy` is a
-# JOB-level group with cancel-in-progress false and is shared with no cancellable job: a deploy is never cancelled
-# mid-flight and two never overlap. A workflow-level group is NOT used for push and dispatch runs (it is unique per
-# run): a group there would let a newer docs-only push replace an older PENDING run that has a deploy to do.
+# DEPLOY RULES. plan, migrate and deploy run ONLY on push to master and on the manual workflow_dispatch from master,
+# never on pull_request or merge_group (the queue's squash commit is the push to master that deploys) and never in a
+# fork (job-level `if:` on the event, the ref and github.repository), and only when the gate `ci` of the SAME run
+# succeeded (#287: the gate succeeds only when lint and tests succeeded or were not needed). Whether there is anything
+# to deploy is decided in `plan` (step "Anything to deploy"): worker/ at this commit vs the last successful deployment
+# to production (BASE), always yes for a dispatch.
+# CONCURRENCY. The WORKFLOW-level group of a push to master or a dispatch from master is `worker-deploy`, with
+# cancel-in-progress false: whole runs are serialized in push order, a running run (and so a running deploy or a
+# migrate waiting for approval) is never cancelled, and GitHub keeps one pending run and replaces an older pending run
+# by a newer one. Because the group is workflow-level, a replaced pending run is always OLDER than the run that
+# survives, and the survivor's `plan` compares with what is live (BASE), so it deploys what the replaced run would
+# have deployed. (Job-level groups on the deploy jobs were rejected: jobs would enter the group in the order their
+# checks finish, not in push order, and a newer pending plan could be cancelled by an older one: nothing deployed.)
+# There is NO job-level concurrency on the deploy jobs (the same group name at both levels would deadlock the run).
+# pull_request, merge_group and everything not on master get their own groups, never `worker-deploy`.
 # Secrets exist only as environment secrets, in the jobs migrate and deploy (the steps listed below); none anywhere
 # else in this file. No pull_request_target (section 3 rule 3).
 #
@@ -51,7 +59,7 @@ on:
   # The deploy jobs never run on merge_group (their `if:` names push and workflow_dispatch only; asserted by test/workflow).
   merge_group:
     types: [checks_requested]
-  # Manual deploy (emergency, re-run, first run): the head of master only (job-level `if:` on the ref, and the guard
+  # Manual deploy (emergency, re-run, recovery): the head of master only (job-level `if:` on the ref, and the guard
   # in `plan`; the environments' branch policy "master" refuses every other ref as well). No inputs, on purpose.
   workflow_dispatch:
 
@@ -62,11 +70,11 @@ permissions:
 # cancelled). cancel-in-progress is true only for the pull_request actions opened, reopened and synchronize. A label
 # event (labeled/unlabeled, for example review-completed being added) must NOT cancel the run in progress on the same
 # commit: with always() the gate of a cancelled run would report a red `ci`. The label run waits in the group instead.
-# The group of every other event contains the run id, so a push to master, a manual dispatch or a merge-queue run never
-# shares a group with, waits for or is cancelled by another run (see DEPLOY RULES above for why: a shared group could
-# drop a pending run with a deploy). Only the deploy jobs serialize, through their own job-level group.
+# Groups: push to master and dispatch from master -> `worker-deploy` (never cancelled, see DEPLOY RULES above);
+# pull_request -> per PR ref; any other run (merge_group, a dispatch from another ref) -> its own run id, so a queue run
+# is never cancelled or replaced and a dispatch from a feature branch can never take the place of a pending deploy run.
 concurrency:
-  group: ci-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  group: ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'worker-deploy' || format('ci-{0}-{1}', github.event_name, github.event_name == 'pull_request' && github.ref || github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' && contains(fromJSON('["opened","reopened","synchronize"]'), github.event.action) }}
 
 jobs:
@@ -77,8 +85,6 @@ jobs:
     timeout-minutes: 5
     outputs:
       worker_changed: ${{ steps.changes.outputs.worker_changed }}
-      # worker/ itself changed (or a manual dispatch): the deploy decision. A change of ci.yml alone does not deploy.
-      deploy_changed: ${{ steps.changes.outputs.deploy_changed }}
       base_sha: ${{ steps.base.outputs.base_sha }}
     steps:
       # Pins: section 6 audit table (full commit SHAs).
@@ -133,32 +139,28 @@ jobs:
           echo "base_sha=$base" >> "$GITHUB_OUTPUT"
 
       # worker_changed = any file under worker/ or this workflow (checked by the workflow tests of "Vitest tests",
-      # #272) differs from the base: lint and tests run. deploy_changed = a file under worker/ differs from the base
-      # (the old path filter of worker-deploy.yml: a workflow or docs edit alone must not redeploy). Both fail closed:
-      # no base or a git failure means true (for deploy_changed this means "try": `plan` has its own guard and BASE).
-      # A manual dispatch sets both to true. The pathspecs are :(top)-anchored so they do not depend on the working
-      # directory.
+      # #272) differs from the base: lint and tests run. Fail closed: no base or a git failure means true. A manual
+      # dispatch sets it to true (lint and tests must pass before a manual deploy too). The deploy decision is NOT made
+      # here: `plan` asks whether worker/ differs from what is live. The pathspecs are :(top)-anchored so they do not
+      # depend on the working directory.
       - name: Detect worker changes
         id: changes
         env:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "manual dispatch: lint, tests and deploy run"
+            echo "manual dispatch: lint and tests run"
             echo "worker_changed=true" >> "$GITHUB_OUTPUT"
-            echo "deploy_changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ -z "$BASE_SHA" ]; then
             echo "no base: treating worker as changed"
             echo "worker_changed=true" >> "$GITHUB_OUTPUT"
-            echo "deploy_changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if ! git diff --name-only "$BASE_SHA"...HEAD -- ':(top)worker' ':(top).github/workflows/ci.yml' > "$RUNNER_TEMP/changed.txt"; then
             echo "git diff failed: treating worker as changed"
             echo "worker_changed=true" >> "$GITHUB_OUTPUT"
-            echo "deploy_changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ -s "$RUNNER_TEMP/changed.txt" ]; then
@@ -167,14 +169,6 @@ jobs:
           else
             echo "nothing under worker/ changed: lint and tests skipped"
             echo "worker_changed=false" >> "$GITHUB_OUTPUT"
-          fi
-          if ! git diff --name-only "$BASE_SHA"...HEAD -- ':(top)worker' > "$RUNNER_TEMP/deploy-changed.txt"; then
-            echo "git diff failed: treating the deploy as needed"
-            echo "deploy_changed=true" >> "$GITHUB_OUTPUT"
-          elif [ -s "$RUNNER_TEMP/deploy-changed.txt" ]; then
-            echo "deploy_changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "deploy_changed=false" >> "$GITHUB_OUTPUT"
           fi
 
   # Stage 2: typecheck and migrations. A job-level `if:` is fine here: the gate `ci` decides what a skip means.
@@ -350,13 +344,13 @@ jobs:
 
       # Vitest has no switch against skipped tests and no minimum count, so both are checked here on the numeric
       # outputs of the report step (no text parsing): skipped must be 0 (a skipped test is a silently dropped check)
-      # and passed must reach MIN_TESTS, a pinned number just below the real count (401 on 2026-10-14: 106 unit, 198
+      # and passed must reach MIN_TESTS, a pinned number just below the real count (424 on 2026-10-14: 106 unit, 221
       # workflow, 51 + 46 smoke) so a few removals do not trip it but a lost file or area does. NOT dynamic: raise it deliberately when tests are added,
       # lower it deliberately when tests are removed on purpose.
       - name: Minimum test count (Vitest)
         if: ${{ steps.vitest.outcome == 'success' }}
         env:
-          MIN_TESTS: "395"
+          MIN_TESTS: "418"
           PASSED: ${{ steps.vitest_report.outputs.passed }}
           SKIPPED: ${{ steps.vitest_report.outputs.skipped }}
         run: |
@@ -462,9 +456,12 @@ jobs:
   # code on the NEW schema, and a rollback of the Worker leaves the NEW schema under OLD code, so every migration must
   # work with and without the code that uses it (design section 5.1 rule 2, as the indexes of #122).
   #
-  # plan runs only when: the gate `ci` and the stages before it succeeded in this run (`needs`, no status function:
-  # a failed or skipped need skips plan), this is the repository itself (not a fork), the ref is master, and the event
-  # is a manual dispatch or a push that changed worker/ (`deploy_changed`). pull_request and merge_group never match.
+  # plan runs only when: the gate `ci` of this run succeeded (it succeeds only when lint and tests succeeded or were
+  # legitimately skipped because nothing relevant changed; `!cancelled()` is there because lint and tests are skipped
+  # for a docs-only push and a skipped need would otherwise skip plan, which must still run to ask what is live), this
+  # is the repository itself (not a fork), the ref is master, and the event is a push or a manual dispatch.
+  # pull_request and merge_group never match. Whether there is anything to deploy is decided by the step "Anything to
+  # deploy" below (worker/ vs the last deployment), not by the path of the push.
   # Guard (section 3 rule 5): an older run that was queued must not deploy after a newer commit landed on master.
   # Then (#202, section 12.2): BASE, immutability of applied migrations, lint of the migrations added since BASE and
   # the routing of `migrate` to `production` or `production-destructive`. No secrets, no environment: only the default
@@ -472,19 +469,16 @@ jobs:
   plan:
     name: plan
     needs: [changes, lint, tests, ci]
-    if: ${{ github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && needs.changes.outputs.deploy_changed == 'true')) }}
+    if: ${{ !cancelled() && needs.ci.result == 'success' && github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # One deploy at a time, a running job is never cancelled (section 3 rule 5); shared with migrate and deploy only.
-    concurrency:
-      group: worker-deploy
-      cancel-in-progress: false
     permissions:
       contents: read
       pull-requests: read # commits/<sha>/pulls: the label of the PR that added a destructive migration
       deployments: read # deployments of `production`: BASE
     outputs:
-      deploy: ${{ steps.guard.outputs.deploy }}
+      # true only when the guard says this commit may deploy AND worker/ differs from what is live (step "Anything to deploy")
+      deploy: ${{ steps.guard.outputs.deploy == 'true' && steps.scope.outputs.deploy == 'true' && 'true' || 'false' }}
       # `production` or `production-destructive`; only these two literals are ever written (see "Classify")
       environment: ${{ steps.classify.outputs.environment }}
       # Subject line of the commit, already reduced to a safe charset (see "Commit title"); the `deploy` job re-checks it
@@ -648,6 +642,45 @@ jobs:
             echo "- BASE: \`$base\` ($source)"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # #290 part 2 (the only step added to the old plan job). The old workflow decided "is there anything to deploy"
+      # outside, with the path filter `worker/**` of the push. Every push to master reaches this job now, so that the run
+      # that survives a replaced pending run can deploy what the replaced run would have: the question is asked against
+      # what is LIVE, BASE (the last successful deployment to production, resolved above) vs this commit, worker/ only.
+      # A manual dispatch always deploys. Any git failure means deploy (a redundant deploy is idempotent and still behind
+      # the guard, the gate and the migrate approval; a missed one is silent). The later steps of this job run for a
+      # docs-only push too (they find nothing to check between BASE and the commit); the job output `deploy` is what
+      # `migrate` and `deploy` read.
+      - name: Anything to deploy (worker/ since BASE)
+        id: scope
+        if: steps.guard.outputs.deploy == 'true'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ steps.base.outputs.base }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            echo "manual dispatch: deploying"
+            exit 0
+          fi
+          rc=0
+          git diff --quiet "$BASE_SHA" "$EVENT_SHA" -- worker/ || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "worker/ is the same as in the last deployment: nothing to deploy"
+            {
+              echo "### Worker deploy: nothing to deploy"
+              echo
+              echo "- \`worker/\` at \`$EVENT_SHA\` equals \`worker/\` at BASE \`$BASE_SHA\` (the last successful deployment to production)"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            if [ "$rc" -ne 1 ]; then
+              echo "::warning::cannot compare worker/ with BASE: deploying"
+            fi
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            echo "worker/ differs from the last deployment (or the comparison failed): deploying"
+          fi
+
       # Section 5.1 rule 5a, here and not only in CI: a direct push could bypass CI, and the check must fail before
       # `migrate` is even offered for approval. Applied migrations are immutable: a file that exists in BASE and is
       # modified, renamed, deleted or changes type fails the run. A migration that was merged but never applied is
@@ -791,10 +824,6 @@ jobs:
     if: needs.plan.outputs.deploy == 'true' && (needs.plan.outputs.environment == 'production' || needs.plan.outputs.environment == 'production-destructive')
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    # The same job-level group as plan and deploy: never cancelled, never two at once (and no cancellable job shares it).
-    concurrency:
-      group: worker-deploy
-      cancel-in-progress: false
     environment:
       name: ${{ needs.plan.outputs.environment }}
     permissions:
@@ -1062,9 +1091,6 @@ jobs:
     if: needs.plan.outputs.deploy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    concurrency:
-      group: worker-deploy
-      cancel-in-progress: false
     environment: production
     defaults:
       run:

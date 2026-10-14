@@ -222,7 +222,10 @@ function stepFailures(text) {
 // --- static controls of the deploy jobs (plan, migrate, deploy) of ci.yml (was worker-deploy.yml, #290 part 2)
 const DEPLOY_JOBS = ["plan", "migrate", "deploy"];
 const code = (t) => t.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
-const PLAN_IF = "    if: ${{ github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && needs.changes.outputs.deploy_changed == 'true')) }}";
+const PLAN_IF = "    if: ${{ !cancelled() && needs.ci.result == 'success' && github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}";
+const PLAN_DEPLOY_OUTPUT = "      deploy: ${{ steps.guard.outputs.deploy == 'true' && steps.scope.outputs.deploy == 'true' && 'true' || 'false' }}";
+// The workflow-level group: whole push-to-master and dispatch-from-master runs are serialized in `worker-deploy`.
+export const WORKFLOW_GROUP = "  group: ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'worker-deploy' || format('ci-{0}-{1}', github.event_name, github.event_name == 'pull_request' && github.ref || github.run_id) }}";
 export function staticFailures(text) {
   const f = stepFailures(text);
   for (const s of steps(text)) {
@@ -240,7 +243,13 @@ export function staticFailures(text) {
   for (const id of DEPLOY_JOBS) if (block[id] === null) f.push(`job ${id} is missing`);
   const line = (id, re) => re.test(block[id] ?? "");
   if (!line("plan", /^ {4}needs: \[changes, lint, tests, ci\]$/m)) f.push("plan must need exactly changes, lint, tests, ci");
-  if (!(block.plan ?? "").split("\n").includes(PLAN_IF)) f.push("plan has not the exact condition (repository, master ref, dispatch or push with deploy_changed)");
+  if (!(block.plan ?? "").split("\n").includes(PLAN_IF)) f.push("plan has not the exact condition (gate succeeded, repository, master ref, dispatch or push)");
+  if (!(block.plan ?? "").split("\n").includes(PLAN_DEPLOY_OUTPUT)) f.push("plan output deploy is not exactly guard AND scope");
+  // The step that decides "anything to deploy": its id, its condition, and that a dispatch always deploys and a git
+  // failure never means "nothing to deploy" (its run block is also executed by changes.mjs).
+  const scope = steps(block.plan ?? "").find((s) => s.name === "Anything to deploy (worker/ since BASE)");
+  if (!scope) f.push("plan has no step Anything to deploy");
+  else if (!/^ {8}id: scope$/m.test(scope.text) || !/^ {8}if: steps\.guard\.outputs\.deploy == 'true'$/m.test(scope.text)) f.push("the scope step has not the id scope and the guard condition");
   if ((block.plan ?? "").split("\n").filter((l) => /^ {4}if:/.test(l)).length !== 1) f.push("plan must have exactly one if");
   if (!line("migrate", /^ {4}needs: plan$/m)) f.push("migrate must need exactly plan");
   if (!line("migrate", /^ {4}if: needs\.plan\.outputs\.deploy == 'true' && \(needs\.plan\.outputs\.environment == 'production' \|\| needs\.plan\.outputs\.environment == 'production-destructive'\)$/m)) f.push("migrate has not the exact condition");
@@ -249,19 +258,25 @@ export function staticFailures(text) {
   if (!line("deploy", /^ {4}if: needs\.plan\.outputs\.deploy == 'true'$/m)) f.push("deploy has not the exact condition");
   if (!line("deploy", /^ {4}environment: production$/m)) f.push("deploy must run in the environment production");
   if (line("plan", /^ {4}environment:/m)) f.push("plan must have no environment");
-  // Concurrency: a job-level group worker-deploy, never cancelling, on exactly these three jobs and no other.
-  for (const id of DEPLOY_JOBS) {
-    if (!line(id, /^ {4}concurrency:\n {6}group: worker-deploy\n {6}cancel-in-progress: false$/m)) f.push(`${id} must have the concurrency group worker-deploy with cancel-in-progress: false`);
+  // Concurrency: the deploy runs are serialized by the WORKFLOW-level group (see ciFailures); a job-level group on any
+  // job would be a second mechanism (and the same name at both levels deadlocks): none may exist.
+  for (const id of ["changes", "lint", "tests", "version", "ci", ...DEPLOY_JOBS]) {
+    if (/^ {4}concurrency:/m.test(code(jobBlock(text, id) ?? ""))) f.push(`job-level concurrency on ${id}`);
   }
-  for (const id of ["changes", "lint", "tests", "version", "ci"]) {
-    if (/worker-deploy/.test(code(jobBlock(text, id) ?? ""))) f.push(`the deploy group is shared with the cancellable job ${id}`);
-  }
-  // Secrets and environments: only in migrate and deploy (every secret there is an environment secret).
+  // `changes` exposes exactly worker_changed and base_sha: no deploy decision leaves it (plan decides).
+  const changesOutputs = code(jobBlock(text, "changes") ?? "").split("\n").filter((l) => /^ {6}[a-z_]+: /.test(l) && !/^ {8}/.test(l));
+  const wantOutputs = ["      worker_changed: ${{ steps.changes.outputs.worker_changed }}", "      base_sha: ${{ steps.base.outputs.base_sha }}"];
+  if (JSON.stringify(changesOutputs.slice(0, 2)) !== JSON.stringify(wantOutputs) || /deploy_changed/.test(code(text))) f.push("the outputs of the job changes are not exactly worker_changed and base_sha");
+  // Secrets: the word `secrets` (a context, `secrets: inherit`, `secrets[...]`, `toJSON(secrets)`) may appear outside
+  // comments ONLY inside the job blocks migrate and deploy, so not at workflow level (top-level env), not in other jobs.
+  let rest = text;
+  for (const id of ["migrate", "deploy"]) rest = rest.replace(jobBlock(text, id) ?? "\u0000", "");
+  if (/\bsecrets\b/i.test(code(rest))) f.push("secrets outside the jobs migrate and deploy (workflow level or another job)");
+  // Environments: only on migrate and deploy.
   for (const id of ["changes", "lint", "tests", "version", "ci", "plan"]) {
-    const j = code(jobBlock(text, id) ?? "");
-    if (/\bsecrets\b/.test(j)) f.push(`secrets in the job ${id}`);
-    if (/^ {4}environment:/m.test(j)) f.push(`environment on the job ${id}`);
+    if (/^ {4}environment:/m.test(code(jobBlock(text, id) ?? ""))) f.push(`environment on the job ${id}`);
   }
+  if (/^environment:|^env:/m.test(code(text.split(/^jobs:/m)[0]))) f.push("workflow-level env or environment");
   for (const id of ["migrate", "deploy"]) {
     if (/\bsecrets\b/.test(code(jobBlock(text, id) ?? "")) && !line(id, /^ {4}environment:/m)) f.push(`secrets in ${id} without an environment`);
   }
@@ -331,7 +346,11 @@ export function ciFailures(text) {
     if (j !== null && !/^ {4}if: \$\{\{ needs\.changes\.outputs\.worker_changed == 'true' \}\}$/m.test(j)) f.push(`job ${id} has no condition on worker_changed`);
   }
 
-  if (!/^concurrency:\n {2}group: ci-\$\{\{ github\.event_name \}\}-\$\{\{ github\.event_name == 'pull_request' && github\.ref \|\| github\.run_id \}\}\n {2}cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' && contains\(fromJSON\('\["opened","reopened","synchronize"\]'\), github\.event\.action\) \}\}\n/m.test(text)) f.push("concurrency: a queue, master or label-event run could cancel a run in progress");
+  // Workflow-level concurrency, exactly: push to master and dispatch from master share the group `worker-deploy` (whole
+  // runs in push order), pull_request has its own group and cancels only opened/reopened/synchronize, nothing else
+  // (merge_group, label events, a dispatch from another ref) is ever cancelled and nothing else is in `worker-deploy`.
+  const wantCancel = "  cancel-in-progress: ${{ github.event_name == 'pull_request' && contains(fromJSON('[\"opened\",\"reopened\",\"synchronize\"]'), github.event.action) }}";
+  if (!text.includes(`\nconcurrency:\n${WORKFLOW_GROUP}\n${wantCancel}\n`)) f.push("workflow concurrency changed: a queue, master or label-event run could be cancelled, or a deploy run could share a cancellable group");
   f.push(...permissionFailures(text, PERMISSIONS["ci.yml"]));
   // A job that publishes a report needs checks: write (else the check run cannot be created), and only such a job has it.
   for (const id of ["changes", "lint", "tests", "version", "ci", "plan", "migrate", "deploy"]) {

@@ -64,9 +64,8 @@ export function createChangesRunner(text, { tmp }) {
     const r2 = spawnSync("bash", ["-e", join(dir, "detect.sh")], { cwd, env: { ...env, EVENT_NAME: event, BASE_SHA: base ?? "", RUNNER_TEMP: tmpDir, GITHUB_OUTPUT: out2 }, encoding: "utf8" });
     const outputs = readFileSync(out2, "utf8");
     const changed = /^worker_changed=(.*)$/m.exec(outputs)?.[1] ?? null;
-    const deployChanged = /^deploy_changed=(.*)$/m.exec(outputs)?.[1] ?? null;
     const outBase = r1 ? (/^base_sha=(.*)$/m.exec(readFileSync(out1, "utf8"))?.[1] ?? null) : base;
-    return { A, H, base, outBase, changed, deployChanged, status: [r1?.status ?? 0, r2.status] };
+    return { A, H, base, outBase, changed, status: [r1?.status ?? 0, r2.status] };
   };
   return { run };
 }
@@ -81,7 +80,7 @@ export const changesCases = [
   ["pull_request: ci.yml changed", { event: "pull_request", change: "ci" }, "A", "true"],
   ["workflow_dispatch: docs only still runs everything (base is the parent)", { event: "workflow_dispatch", change: "docs" }, "A", "true"],
   ["workflow_dispatch: nothing changed still runs everything", { event: "workflow_dispatch" }, "A", "true"],
-  ["push: only ci.yml changed does not deploy", { event: "push", change: "ci", before: A_ }, "A", "true"],
+  ["push: only ci.yml changed still runs lint and tests", { event: "push", change: "ci", before: A_ }, "A", "true"],
   ["push: a change of the removed worker-deploy.yml path is not tracked any more",{ event: "push", change: "deploy", before: A_ }, "A", "false"],
   ["pull_request: no origin/master (fail closed)", { event: "pull_request", change: "docs", noOriginMaster: true }, "", "true"],
   ["merge_group: valid base and head, docs only", { event: "merge_group", change: "docs", mgBase: A_, mgHead: H_ }, "A", "false"],
@@ -113,10 +112,6 @@ export function changesCaseFailures(runner, [name, opts, wantBase, wantChanged])
   if ((r.base ?? "") !== base) f.push(`${name}: base ${JSON.stringify(r.base)}, expected ${JSON.stringify(base)}`);
   if ((r.outBase ?? "") !== base) f.push(`${name}: base_sha output ${JSON.stringify(r.outBase)}`);
   if (r.changed !== wantChanged) f.push(`${name}: worker_changed=${r.changed}, expected ${wantChanged}`);
-  // deploy_changed: true for a manual dispatch, for a change under worker/ and whenever the check fails closed; a
-  // change of ci.yml alone (worker_changed true) must not deploy.
-  const wantDeploy = opts.event === "workflow_dispatch" || (wantChanged === "true" && opts.change !== "ci") ? "true" : "false";
-  if (r.deployChanged !== wantDeploy) f.push(`${name}: deploy_changed=${r.deployChanged}, expected ${wantDeploy}`);
   return f;
 }
 
@@ -125,8 +120,82 @@ export const changesMutations = [
   ["the no base branch writes worker_changed=false", (t) => t.replace('echo "no base: treating worker as changed"\n            echo "worker_changed=true"', 'echo "no base: treating worker as changed"\n            echo "worker_changed=false"')],
   ["the merge_group head check is replaced by true", (t) => t.replace('if [ "$head" = "$MG_HEAD_SHA" ]; then', "if true; then")],
   ["the merge_group is_sha check is replaced by true", (t) => t.replace('if is_sha "$MG_BASE_SHA" && is_sha "$MG_HEAD_SHA"; then', "if true; then")],
-  ["deploy_changed also watches ci.yml", (t) => t.replace("-- ':(top)worker' > \"$RUNNER_TEMP/deploy-changed.txt\"", "-- ':(top)worker' ':(top).github/workflows/ci.yml' > \"$RUNNER_TEMP/deploy-changed.txt\"")],
-  ["a manual dispatch is not forced to deploy", (t) => t.replace('if [ "$EVENT_NAME" = "workflow_dispatch" ]; then\n            echo "manual dispatch', 'if false; then\n            echo "manual dispatch')],
-  ["the no base branch writes deploy_changed=false", (t) => t.replace('echo "no base: treating worker as changed"\n            echo "worker_changed=true" >> "$GITHUB_OUTPUT"\n            echo "deploy_changed=true"', 'echo "no base: treating worker as changed"\n            echo "worker_changed=true" >> "$GITHUB_OUTPUT"\n            echo "deploy_changed=false"')],
-  ["pull_request resolves the base to HEAD",(t) => t.replace("refs/remotes/origin/master^{commit}", "HEAD^{commit}")],
+  ["a manual dispatch is not forced to run lint and tests", (t) => t.replace('if [ "$EVENT_NAME" = "workflow_dispatch" ]; then\n            echo "manual dispatch', 'if false; then\n            echo "manual dispatch')],
+  ["pull_request resolves the base to HEAD", (t) => t.replace("refs/remotes/origin/master^{commit}", "HEAD^{commit}")],
+];
+
+// --- the step "Anything to deploy (worker/ since BASE)" of the plan job, in a real temp git repo
+const SCOPE_STEP = "Anything to deploy (worker/ since BASE)";
+export function createScopeRunner(text, { tmp }) {
+  const dir = mkdtempSync(join(tmp, "scope-"));
+  writeFileSync(join(dir, "scope.sh"), runBlock(text, SCOPE_STEP));
+  let n = 0;
+  const env = { PATH: "/usr/bin:/bin", ...GIT_ENV };
+  const git = (cwd, ...args) => {
+    const r = spawnSync("git", args, { cwd, env, encoding: "utf8" });
+    if (r.status !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+    return r.stdout.trim();
+  };
+  // change: what the head commit changes against the base commit A: worker | docs | none.
+  const run = ({ event, change, base, mid }) => {
+    const id = n++;
+    const cwd = join(dir, `r${id}`);
+    mkdirSync(cwd);
+    git(cwd, "init", "-q");
+    mkdirSync(join(cwd, "worker"));
+    mkdirSync(join(cwd, "docs"));
+    writeFileSync(join(cwd, "worker/a.txt"), "base\n");
+    writeFileSync(join(cwd, "docs/d.txt"), "base\n");
+    git(cwd, "add", "-A");
+    git(cwd, "commit", "-q", "-m", "base");
+    const A = git(cwd, "rev-parse", "HEAD");
+    if (mid === "worker") {
+      // an older commit between BASE and the head that changes worker/ (its own run was replaced while pending)
+      writeFileSync(join(cwd, "worker/a.txt"), "older change\n");
+      git(cwd, "add", "-A");
+      git(cwd, "commit", "-q", "-m", "older worker commit");
+    }
+    if (change === "worker") writeFileSync(join(cwd, "worker/a.txt"), "changed\n");
+    if (change === "docs") writeFileSync(join(cwd, "docs/d.txt"), "changed\n");
+    git(cwd, "add", "-A");
+    git(cwd, "commit", "-q", "--allow-empty", "-m", "head");
+    const H = git(cwd, "rev-parse", "HEAD");
+    const out = join(dir, `out${id}`);
+    const summary = join(dir, `sum${id}`);
+    writeFileSync(out, "");
+    writeFileSync(summary, "");
+    const b = typeof base === "function" ? base({ A, H }) : base;
+    const r = spawnSync("bash", ["-eo", "pipefail", join(dir, "scope.sh")], { cwd, env: { ...env, EVENT_NAME: event, BASE_SHA: b, EVENT_SHA: H, GITHUB_OUTPUT: out, GITHUB_STEP_SUMMARY: summary }, encoding: "utf8" });
+    return { status: r.status, deploy: /^deploy=(.*)$/m.exec(readFileSync(out, "utf8"))?.[1] ?? null, summary: readFileSync(summary, "utf8"), stderr: r.stdout + r.stderr };
+  };
+  return { run };
+}
+
+// [name, options, expected deploy output, expects a "nothing to deploy" summary]
+export const scopeCases = [
+  ["push: worker/ changed since BASE deploys", { event: "push", change: "worker", base: A_ }, "true", false],
+  ["push: docs only since BASE does not deploy (visible summary)", { event: "push", change: "docs", base: A_ }, "false", true],
+  ["push: nothing changed since BASE does not deploy", { event: "push", change: "none", base: A_ }, "false", true],
+  ["push: BASE is the head itself does not deploy", { event: "push", change: "worker", base: H_ }, "false", true],
+  ["push: worker/ changed in an OLDER commit than a docs-only head deploys (the survivor deploys what a replaced run would have)", { event: "push", change: "docs", mid: "worker", base: A_ }, "true", false],
+  ["push: BASE does not exist (git failure) deploys", { event: "push", change: "docs", base: F40 }, "true", false],
+  ["push: empty BASE (git failure) deploys", { event: "push", change: "docs", base: "" }, "true", false],
+  ["workflow_dispatch: always deploys, docs only", { event: "workflow_dispatch", change: "docs", base: A_ }, "true", false],
+  ["workflow_dispatch: always deploys, nothing changed", { event: "workflow_dispatch", change: "none", base: H_ }, "true", false],
+];
+
+export function scopeCaseFailures(runner, [name, opts, wantDeploy, wantSummary]) {
+  const r = runner.run(opts);
+  const f = [];
+  if (r.status !== 0) f.push(`${name}: the step exited ${r.status}`);
+  if (r.deploy !== wantDeploy) f.push(`${name}: deploy=${r.deploy}, expected ${wantDeploy}`);
+  if (r.summary.includes("nothing to deploy") !== wantSummary) f.push(`${name}: the summary line "nothing to deploy" is ${r.summary.includes("nothing to deploy") ? "present" : "missing"}`);
+  return f;
+}
+
+export const scopeMutations = [
+  ["a git failure means nothing to deploy", (t) => t.replace('            echo "deploy=true" >> "$GITHUB_OUTPUT"\n            echo "worker/ differs from the last deployment (or the comparison failed): deploying"', '            echo "deploy=false" >> "$GITHUB_OUTPUT"\n            echo "worker/ differs from the last deployment (or the comparison failed): deploying"')],
+  ["a dispatch is not forced to deploy", (t) => t.replace('if [ "$EVENT_NAME" = "workflow_dispatch" ]; then\n            echo "deploy=true"', 'if false; then\n            echo "deploy=true"')],
+  ["the comparison looks at the whole tree, not worker/", (t) => t.replace('"$EVENT_SHA" -- worker/ || rc=$?', '"$EVENT_SHA" || rc=$?')],
+  ["an equal tree deploys", (t) => t.replace('if [ "$rc" -eq 0 ]; then\n            echo "deploy=false"', 'if [ "$rc" -eq 99 ]; then\n            echo "deploy=false"')],
 ];

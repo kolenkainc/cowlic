@@ -11,7 +11,7 @@ import {
   PERMISSIONS, ciFailures, ciFile, createRunner, createSandbox, dynamicFailures, hostileTitleFailures, hostileTitles, mutations,
   parsePermissions, permissionFailures, readText, staticFailures, steps, tamperCases,
 } from "./lib.mjs";
-import { changesCaseFailures, changesCases, changesMutations, createChangesRunner } from "./changes.mjs";
+import { changesCaseFailures, changesCases, changesMutations, createChangesRunner, createScopeRunner, scopeCaseFailures, scopeCases, scopeMutations } from "./changes.mjs";
 
 const ci = readText(ciFile);
 const original = ci; // the deploy jobs live in ci.yml
@@ -223,8 +223,26 @@ describe("ci.yml reports `ci` on pull_request, push and merge_group (#290, #292)
     ["paths-ignore filter on pull_request", (t) => t.replace(prTypes, `${prTypes}    paths-ignore: ["docs/**"]\n`)],
     ["branches filter on merge_group", (t) => t.replace("    types: [checks_requested]\n", "    types: [checks_requested]\n    branches: [master]\n")],
     ["paths filter on push", (t) => t.replace("    branches: [master]\n", '    branches: [master]\n    paths: ["worker/**"]\n')],
-    ["shared concurrency group for push runs (a pending run with a deploy could be replaced)", (t) => t.replace("github.event_name == 'pull_request' && github.ref || github.run_id", "github.ref")],
-    ["shared concurrency group without the event", (t) => t.replace("group: ci-${{ github.event_name }}-", "group: ci-")],
+    // Workflow-level concurrency (#290 part 2, review of #306): push runs of master serialize in `worker-deploy`.
+    ["push runs of master are not in the group worker-deploy (jobs would enter in check order)", (t) => t.replace("&& 'worker-deploy' ||", "&& 'ci-push' ||")],
+    ["a dispatch from any ref joins the deploy group (could replace a pending deploy run)", (t) => t.replace("github.ref == 'refs/heads/master' && (github.event_name == 'push'", "(github.event_name == 'push'")],
+    ["the group of the other events drops the event name (queue and PR runs could collide)",(t) => t.replace("format('ci-{0}-{1}', github.event_name, ", "format('ci-{0}-{1}', 'x', ")],
+    ["dispatch not in the deploy group", (t) => t.replace(" || github.event_name == 'workflow_dispatch') && 'worker-deploy'", ") && 'worker-deploy'")],
+    ["job-level concurrency group on deploy (deadlocks with the workflow group)", (t) => t.replace("  deploy:\n    name: deploy\n", "  deploy:\n    name: deploy\n    concurrency:\n      group: worker-deploy\n      cancel-in-progress: false\n")],
+    ["job-level concurrency group on plan", (t) => t.replace("  plan:\n    name: plan\n", "  plan:\n    name: plan\n    concurrency:\n      group: worker-deploy\n      cancel-in-progress: false\n")],
+    // Secrets only in migrate and deploy (review of #306): not at workflow level, not in any other job, in any form.
+    ["workflow-level env with a secret", (t) => t.replace("\nconcurrency:\n", "\nenv:\n  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}\n\nconcurrency:\n")],
+    ["workflow-level env with toJSON(secrets)", (t) => t.replace("\nconcurrency:\n", "\nenv:\n  ALL: ${{ toJSON(secrets) }}\n\nconcurrency:\n")],
+    ["secrets index form in the tests job", (t) => t.replace("      - name: Migration lint tests\n", "      - name: Migration lint tests\n        env:\n          X: ${{ secrets['WORKER_URL'] }}\n")],
+    ["toJSON(secrets) in the lint job", (t) => t.replace("      - name: Typecheck\n", "      - name: Typecheck\n        env:\n          X: ${{ toJSON(secrets) }}\n")],
+    ["a secret in the gate", (t) => t.replace("          CHANGES_RESULT: ${{ needs.changes.result }}\n", "          CHANGES_RESULT: ${{ needs.changes.result }}\n          X: ${{ secrets.WORKER_URL }}\n")],
+    // The outputs of `changes` and the deploy decision of `plan`.
+    ["changes exposes a deploy_changed output mapped to worker_changed", (t) => t.replace("      base_sha: ${{ steps.base.outputs.base_sha }}\n", "      base_sha: ${{ steps.base.outputs.base_sha }}\n      deploy_changed: ${{ steps.changes.outputs.worker_changed }}\n")],
+    ["plan output deploy ignores the scope step", (t) => t.replace(" && steps.scope.outputs.deploy == 'true'", "")],
+    ["plan output deploy only reads the scope step", (t) => t.replace("steps.guard.outputs.deploy == 'true' && steps.scope.outputs.deploy == 'true' && 'true' || 'false'", "steps.scope.outputs.deploy")],
+    ["the scope step is removed (renamed)", (t) => t.replace("Anything to deploy (worker/ since BASE)", "Something else")],
+    ["plan without the gate result in its condition", (t) => t.replace("needs.ci.result == 'success' && ", "")],
+    ["plan without !cancelled()", (t) => t.replace("${{ !cancelled() && needs.ci.result", "${{ needs.ci.result")],
     // The deploy jobs (#290 part 2, #287): the graph, the conditions, the group, secrets only in migrate and deploy.
     ["deploy job without needs", (t) => t.replace("    needs: [plan, migrate]\n", "")],
     ["deploy needs only plan (can start without migrate)", (t) => t.replace("needs: [plan, migrate]", "needs: [plan]")],
@@ -232,16 +250,13 @@ describe("ci.yml reports `ci` on pull_request, push and merge_group (#290, #292)
     ["plan without the gate in needs (deploy without lint, tests and ci)", (t) => t.replace("needs: [changes, lint, tests, ci]", "needs: [changes]")],
     ["plan without the repository condition (forks)", (t) => t.replace("github.repository == 'kolenkainc/cowlic' && ", "")],
     ["plan without the master ref condition", (t) => t.replace("github.ref == 'refs/heads/master' && ", "")],
-    ["plan on every event except pull_request (merge_group deploys)", (t) => t.replace("github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && needs.changes.outputs.deploy_changed == 'true')", "github.event_name != 'pull_request'")],
+    ["plan on every event except pull_request (merge_group deploys)", (t) => t.replace("(github.event_name == 'workflow_dispatch' || github.event_name == 'push')", "github.event_name != 'pull_request'")],
     ["plan on pull_request too", (t) => t.replace("(github.event_name == 'workflow_dispatch' ||", "(github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' ||")],
-    ["plan on every push (no deploy_changed condition)", (t) => t.replace(" && needs.changes.outputs.deploy_changed == 'true'", "")],
+    ["plan on merge_group too", (t) => t.replace("(github.event_name == 'workflow_dispatch' ||", "(github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' ||")],
     ["plan with an extra job-level if", (t) => t.replace("  plan:\n    name: plan\n", "  plan:\n    name: plan\n    if: ${{ true }}\n")],
     ["plan with an environment", (t) => t.replace("  plan:\n    name: plan\n", "  plan:\n    name: plan\n    environment: production\n")],
     ["deploy without an environment", (t) => t.replace("    environment: production\n", "")],
     ["migrate without its environment", (t) => t.replace("    environment:\n      name: ${{ needs.plan.outputs.environment }}\n", "")],
-    ["shared cancellable concurrency group on deploy", (t) => t.replace(/(  deploy:\n[\s\S]*?concurrency:\n) {6}group: worker-deploy\n {6}cancel-in-progress: false\n/m, "$1      group: ci-${{ github.ref }}\n      cancel-in-progress: true\n")],
-    ["deploy with cancel-in-progress true", (t) => t.replace(/(  deploy:\n[\s\S]*?concurrency:\n {6}group: worker-deploy\n {6}cancel-in-progress: )false/m, "$1true")],
-    ["migrate without the deploy concurrency group", (t) => t.replace(/(  migrate:\n[\s\S]*?)    concurrency:\n {6}group: worker-deploy\n {6}cancel-in-progress: false\n/m, "$1")],
     ["a cancellable job in the deploy group", (t) => t.replace("  lint:\n    name: lint\n", "  lint:\n    name: lint\n    concurrency:\n      group: worker-deploy\n      cancel-in-progress: true\n")],
     ["secrets used in plan (outside an environment)", (t) => t.replace("      - name: Commit title\n        id: title\n", "      - name: Commit title\n        id: title\n        env:\n          X: ${{ secrets.CLOUDFLARE_API_TOKEN }}\n")],
     ["secrets used in the tests job", (t) => t.replace("      - name: Migration lint tests\n", "      - name: Migration lint tests\n        env:\n          X: ${{ secrets.WORKER_URL }}\n")],
@@ -280,5 +295,22 @@ describe("ci.yml: Resolve base commit and Detect worker changes", () => {
     expect(mutated, `the mutation pattern was not found: ${name}`).not.toBe(ci);
     const runner = createChangesRunner(mutated, sandbox);
     expect(changesCases.flatMap((c) => changesCaseFailures(runner, c)).length).toBeGreaterThan(0);
+  });
+});
+
+// The step of `plan` that decides whether there is anything to deploy (worker/ vs what is live): real temp git repo.
+describe("ci.yml: Anything to deploy (worker/ since BASE)", () => {
+  let scopeRunner;
+  beforeAll(() => {
+    scopeRunner = createScopeRunner(ci, sandbox);
+  });
+  it.each(scopeCases.map((c) => [c[0], c]))("%s", (_name, c) => {
+    expect(scopeCaseFailures(scopeRunner, c)).toEqual([]);
+  });
+  it.each(scopeMutations)("mutation is caught: %s", (name, fn) => {
+    const mutated = fn(ci);
+    expect(mutated, `the mutation pattern was not found: ${name}`).not.toBe(ci);
+    const runner = createScopeRunner(mutated, sandbox);
+    expect(scopeCases.flatMap((c) => scopeCaseFailures(runner, c)).length).toBeGreaterThan(0);
   });
 });
