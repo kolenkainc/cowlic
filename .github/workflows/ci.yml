@@ -25,6 +25,8 @@ on:
   # #292: the master ruleset has a merge queue and requires `ci`; the queue sends merge_group (checks_requested)
   # and waits for the required check on the gh-readonly-queue/* commit. No path filter: `ci` must always report.
   # Nothing here deploys or releases; worker-deploy.yml must NOT get this trigger (asserted by test/workflow).
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
