@@ -54,6 +54,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  evil: {runs-on: ubuntu-latest, permissions: {contents: write}, steps: []}
   # Guard (section 3 rule 5): an older run that was queued must not deploy after a newer commit landed on master.
   # Then (#202, section 12.2): BASE, immutability of applied migrations, lint of the migrations added since BASE and
   # the routing of `migrate` to `production` or `production-destructive`. No secrets, no environment: only the default
