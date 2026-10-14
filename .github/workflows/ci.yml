@@ -1,12 +1,12 @@
 # CI. Contract: docs/worker-cicd.md (section 12.1, rules in 3 and 5.1 rule 5a, pins in 6) and docs/releasing.md.
 # One workflow for every check and for the Worker deploy (#290: part 1 merged version.yml and worker-ci.yml, part 2
-# folded worker-deploy.yml in, part 3 added the release stage).
+# folded worker-deploy.yml in, part 3 added the release stage, #312 merged migrate and deploy into `ship`).
 #
 # Stages (jobs): changes (what changed), lint (typecheck, migrations), tests (migration lint tests and Vitest, with
-# reports), version (GitVersion, read-only), ci (the gate), then plan -> migrate -> deploy (D1 migrations and the Worker
-# deploy, #201 and #202), then release (tag and GitHub Release, the only job with contents: write). Check contexts
-# (the job names; the UI shows "<workflow> / <job>"): `ci`, `changes`, `lint`, `tests`, `version`, `plan`, `migrate`,
-# `deploy`, `release`, plus the report check runs "Test Report" and "Test Report (Vitest)".
+# reports), version (GitVersion, read-only), ci (the gate), then plan -> ship (the D1 migrations and then the Worker
+# deploy in ONE job, #201, #202, #312), then release (tag and GitHub Release, the only job with contents: write). Check
+# contexts (the job names; the UI shows "<workflow> / <job>"): `ci`, `changes`, `lint`, `tests`, `version`, `plan`,
+# `ship`, `release`, plus the report check runs "Test Report" and "Test Report (Vitest)".
 # The owner's master ruleset requires the context `ci` (integration 15368): it is the gate job below, which always
 # runs and reports on pull_request, push to master and merge_group.
 #
@@ -15,35 +15,35 @@
 # the output of `changes`, and the gate `ci` accepts a skipped job only when `changes` said it was not needed.
 # `ci` itself has no condition except `always()` (a skipped required check counts as passed).
 #
-# DEPLOY RULES. plan, migrate and deploy run ONLY on push to master and on the manual workflow_dispatch from master,
+# DEPLOY RULES. plan and ship run ONLY on push to master and on the manual workflow_dispatch from master,
 # never on pull_request or merge_group (the queue's squash commit is the push to master that deploys) and never in a
 # fork (job-level `if:` on the event, the ref and github.repository), and only when the gate `ci` of the SAME run
 # succeeded (#287: the gate succeeds only when lint and tests succeeded or were not needed). Whether there is anything
 # to deploy is decided in `plan` (step "Anything to deploy"): worker/ at this commit vs BASE, the commit of the most
-# recent successful `production` deployment record (it moves once `migrate` succeeds; after a failed deploy or health
-# check a later docs-only push does not retry, recovery is a workflow_dispatch), always yes for a dispatch.
+# recent successful deployment record of `production` or `production-destructive` (it moves once `ship` succeeds; after
+# a failed ship, for example a failed health check, it does not move: recovery is a workflow_dispatch), always yes for
+# a dispatch.
 # CONCURRENCY. The WORKFLOW-level group of a push to master or a dispatch from master is `worker-deploy`, with
-# cancel-in-progress false: whole runs are serialized in push order, a running run (and so a running deploy or a
-# migrate waiting for approval) is never cancelled, and GitHub keeps one pending run and replaces an older pending run
+# cancel-in-progress false: whole runs are serialized in push order, a running run (and so a running ship or a ship
+# waiting for approval) is never cancelled, and GitHub keeps one pending run and replaces an older pending run
 # by a newer one. Because the group is workflow-level, a replaced pending run is always OLDER than the run that
 # survives, and the survivor's `plan` compares with what is live (BASE), so it deploys what the replaced run would
 # have deployed. (Job-level groups on the deploy jobs were rejected: jobs would enter the group in the order their
 # checks finish, not in push order, and a newer pending plan could be cancelled by an older one: nothing deployed.)
 # There is NO job-level concurrency on the deploy jobs (the same group name at both levels would deadlock the run).
 # pull_request, merge_group and everything not on master get their own groups, never `worker-deploy`.
-# Secrets exist only as environment secrets, in the jobs migrate and deploy (the steps listed below); none anywhere
+# Secrets exist only as environment secrets, in the job ship (the steps listed below); none anywhere
 # else in this file. No pull_request_target (section 3 rule 3).
 #
-# Secrets (environment secrets of `production`: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, D1_DATABASE_ID,
-# WORKER_URL; `production-destructive`: the first three) are consumed in exactly these steps:
-#   migrate: "Write runner-local wrangler config": D1_DATABASE_ID
-#            "List pending migrations", "Time Travel bookmark", "Apply migrations", "Verify nothing is pending":
-#            CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID
-#   deploy:  "Write runner-local wrangler config": D1_DATABASE_ID
-#            "Mask the Worker URL": WORKER_URL
-#            "Deploy": CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID
-#            "Health check": WORKER_URL
-# `npm ci` in migrate and deploy runs with no secrets in its environment. Nothing prints an id, no `set -x`, the
+# Secrets (environment secrets of BOTH `production` and `production-destructive`: CLOUDFLARE_API_TOKEN,
+# CLOUDFLARE_ACCOUNT_ID, D1_DATABASE_ID, WORKER_URL) are consumed in exactly these steps of `ship`:
+#   "Write runner-local wrangler config": D1_DATABASE_ID
+#   "List pending migrations", "Time Travel bookmark", "Apply migrations", "Verify nothing is pending":
+#       CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID
+#   "Mask the Worker URL": WORKER_URL
+#   "Deploy": CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID
+#   "Health check": WORKER_URL
+# `npm ci` in ship runs with no secrets in its environment. Nothing prints an id, no `set -x`, the
 # generated config is never printed, committed or uploaded (no upload-artifact in this file). The `plan` job uses only
 # the default GITHUB_TOKEN. The Worker's own secrets (TG_BOT_TOKEN, SUBSONIC_*) are never touched: `wrangler deploy`
 # only, no `secret put`, and worker/wrangler.toml has no [vars].
@@ -346,13 +346,13 @@ jobs:
 
       # Vitest has no switch against skipped tests and no minimum count, so both are checked here on the numeric
       # outputs of the report step (no text parsing): skipped must be 0 (a skipped test is a silently dropped check)
-      # and passed must reach MIN_TESTS, a pinned number just below the real count (551 on 2026-10-14: 106 unit, 348
+      # and passed must reach MIN_TESTS, a pinned number just below the real count (654 on 2026-10-14: 106 unit, 451
       # workflow, 51 + 46 smoke) so a few removals do not trip it but a lost file or area does. NOT dynamic: raise it deliberately when tests are added,
       # lower it deliberately when tests are removed on purpose.
       - name: Minimum test count (Vitest)
         if: ${{ steps.vitest.outcome == 'success' }}
         env:
-          MIN_TESTS: "545"
+          MIN_TESTS: "648"
           PASSED: ${{ steps.vitest_report.outputs.passed }}
           SKIPPED: ${{ steps.vitest_report.outputs.skipped }}
         run: |
@@ -479,10 +479,9 @@ jobs:
           done
           exit "$fail"
 
-  # ORDER RULE (enforced by `needs`): plan -> migrate -> deploy. Migrate first, deploy second: a failed, rejected or
-  # cancelled migrate job means `deploy` never starts. The Worker that is live between migrate and deploy is the OLD
-  # code on the NEW schema, and a rollback of the Worker leaves the NEW schema under OLD code, so every migration must
-  # work with and without the code that uses it (design section 5.1 rule 2, as the indexes of #122).
+  # ORDER RULE (enforced by `needs` and by the step order inside `ship`): plan -> ship. Inside ship the migration
+  # steps run first and the deploy steps second: a failed migration step stops the job before any deploy step, and a
+  # rejected or cancelled approval means nothing runs at all (see the comment of `ship`).
   #
   # plan runs only when: the gate `ci` of this run succeeded (it succeeds only when lint and tests succeeded or were
   # legitimately skipped because nothing relevant changed; `!cancelled()` is there because lint and tests are skipped
@@ -492,7 +491,7 @@ jobs:
   # deploy" below (worker/ vs the last deployment), not by the path of the push.
   # Guard (section 3 rule 5): an older run that was queued must not deploy after a newer commit landed on master.
   # Then (#202, section 12.2): BASE, immutability of applied migrations, lint of the migrations added since BASE and
-  # the routing of `migrate` to `production` or `production-destructive`. No secrets, no environment: only the default
+  # the routing of `ship` to `production` or `production-destructive`. No secrets, no environment: only the default
   # GITHUB_TOKEN, with the two extra read permissions this job needs (deployments for BASE, pull-requests for the label).
   plan:
     name: plan
@@ -507,9 +506,12 @@ jobs:
     outputs:
       # true only when the guard says this commit may deploy AND worker/ differs from what is live (step "Anything to deploy")
       deploy: ${{ steps.guard.outputs.deploy == 'true' && steps.scope.outputs.deploy == 'true' && 'true' || 'false' }}
-      # `production` or `production-destructive`; only these two literals are ever written (see "Classify")
-      environment: ${{ steps.classify.outputs.environment }}
-      # Subject line of the commit, already reduced to a safe charset (see "Commit title"); the `deploy` job re-checks it
+      # EXACTLY `production` or `production-destructive` (#312). Validated here, in the expression: only the literal
+      # `production` written by the step "Classify" passes as `production`; a missing, empty or any other value (the
+      # step skipped, a failed step, a tampered string) is `production-destructive`, i.e. it needs the owner's approval
+      # (fail closed). `ship` runs in this environment.
+      environment: ${{ steps.classify.outputs.environment == 'production' && 'production' || 'production-destructive' }}
+      # Subject line of the commit, already reduced to a safe charset (see "Commit title"); the step "Deploy" re-checks it
       commit_title: ${{ steps.title.outputs.title }}
     defaults:
       run:
@@ -597,11 +599,17 @@ jobs:
           node-version: 22
           package-manager-cache: false # no cache at all (section 6)
 
-      # BASE = the commit whose migrations are already live: the commit of the last SUCCESSFUL deployment to the
-      # environment `production` (section 12.2). Why not github.event.before or the previous master head: a replaced
-      # pending run or a failed run would drop its migrations from the next run's range, and a destructive one could
-      # then no longer be routed to the approval environment.
-      # BASE is advisory: anyone with write access can create deployment records. The authority is the `migrate` job
+      # BASE = the commit whose migrations are already live: the commit of the most recent SUCCESSFUL deployment to
+      # EITHER environment, `production` or `production-destructive` (section 12.2, #312): the job `ship` runs in one
+      # of them, so a run that needed the owner's approval leaves its record in `production-destructive` and a run
+      # that did not leaves it in `production`; reading only `production` would not advance BASE after a destructive
+      # run and the next run would redo its classification and its approval. Both listings are merged and sorted by
+      # creation time (newest first), the first one whose latest status is `success` wins. If one listing cannot be
+      # read it is skipped with a warning: an older BASE only means more work is considered new (re-lint, re-approval),
+      # never less. Why not github.event.before or the previous master head: a replaced pending run or a failed run
+      # would drop its migrations from the next run's range, and a destructive one could then no longer be routed to
+      # the approval environment.
+      # BASE is advisory: anyone with write access can create deployment records. The authority is the job `ship`
       # (pending list of the remote DB, re-lint without --approved in `production`, environment approval).
       # Fallback when there is no successful deployment yet (the first run) or the API fails: push -> the `before`
       # commit of the event, workflow_dispatch -> the parent of the commit. BASE must exist and be an ancestor of the
@@ -624,21 +632,31 @@ jobs:
           }
           base=""
           source=""
-          if listing=$(gh api "repos/$REPO/deployments?environment=production&per_page=30" --jq '.[] | "\(.id) \(.sha)"'); then
-            while read -r dep_id dep_sha; do
-              case "$dep_id" in
-                "" | *[!0-9]*) continue ;;
-              esac
-              is_sha "$dep_sha" || continue
-              # statuses are newest first: the first one is the current state of the deployment
-              if state=$(gh api "repos/$REPO/deployments/$dep_id/statuses?per_page=1" --jq '.[0].state // ""') && [ "$state" = "success" ]; then
-                base="$dep_sha"
-                source="last successful deployment to production"
-                break
-              fi
-            done <<< "$listing"
-          else
-            echo "::warning::cannot read the deployments of production: using the fallback base"
+          listing=""
+          for env_name in production production-destructive; do
+            if part=$(gh api "repos/$REPO/deployments?environment=$env_name&per_page=30" --jq '.[] | "\(.created_at) \(.id) \(.sha)"'); then
+              listing="$listing$part"$'\n'
+            else
+              echo "::warning::cannot read the deployments of $env_name: its records are not considered"
+            fi
+          done
+          # newest first across both environments: created_at is ISO 8601 in UTC, so a text sort is a time sort
+          listing=$(printf '%s' "$listing" | LC_ALL=C sort -r) || listing=""
+          while read -r dep_created dep_id dep_sha; do
+            [[ "$dep_created" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || continue
+            case "$dep_id" in
+              "" | *[!0-9]*) continue ;;
+            esac
+            is_sha "$dep_sha" || continue
+            # statuses are newest first: the first one is the current state of the deployment
+            if state=$(gh api "repos/$REPO/deployments/$dep_id/statuses?per_page=1" --jq '.[0].state // ""') && [ "$state" = "success" ]; then
+              base="$dep_sha"
+              source="last successful deployment to production or production-destructive"
+              break
+            fi
+          done <<< "$listing"
+          if [ -z "$base" ]; then
+            echo "::warning::no successful deployment found (or the deployments cannot be read): using the fallback base"
           fi
           if [ -z "$base" ]; then
             if [ "$EVENT_NAME" = "push" ]; then
@@ -673,13 +691,13 @@ jobs:
       # #290 part 2 (the only step added to the old plan job). The old workflow decided "is there anything to deploy"
       # outside, with the path filter `worker/**` of the push. Every push to master reaches this job now, so that the run
       # that survives a replaced pending run can deploy what the replaced run would have: the question is asked against
-      # what is LIVE, BASE (the commit of the most recent successful `production` deployment record, resolved above; it
-      # moves once `migrate` succeeds, so after a failed deploy or health check recovery is a workflow_dispatch) vs this
-      # commit, worker/ only.
+      # what is LIVE, BASE (the commit of the most recent successful `production` or `production-destructive` deployment
+      # record, resolved above; it moves once `ship` succeeds, so after a failed ship, for example a failed health check,
+      # recovery is a workflow_dispatch) vs this commit, worker/ only.
       # A manual dispatch always deploys. Any git failure means deploy (a redundant deploy is idempotent and still behind
-      # the guard, the gate and the migrate approval; a missed one is silent). The later steps of this job run for a
+      # the guard, the gate and the approval of `ship`; a missed one is silent). The later steps of this job run for a
       # docs-only push too (they find nothing to check between BASE and the commit); the job output `deploy` is what
-      # `migrate` and `deploy` read.
+      # `ship` reads.
       - name: Anything to deploy (worker/ since BASE)
         id: scope
         if: steps.guard.outputs.deploy == 'true'
@@ -701,7 +719,7 @@ jobs:
             {
               echo "### Worker deploy: nothing to deploy"
               echo
-              echo "- \`worker/\` at \`$EVENT_SHA\` equals \`worker/\` at BASE \`$BASE_SHA\` (the last successful deployment to production)"
+              echo "- \`worker/\` at \`$EVENT_SHA\` equals \`worker/\` at BASE \`$BASE_SHA\` (the last successful deployment to production or production-destructive)"
             } >> "$GITHUB_STEP_SUMMARY"
           else
             if [ "$rc" -ne 1 ]; then
@@ -712,7 +730,7 @@ jobs:
           fi
 
       # Section 5.1 rule 5a, here and not only in CI: a direct push could bypass CI, and the check must fail before
-      # `migrate` is even offered for approval. Applied migrations are immutable: a file that exists in BASE and is
+      # `ship` is even offered for approval. Applied migrations are immutable: a file that exists in BASE and is
       # modified, renamed, deleted or changes type fails the run. A migration that was merged but never applied is
       # not affected (BASE..sha sees it as added and it is linted at its final content). Fix mistakes with a NEW
       # migration. No label bypasses this. A git failure fails the step (fail closed).
@@ -796,13 +814,13 @@ jobs:
             echo "- New migration files since BASE: ${#added[@]} (destructive: ${#destructive[@]})"
             for f in "${added[@]}"; do echo "  - \`$f\`"; done
             if [ "${#destructive[@]}" -gt 0 ]; then
-              echo "- DESTRUCTIVE (the owner's approval of \`production-destructive\` applies \`--approved\` to ALL pending files; the approval screen lists no files, so check this list and the pending list of \`migrate\` first):"
+              echo "- DESTRUCTIVE (the owner's approval of \`production-destructive\` applies \`--approved\` to ALL pending files; the approval screen lists no files, so check this list and the pending list of \`ship\` first):"
               for f in "${destructive[@]}"; do echo "  - \`$f\`"; done
             fi
-            echo "- \`migrate\` runs in the environment \`$environment\`"
-            echo "- The classification is advisory: \`migrate\` lists the pending migrations of the remote DB and re-lints them"
+            echo "- \`ship\` runs in the environment \`$environment\`"
+            echo "- The classification is advisory: \`ship\` lists the pending migrations of the remote DB and re-lints them"
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "migrate environment: $environment"
+          echo "ship environment: $environment"
 
       # #272: the subject line of the commit for the message of the Worker version ("GitHub Actions run <id>: <title>").
       # The title is UNTRUSTED text (anyone who can merge writes it; a squash merge takes it from the PR title). It is read
@@ -833,27 +851,43 @@ jobs:
           # Safe to print: only the charset above, and the fixed prefix means the line cannot start with a workflow command.
           echo "commit title: $title"
 
-  # Migrations (#202, design sections 5 and 12.2). Runs in the environment that `plan` computed: `production` (the
-  # new migrations are not destructive) or `production-destructive` (the owner is a required reviewer: the job
-  # WAITS for the approval and does not start when the owner rejects, so nothing is applied and `deploy` is skipped).
-  # `if:` accepts exactly those two names: an environment name that does not exist would be created by GitHub
-  # without protection, so nothing else is ever passed.
-  # This job always runs when a deploy is planned, also when `plan` saw no new migration file: the pending list of
-  # the remote DB is the authority (a hand-applied migration is not pending, a merged-but-never-applied one is), and
-  # "nothing pending" is a green no-op. Pending files are re-linted explicitly: WITHOUT --approved in `production`
-  # (a destructive file that `plan` did not route fails closed), with --approved only in `production-destructive`.
-  # A Time Travel bookmark is read BEFORE applying and written to the summary with the restore command; if it cannot
-  # be read nothing is applied. wrangler 4.149.0 applies migration after migration (each file plus the insert into
-  # d1_migrations as one query) and stops at the first error: the job fails, `deploy` is skipped. Whether a file is
-  # atomic on D1 is not documented, so the bookmark is the recovery point (design section 5.2).
-  # While `migrate` waits for an approval the concurrency group is held: newer runs queue behind it (one pending run is
+  # SHIP (#312, owner decision of 2026-10-14: plan, ship, release). ONE job applies the D1 migrations and then deploys
+  # the Worker (it replaces the former jobs `migrate` and `deploy`; design sections 5 and 12.2, #202).
+  # ENVIRONMENT. It runs in the environment that `plan` computed: `production` (the new migrations are not destructive)
+  # or `production-destructive` (the owner is a required reviewer). The approval is a property of the JOB: GitHub
+  # holds the job before its first step until the reviewer approves, so with `production-destructive` NOTHING runs
+  # before the approval (no migration, no deploy), and a rejection or a timeout applies and deploys nothing. The job
+  # `plan` validates the output to exactly those two names (anything doubtful is `production-destructive`), and `if:`
+  # accepts exactly those two names too: an environment name that does not exist would be created by GitHub without
+  # protection, so nothing else is ever passed. Both environments hold the four secrets of this job
+  # (CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, D1_DATABASE_ID, WORKER_URL).
+  # ORDER RULE. The migration steps come first, the deploy steps second, in ONE job with default step semantics: a
+  # failed step stops the job, so a failed migration step means the Worker is never deployed. No step has
+  # continue-on-error, and the only steps that run after a failure are the two summary steps (`always()`), which only
+  # write the job summary. The Worker that is live between the migration and the deploy is the OLD code on the NEW
+  # schema, and a rollback of the Worker leaves the NEW schema under OLD code, so every migration must work with and
+  # without the code that uses it (design section 5.1 rule 2, as the indexes of #122).
+  # DEPLOYMENT RECORDS. GitHub writes one deployment record per job in its environment: a success in the environment
+  # `production` or `production-destructive` is what `plan` reads as BASE (step "Resolve BASE", both environments).
+  # A ship job that fails (for example the health check after a successful migration) writes no success record, so
+  # BASE does not move and the next run compares with the older commit again; recovery is a workflow_dispatch.
+  # MIGRATIONS. The job always runs when a deploy is planned, also when `plan` saw no new migration file: the pending
+  # list of the remote DB is the authority (a hand-applied migration is not pending, a merged-but-never-applied one
+  # is), and "nothing pending" is a green no-op. Pending files are re-linted explicitly: WITHOUT --approved in
+  # `production` (a destructive file that `plan` did not route fails closed), with --approved only in
+  # `production-destructive`. A Time Travel bookmark is read BEFORE applying and written to the summary with the
+  # restore command; if it cannot be read nothing is applied. wrangler 4.149.0 applies migration after migration (each
+  # file plus the insert into d1_migrations as one query) and stops at the first error: the step fails and so does the
+  # job. Whether a file is atomic on D1 is not documented, so the bookmark is the recovery point (design section 5.2).
+  # While `ship` waits for an approval the concurrency group is held: newer runs queue behind it (one pending run is
   # kept) and their BASE still contains the unapproved migration, so it stays routed to the approval.
-  migrate:
-    name: migrate
+  # Timeout: 40 minutes = the former 25 (migrate) + 15 (deploy); time spent waiting for an approval does not count.
+  ship:
+    name: ship
     needs: plan
     if: needs.plan.outputs.deploy == 'true' && (needs.plan.outputs.environment == 'production' || needs.plan.outputs.environment == 'production-destructive')
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     environment:
       name: ${{ needs.plan.outputs.environment }}
     permissions:
@@ -877,7 +911,9 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
-      # Same step as in `deploy` (section 4.2): validate, mask, substitute. Never printed.
+      # Section 4.2. Validate first (allowlist, whole value, nothing echoed), mask second, substitute third.
+      # wrangler.toml keeps its placeholder; wrangler.ci.toml (gitignored) lives next to it because wrangler resolves
+      # `main` and `migrations_dir` relative to the config file. Mode 600. Never printed. Used by every wrangler step below.
       - name: Write runner-local wrangler config
         env:
           D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
@@ -1112,66 +1148,10 @@ jobs:
             echo "Fix forward with a NEW migration, or restore the bookmark (design section 9.2); never edit an applied migration."
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # Needs `migrate` (ORDER RULE): `deploy` starts only after migrate finished successfully. A failed, rejected or
-  # cancelled migrate job skips this job; so does a skipped one (nothing here treats a skipped migrate as a no-op:
-  # when a deploy is planned `migrate` always runs and does its own "no pending migrations" no-op).
-  deploy:
-    name: deploy
-    needs: [plan, migrate]
-    if: needs.plan.outputs.deploy == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    environment: production
-    defaults:
-      run:
-        shell: bash
-        working-directory: worker
-    steps:
-      # Pins: section 6 audit table (full commit SHAs).
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 22
-          package-manager-cache: false # no cache at all (section 6)
-
-      # No secrets in this step's environment: install scripts of dependencies never see the token.
-      - name: Install dependencies
-        run: npm ci --ignore-scripts
-
-      # Section 4.2. Validate first (allowlist, whole value, nothing echoed), mask second, substitute third.
-      # wrangler.toml keeps its placeholder; wrangler.ci.toml (gitignored) lives next to it because wrangler resolves
-      # `main` and `migrations_dir` relative to the config file. Mode 600. Never printed.
-      - name: Write runner-local wrangler config
-        env:
-          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
-        run: |
-          node --input-type=module - <<'EOF'
-          const id = process.env.D1_DATABASE_ID ?? "";
-          if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) {
-            console.error("::error::D1_DATABASE_ID is missing or not a lowercase UUID");
-            process.exit(1);
-          }
-          EOF
-          echo "::add-mask::$D1_DATABASE_ID"
-          node --input-type=module - <<'EOF'
-          import { readFileSync, writeFileSync } from "node:fs";
-          const placeholder = "REPLACE_AFTER_d1_create";
-          const src = readFileSync("wrangler.toml", "utf8");
-          if (src.split(placeholder).length !== 2) {
-            console.error("::error::wrangler.toml must contain the D1 placeholder exactly once");
-            process.exit(1);
-          }
-          const out = src.replace(placeholder, () => process.env.D1_DATABASE_ID);
-          if (out.includes(placeholder)) {
-            console.error("::error::placeholder still present");
-            process.exit(1);
-          }
-          writeFileSync("wrangler.ci.toml", out, { mode: 0o600 });
-          console.log("runner-local config written");
-          EOF
+      # ---- The deploy half of the job. Reached only when every step above succeeded: no step above or below it has a
+      # condition that lets it run after a failure, except the two summary steps (they only write the job summary).
+      # The checkout, Node, install and wrangler config steps of the old `deploy` job were identical to the ones at the
+      # top of this job and are not repeated: wrangler.ci.toml written there is the one used by "Deploy" below.
 
       # Section 4.3. GitHub masks the exact secret string only, and wrangler may print the bare host or the account
       # subdomain, so the URL, its host and the account subdomain label are registered as separate masks BEFORE the
@@ -1348,9 +1328,9 @@ jobs:
   # the GitHub Release (generated notes) only for feat, fix, perf and breaking commits or on a manual dispatch.
   # Runs only on push to master and workflow_dispatch from master in this repository (never pull_request,
   # merge_group, fork) and only after the deploy chain is done: plan succeeded and EITHER nothing was to be deployed
-  # (migrate and deploy skipped by design) OR migrate and deploy both succeeded. A failed, cancelled or rejected
-  # migrate or deploy, a failed plan or a failed gate never releases. `!cancelled()` is needed because migrate and
-  # deploy are legitimately skipped when there is nothing to deploy (a skipped need would otherwise skip this job).
+  # (ship skipped by design) OR ship succeeded (its migration and deploy steps and the health check). A failed,
+  # cancelled or rejected ship, a failed plan or a failed gate never releases. `!cancelled()` is needed because ship is
+  # legitimately skipped when there is nothing to deploy (a skipped need would otherwise skip this job).
   # The ONLY job with contents: write (to create the tag and the Release through the REST API with the job's
   # GITHUB_TOKEN: no PAT, no push from a checkout, no environment, no deploy secret, nothing of Cloudflare). The group
   # worker-deploy of the workflow serializes it with the other pushes.
@@ -1364,8 +1344,8 @@ jobs:
   # fast merging not every commit gets a tag.
   release:
     name: release
-    needs: [changes, lint, tests, ci, version, plan, migrate, deploy]
-    if: ${{ !cancelled() && needs.ci.result == 'success' && needs.version.result == 'success' && needs.plan.result == 'success' && ((needs.plan.outputs.deploy != 'true' && needs.migrate.result == 'skipped' && needs.deploy.result == 'skipped') || (needs.plan.outputs.deploy == 'true' && needs.migrate.result == 'success' && needs.deploy.result == 'success')) && github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}
+    needs: [changes, lint, tests, ci, version, plan, ship]
+    if: ${{ !cancelled() && needs.ci.result == 'success' && needs.version.result == 'success' && needs.plan.result == 'success' && ((needs.plan.outputs.deploy != 'true' && needs.ship.result == 'skipped') || (needs.plan.outputs.deploy == 'true' && needs.ship.result == 'success')) && github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

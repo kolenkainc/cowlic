@@ -8,14 +8,33 @@ import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
-  PERMISSIONS, ciFailures, ciFile, createRunner, createSandbox, dynamicFailures, hostileTitleFailures, hostileTitles, mutations,
-  parsePermissions, permissionFailures, readText, staticFailures, steps, tamperCases,
+  PERMISSIONS, SHIP_STEPS, ciFailures, ciFile, createRunner, createSandbox, dynamicFailures, hostileTitleFailures, hostileTitles, jobBlock, mutations,
+  parsePermissions, permissionFailures, readText, shipFailures, staticFailures, stepHash, steps, tamperCases,
 } from "./lib.mjs";
+import { baseCaseFailures, baseCases, baseMutations, createBaseRunner, envCaseFailures, shipOrderCaseFailures, shipOrderCases } from "./ship.mjs";
 import { createReleaseRunner, createVersionRunner, hostileCases, releaseCaseFailures, releaseCases, releaseConditionFailures, releaseMutations, versionCaseFailures, versionCases, versionMutations } from "./release.mjs";
 import { changesCaseFailures, changesCases, changesMutations, createChangesRunner, createScopeRunner, scopeCaseFailures, scopeCases, scopeMutations } from "./changes.mjs";
 
 const ci = readText(ciFile);
 const original = ci; // the deploy jobs live in ci.yml
+
+// Mutation helpers on the steps of the job `ship` (the text of a step, from steps(), is contiguous in the file).
+const shipSteps = (t) => steps(jobBlock(t, "ship") ?? "");
+const dropStep = (t, name) => {
+  const s = shipSteps(t).find((x) => x.name === name);
+  return s ? t.replace(`${s.text}\n`, "") : t;
+};
+const moveStepBefore = (t, name, before) => {
+  const s = shipSteps(t).find((x) => x.name === name);
+  const b = shipSteps(t).find((x) => x.name === before);
+  if (!s || !b) return t;
+  return t.replace(`${s.text}\n`, "").replace(b.text, `${s.text}\n${b.text}`);
+};
+const swapSteps = (t, first, second) => {
+  const a = shipSteps(t).find((x) => x.name === first);
+  const b = shipSteps(t).find((x) => x.name === second);
+  return a && b ? t.replace(`${a.text}\n${b.text}`, `${b.text}\n${a.text}`) : t;
+};
 let sandbox;
 let runner;
 
@@ -86,23 +105,23 @@ describe("workflow permissions are exact", () => {
     ["ci.yml", "append id-token: write at top level", appendTop("id-token: write")],
     ["ci.yml", "top-level contents: write", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, "permissions:\n  contents: write\n")],
     ["ci.yml", "top-level write-all (inline form, parser fails closed)", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, "permissions: write-all\n")],
-    ["ci.yml", "add contents: write to a job that has no block (deploy)", addJobBlock("deploy", ["contents: write"])],
-    ["ci.yml", "widen checks to write in a job that has none (deploy)", addJobBlock("deploy", ["checks: write"])],
+    ["ci.yml", "add contents: write to a job that has no block (ship has contents: read)", addJobBlock("ship", ["contents: write"])],
+    ["ci.yml", "widen checks to write in a job that has none (ship)", addJobBlock("ship", ["checks: write"])],
     ["ci.yml", "add contents: write to a job that has no block (version)", addJobBlock("version", ["contents: write"])],
     ["ci.yml", "add contents: write to a job that has no block (lint)", addJobBlock("lint", ["contents: write"])],
     ["ci.yml", "add checks: write to the gate (ci), which has no block", addJobBlock("ci", ["checks: write"])],
     ["ci.yml", "contents: write in the tests job", (t) => t.replace("      contents: read\n      checks: write\n", "      contents: write\n      checks: write\n")],
     ["ci.yml", "add pull-requests: write to the tests job", (t) => t.replace("      checks: write\n", "      checks: write\n      pull-requests: write\n")],
     ["ci.yml", "widen pull-requests to write in plan", (t) => t.replace("      pull-requests: read", "      pull-requests: write")],
-    ["ci.yml", "widen contents to write in migrate", (t) => t.replace(/^( {2}migrate:\n[\s\S]*?\n {4}permissions:\n {6}contents: )read/m, "$1write")],
+    ["ci.yml", "widen contents to write in ship", (t) => t.replace(/^( {2}ship:\n[\s\S]*?\n {4}permissions:\n {6}contents: )read/m, "$1write")],
 
     // Valid YAML that a naive line parser misses (review of #297): each must still be caught, on the real files.
     ["ci.yml", "blank line inside the top-level block, then id-token: write", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, (m) => `${m}\n  id-token: write\n`)],
     ["ci.yml", "blank line inside the top-level block, then id-token: write", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, (m) => `${m}\n  id-token: write\n`)],
-    ["ci.yml", "blank line inside the migrate block, then packages: write", (t) => t.replace(/^( {2}migrate:\n[\s\S]*?\n {4}permissions:\n {6}contents: read\n)/m, (m) => `${m}\n      packages: write\n`)],
+    ["ci.yml", "blank line inside the ship block, then packages: write", (t) => t.replace(/^( {2}ship:\n[\s\S]*?\n {4}permissions:\n {6}contents: read\n)/m, (m) => `${m}\n      packages: write\n`)],
     ["ci.yml", "blank line inside the tests block, then pull-requests: write", (t) => t.replace("      checks: write\n", "      checks: write\n\n      pull-requests: write\n")],
-    ["ci.yml", 'quoted key "permissions": in a job without a block', (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    "permissions":\n      contents: write\n`)],
-    ["ci.yml", "single-quoted key 'permissions': in a job without a block", (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    'permissions':\n      contents: write\n`)],
+    ["ci.yml", 'quoted key "permissions": in a job without a block', (t) => t.replace(/^ {2}ship:\n/m, (m) => `${m}    "permissions":\n      contents: write\n`)],
+    ["ci.yml", "single-quoted key 'permissions': in a job without a block", (t) => t.replace(/^ {2}ship:\n/m, (m) => `${m}    'permissions':\n      contents: write\n`)],
     ["ci.yml", "space before the colon (permissions :) in a job without a block", (t) => t.replace(/^ {2}version:\n/m, (m) => `${m}    permissions :\n      contents: write\n`)],
     ["ci.yml", "flow-style job as the FIRST entry under jobs:", (t) => t.replace(/^jobs:\n/m, (m) => `${m}  evil: {runs-on: ubuntu-latest, permissions: {contents: write}, steps: []}\n`)],
     ["ci.yml", "quoted job id as the FIRST entry under jobs:", (t) => t.replace(/^jobs:\n/m, (m) => `${m}  "evil":\n    permissions:\n      contents: write\n`)],
@@ -110,19 +129,19 @@ describe("workflow permissions are exact", () => {
     ["ci.yml", "second top-level permissions key (quoted duplicate)", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, (m) => `${m}"permissions":\n  contents: write\n`)],
     ["ci.yml", "second top-level permissions key (plain duplicate)", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, (m) => `${m}permissions:\n  contents: write\n`)],
     ["ci.yml", "YAML anchor on the top-level block", (t) => t.replace(/^permissions:\n/m, "x-perms: &p\n  id-token: write\npermissions:\n")],
-    ["ci.yml", "alias as a job's permissions", (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    permissions: *p\n`)],
-    ["ci.yml", "merge key in a job block", (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    permissions:\n      <<: *p\n`)],
+    ["ci.yml", "alias as a job's permissions", (t) => t.replace(/^ {2}ship:\n/m, (m) => `${m}    permissions: *p\n`)],
+    ["ci.yml", "merge key in a job block", (t) => t.replace(/^ {2}ship:\n/m, (m) => `${m}    permissions:\n      <<: *p\n`)],
     ["ci.yml", "tab indentation in the top-level block", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, "permissions:\n\tcontents: read\n")],
 
     // #290 parser hardening: case variants, complex keys, YAML-escaped keys (each a way to hide or rename a scope).
     ["ci.yml", "case variant Permissions: in a job without a block", (t) => t.replace(/^ {2}version:\n/m, (m) => `${m}    Permissions:\n      contents: write\n`)],
-    ["ci.yml", "case variant PERMISSIONS: in a job without a block", (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    PERMISSIONS:\n      contents: write\n`)],
+    ["ci.yml", "case variant PERMISSIONS: in a job without a block", (t) => t.replace(/^ {2}ship:\n/m, (m) => `${m}    PERMISSIONS:\n      contents: write\n`)],
     ["ci.yml", "case variant PERMISSIONS: instead of the top-level key", (t) => t.replace(/^permissions:\n/m, "PERMISSIONS:\n")],
     ["ci.yml", "case variant Permissions: as a second top-level key", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, (m) => `${m}Permissions:\n  contents: write\n`)],
-    ["ci.yml", "complex key `? permissions` in a job without a block", (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    ? permissions\n    : {contents: write}\n`)],
+    ["ci.yml", "complex key `? permissions` in a job without a block", (t) => t.replace(/^ {2}ship:\n/m, (m) => `${m}    ? permissions\n    : {contents: write}\n`)],
     ["ci.yml", "complex key `? permissions` as a second top-level key", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, (m) => `${m}? permissions\n: {contents: write}\n`)],
     ["ci.yml", "YAML-escaped key (x70) in a job without a block", (t) => t.replace(/^ {2}version:\n/m, (m) => `${m}    "\\x70ermissions":\n      contents: write\n`)],
-    ["ci.yml", "YAML-escaped key (u0069) in a job without a block", (t) => t.replace(/^ {2}deploy:\n/m, (m) => `${m}    "perm\\u0069ssions":\n      contents: write\n`)],
+    ["ci.yml", "YAML-escaped key (u0069) in a job without a block", (t) => t.replace(/^ {2}ship:\n/m, (m) => `${m}    "perm\\u0069ssions":\n      contents: write\n`)],
     ["ci.yml", "YAML-escaped key in flow style on one line", (t) => t.replace(/^ {2}version:\n/m, (m) => `${m}    {"\\x70ermissions": {contents: write}}\n`)],
     ["ci.yml", "case variant and escape together (Perm x69 ssions)", (t) => t.replace(/^ {2}version:\n/m, (m) => `${m}    "Perm\\x69ssions":\n      contents: write\n`)],
   ];
@@ -229,7 +248,7 @@ describe("ci.yml reports `ci` on pull_request, push and merge_group (#290, #292)
     ["a dispatch from any ref joins the deploy group (could replace a pending deploy run)", (t) => t.replace("github.ref == 'refs/heads/master' && (github.event_name == 'push'", "(github.event_name == 'push'")],
     ["the group of the other events drops the event name (queue and PR runs could collide)",(t) => t.replace("format('ci-{0}-{1}', github.event_name, ", "format('ci-{0}-{1}', 'x', ")],
     ["dispatch not in the deploy group", (t) => t.replace(" || github.event_name == 'workflow_dispatch') && 'worker-deploy'", ") && 'worker-deploy'")],
-    ["job-level concurrency group on deploy (deadlocks with the workflow group)", (t) => t.replace("  deploy:\n    name: deploy\n", "  deploy:\n    name: deploy\n    concurrency:\n      group: worker-deploy\n      cancel-in-progress: false\n")],
+    ["job-level concurrency group on ship (deadlocks with the workflow group)", (t) => t.replace("  ship:\n    name: ship\n", "  ship:\n    name: ship\n    concurrency:\n      group: worker-deploy\n      cancel-in-progress: false\n")],
     ["job-level concurrency group on plan", (t) => t.replace("  plan:\n    name: plan\n", "  plan:\n    name: plan\n    concurrency:\n      group: worker-deploy\n      cancel-in-progress: false\n")],
     // Secrets only in migrate and deploy (review of #306): not at workflow level, not in any other job, in any form.
     ["workflow-level env with a secret", (t) => t.replace("\nconcurrency:\n", "\nenv:\n  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}\n\nconcurrency:\n")],
@@ -244,10 +263,39 @@ describe("ci.yml reports `ci` on pull_request, push and merge_group (#290, #292)
     ["the scope step is removed (renamed)", (t) => t.replace("Anything to deploy (worker/ since BASE)", "Something else")],
     ["plan without the gate result in its condition", (t) => t.replace("needs.ci.result == 'success' && ", "")],
     ["plan without !cancelled()", (t) => t.replace("${{ !cancelled() && needs.ci.result", "${{ needs.ci.result")],
-    // The deploy jobs (#290 part 2, #287): the graph, the conditions, the group, secrets only in migrate and deploy.
-    ["deploy job without needs", (t) => t.replace("    needs: [plan, migrate]\n", "")],
-    ["deploy needs only plan (can start without migrate)", (t) => t.replace("needs: [plan, migrate]", "needs: [plan]")],
-    ["migrate without needs", (t) => t.replace("  migrate:\n    name: migrate\n    needs: plan\n", "  migrate:\n    name: migrate\n")],
+    // The deploy jobs (#290 part 2, #287, #312): the graph, the conditions, the group, secrets only in ship.
+    ["ship job without needs", (t) => t.replace("  ship:\n    name: ship\n    needs: plan\n", "  ship:\n    name: ship\n")],
+    ["ship needs the gate instead of plan (no environment, no deploy decision)", (t) => t.replace("  ship:\n    name: ship\n    needs: plan\n", "  ship:\n    name: ship\n    needs: ci\n")],
+    ["the old job migrate is back next to ship", (t) => t.replace("  ship:\n    name: ship\n", "  migrate:\n    name: migrate\n    needs: plan\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n\n  ship:\n    name: ship\n")],
+    ["a ship reference to needs.deploy", (t) => t.replace("needs.plan.outputs.deploy == 'true' && (needs.plan.outputs.environment == 'production' ||", "needs.deploy.result != 'x' && needs.plan.outputs.deploy == 'true' && (needs.plan.outputs.environment == 'production' ||")],
+    // ship (#312): environment, condition, reachability, failure semantics, order.
+    ["ship without an environment (no approval gate, no secrets)", (t) => t.replace("  ship:\n    name: ship\n    needs: plan\n    if: needs.plan.outputs.deploy == 'true' && (needs.plan.outputs.environment == 'production' || needs.plan.outputs.environment == 'production-destructive')\n    runs-on: ubuntu-latest\n    timeout-minutes: 40\n    environment:\n      name: ${{ needs.plan.outputs.environment }}\n", "  ship:\n    name: ship\n    needs: plan\n    if: needs.plan.outputs.deploy == 'true' && (needs.plan.outputs.environment == 'production' || needs.plan.outputs.environment == 'production-destructive')\n    runs-on: ubuntu-latest\n    timeout-minutes: 40\n")],
+    ["ship with a static environment production (the destructive approval is bypassed)", (t) => t.replace("    environment:\n      name: ${{ needs.plan.outputs.environment }}\n", "    environment: production\n")],
+    ["ship with a static environment production-destructive", (t) => t.replace("    environment:\n      name: ${{ needs.plan.outputs.environment }}\n", "    environment: production-destructive\n")],
+    ["plan environment output not validated (the raw classify output)", (t) => t.replace("      environment: ${{ steps.classify.outputs.environment == 'production' && 'production' || 'production-destructive' }}", "      environment: ${{ steps.classify.outputs.environment }}")],
+    ["plan environment output fails open (production on doubt)", (t) => t.replace("&& 'production' || 'production-destructive' }}", "&& 'production-destructive' || 'production' }}")],
+    ["plan environment output compares with the wrong literal", (t) => t.replace("steps.classify.outputs.environment == 'production' &&", "steps.classify.outputs.environment != '' &&")],
+    ["ship reachable on pull_request", (t) => t.replace("    if: needs.plan.outputs.deploy == 'true' && (needs.plan.outputs.environment", "    if: github.event_name == 'pull_request' || needs.plan.outputs.deploy == 'true' && (needs.plan.outputs.environment")],
+    ["ship reachable on merge_group", (t) => t.replace("    if: needs.plan.outputs.deploy == 'true' && (needs.plan.outputs.environment", "    if: github.event_name == 'merge_group' || needs.plan.outputs.deploy == 'true' && (needs.plan.outputs.environment")],
+    ["ship without the deploy decision of plan", (t) => t.replace("    if: needs.plan.outputs.deploy == 'true' && (needs.plan.outputs.environment == 'production' || needs.plan.outputs.environment == 'production-destructive')\n    runs-on: ubuntu-latest\n    timeout-minutes: 40", "    if: (needs.plan.outputs.environment == 'production' || needs.plan.outputs.environment == 'production-destructive')\n    runs-on: ubuntu-latest\n    timeout-minutes: 40")],
+    ["ship step Deploy with if: always() (deploys after a failed migration)", (t) => t.replace("      - name: Deploy\n        id: deploy\n", "      - name: Deploy\n        id: deploy\n        if: always()\n")],
+    ["ship step Apply migrations with if: always()", (t) => t.replace("      - name: Apply migrations\n        id: apply\n", "      - name: Apply migrations\n        id: apply\n        if: always()\n")],
+    ["ship step Mask the Worker URL with if: ${{ !cancelled() }}", (t) => t.replace("      - name: Mask the Worker URL\n", "      - name: Mask the Worker URL\n        if: ${{ !cancelled() }}\n")],
+    ["ship step Apply migrations with continue-on-error", (t) => t.replace("      - name: Apply migrations\n        id: apply\n", "      - name: Apply migrations\n        id: apply\n        continue-on-error: true\n")],
+    ["ship step Verify nothing is pending with continue-on-error", (t) => t.replace("      - name: Verify nothing is pending\n        id: verify\n", "      - name: Verify nothing is pending\n        id: verify\n        continue-on-error: true\n")],
+    ["ship step Time Travel bookmark removed", (t) => dropStep(t, "Time Travel bookmark")],
+    ["ship step Verify nothing is pending removed", (t) => dropStep(t, "Verify nothing is pending")],
+    ["ship step Health check removed", (t) => dropStep(t, "Health check")],
+    ["ship step Lint the pending migrations removed", (t) => dropStep(t, "Lint the pending migrations")],
+    ["ship: Deploy moved before List pending migrations (deploy before migrate)", (t) => moveStepBefore(t, "Deploy", "List pending migrations")],
+    ["ship: Apply migrations moved after Deploy", (t) => moveStepBefore(t, "Apply migrations", "Read the deployed version id")],
+    ["ship: Time Travel bookmark and Record the bookmark swapped", (t) => swapSteps(t, "Time Travel bookmark", "Record the bookmark")],
+    ["ship: Mask the Worker URL and Deploy swapped", (t) => swapSteps(t, "Mask the Worker URL", "Deploy")],
+    ["ship step run block edited (the health check passes anything)", (t) => t.replace('if (res.status === 200 && sr && sr.status === "failed" && sr.error && sr.error.code === 40) {', "if (true) {")],
+    ["ship step run block edited (apply with --force-like flag)", (t) => t.replace("npx wrangler d1 migrations apply cowlic --remote -c wrangler.ci.toml", "npx wrangler d1 migrations apply cowlic --remote -c wrangler.ci.toml --x")],
+    ["ship with a new step between migrate and deploy", (t) => t.replace("      - name: Mask the Worker URL\n", "      - name: Extra\n        run: echo hi\n\n      - name: Mask the Worker URL\n")],
+    ["ship timeout changed", (t) => t.replace("    timeout-minutes: 40\n", "    timeout-minutes: 400\n")],
+    ["ship with a secret removed (WORKER_URL not read)", (t) => t.replaceAll("secrets.WORKER_URL", "vars.WORKER_URL")],
     ["plan without the gate in needs (deploy without lint, tests and ci)", (t) => t.replace("needs: [changes, lint, tests, ci]", "needs: [changes]")],
     ["plan without the repository condition (forks)", (t) => t.replace("github.repository == 'kolenkainc/cowlic' && ", "")],
     ["plan without the master ref condition", (t) => t.replace("github.ref == 'refs/heads/master' && ", "")],
@@ -256,19 +304,18 @@ describe("ci.yml reports `ci` on pull_request, push and merge_group (#290, #292)
     ["plan on merge_group too", (t) => t.replace("(github.event_name == 'workflow_dispatch' ||", "(github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' ||")],
     ["plan with an extra job-level if", (t) => t.replace("  plan:\n    name: plan\n", "  plan:\n    name: plan\n    if: ${{ true }}\n")],
     ["plan with an environment", (t) => t.replace("  plan:\n    name: plan\n", "  plan:\n    name: plan\n    environment: production\n")],
-    ["deploy without an environment", (t) => t.replace("    environment: production\n", "")],
-    ["migrate without its environment", (t) => t.replace("    environment:\n      name: ${{ needs.plan.outputs.environment }}\n", "")],
     ["a cancellable job in the deploy group", (t) => t.replace("  lint:\n    name: lint\n", "  lint:\n    name: lint\n    concurrency:\n      group: worker-deploy\n      cancel-in-progress: true\n")],
     ["secrets used in plan (outside an environment)", (t) => t.replace("      - name: Commit title\n        id: title\n", "      - name: Commit title\n        id: title\n        env:\n          X: ${{ secrets.CLOUDFLARE_API_TOKEN }}\n")],
     ["secrets used in the tests job", (t) => t.replace("      - name: Migration lint tests\n", "      - name: Migration lint tests\n        env:\n          X: ${{ secrets.WORKER_URL }}\n")],
-    ["contents: write on the deploy job", (t) => t.replace("  deploy:\n    name: deploy\n", "  deploy:\n    name: deploy\n    permissions:\n      contents: write\n")],
-    ["plain npm ci with install scripts in deploy", (t) => t.replace(/(  deploy:\n[\s\S]*?)npm ci --ignore-scripts/m, "$1npm ci")],
+    ["contents: write on the ship job", (t) => t.replace("    permissions:\n      contents: read\n    defaults:\n      run:\n        shell: bash\n        working-directory: worker\n    steps:\n      # Pins: section 6 audit table (full commit SHAs). Depth 1", "    permissions:\n      contents: write\n    defaults:\n      run:\n        shell: bash\n        working-directory: worker\n    steps:\n      # Pins: section 6 audit table (full commit SHAs). Depth 1")],
+    ["ship without its permissions block", (t) => t.replace("    permissions:\n      contents: read\n    defaults:\n      run:\n        shell: bash\n        working-directory: worker\n    steps:\n      # Pins: section 6 audit table (full commit SHAs). Depth 1", "    defaults:\n      run:\n        shell: bash\n        working-directory: worker\n    steps:\n      # Pins: section 6 audit table (full commit SHAs). Depth 1")],
+    ["plain npm ci with install scripts in ship", (t) => t.replace(/(  ship:\n[\s\S]*?)npm ci --ignore-scripts/m, "$1npm ci")],
     ["a new unreviewed job", (t) => `${t}\n  extra:\n    name: extra\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n`],
     // The release job (#290 part 3).
     ["release job removed", (t) => t.replace(/^ {2}release:\n[\s\S]*$/m, "")],
-    ["release without needs", (t) => t.replace("    needs: [changes, lint, tests, ci, version, plan, migrate, deploy]\n", "")],
-    ["release not needing deploy", (t) => t.replace("needs: [changes, lint, tests, ci, version, plan, migrate, deploy]", "needs: [changes, lint, tests, ci, version, plan]")],
-    ["release without needs.version", (t) => t.replace("needs: [changes, lint, tests, ci, version, plan, migrate, deploy]", "needs: [changes, lint, tests, ci, plan, migrate, deploy]")],
+    ["release without needs", (t) => t.replace("    needs: [changes, lint, tests, ci, version, plan, ship]\n", "")],
+    ["release not needing ship", (t) => t.replace("needs: [changes, lint, tests, ci, version, plan, ship]", "needs: [changes, lint, tests, ci, version, plan]")],
+    ["release without needs.version", (t) => t.replace("needs: [changes, lint, tests, ci, version, plan, ship]", "needs: [changes, lint, tests, ci, plan, ship]")],
     ["release without needs.version.result in its condition", (t) => t.replace(" && needs.version.result == 'success' && needs.plan.result", " && needs.plan.result")],
     ["release when the version job failed or was skipped (any result accepted)", (t) => t.replace("needs.version.result == 'success'", "needs.version.result != 'cancelled'")],
     ["release installing GitVersion again (a tool in the write-token job)", (t) => t.replace("      - name: Tag and release\n", "      - name: Install GitVersion.Tool\n        run: |\n          dotnet tool install GitVersion.Tool --tool-path \"$RUNNER_TEMP/gitversion\" --version 6.8.2\n\n      - name: Tag and release\n")],
@@ -283,14 +330,16 @@ describe("ci.yml reports `ci` on pull_request, push and merge_group (#290, #292)
     ["release with contents: write at workflow level", (t) => t.replace(/^permissions:\n {2}contents: read\n/m, "permissions:\n  contents: write\n")],
     ["release without its write permission", (t) => t.replace("    permissions:\n      contents: write\n", "")],
     ["release with an extra scope", (t) => t.replace("      contents: write\n", "      contents: write\n      id-token: write\n")],
-    ["contents: write on the deploy job as well", (t) => t.replace("  deploy:\n    name: deploy\n", "  deploy:\n    name: deploy\n    permissions:\n      contents: write\n")],
+    ["contents: write on the ship job as well (a second write scope)", (t) => t.replace("  ship:\n    name: ship\n", "  ship:\n    name: ship\n    permissions:\n      contents: write\n")],
     ["release with an environment", (t) => t.replace("  release:\n    name: release\n", "  release:\n    name: release\n    environment: production\n")],
     ["release on pull_request too", (t) => t.replace("(github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}\n    runs-on: ubuntu-24.04", "(github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}\n    runs-on: ubuntu-24.04")],
     ["release on merge_group too", (t) => t.replace("github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}\n    runs-on: ubuntu-24.04", "github.ref == 'refs/heads/master' && (github.event_name != 'pull_request') }}\n    runs-on: ubuntu-24.04")],
     ["release without the repository condition", (t) => t.replace(" && github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}\n    runs-on: ubuntu-24.04", " && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}\n    runs-on: ubuntu-24.04")],
     ["release without the master ref condition", (t) => t.replace(" && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}\n    runs-on: ubuntu-24.04", " && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}\n    runs-on: ubuntu-24.04")],
-    ["release tagging on a failed deploy (deploy result not checked)", (t) => t.replace(" && needs.deploy.result == 'success')) && github.repository", ")) && github.repository")],
-    ["release after a failed or cancelled migrate", (t) => t.replace("needs.migrate.result == 'success' && ", "")],
+    ["release after a failed ship (ship result not checked)", (t) => t.replace("needs.plan.outputs.deploy == 'true' && needs.ship.result == 'success')", "needs.plan.outputs.deploy == 'true')")],
+    ["release after a failed or cancelled ship (anything but failure accepted)", (t) => t.replace("needs.ship.result == 'success')", "needs.ship.result != 'failure')")],
+    ["release when ship was skipped although a deploy was planned", (t) => t.replace("needs.plan.outputs.deploy == 'true' && needs.ship.result == 'success')", "needs.plan.outputs.deploy == 'true' && needs.ship.result != 'cancelled' && needs.ship.result != 'failure')")],
+    ["release when ship ran although nothing was to be deployed", (t) => t.replace("needs.plan.outputs.deploy != 'true' && needs.ship.result == 'skipped')", "needs.plan.outputs.deploy != 'true')")],
     ["release when plan failed or was skipped", (t) => t.replace("needs.plan.result == 'success' && ", "")],
     ["release without the gate", (t) => t.replace("needs.ci.result == 'success' && needs.version.result", "needs.version.result")],
     ["release without !cancelled() (skipped by design would skip it)", (t) => t.replace("${{ !cancelled() && needs.ci.result == 'success' && needs.version.result", "${{ needs.ci.result == 'success' && needs.version.result")],
@@ -378,15 +427,71 @@ describe("ci.yml: the release job", () => {
     expect(all.flatMap((c) => releaseCaseFailures(runner, c)).length).toBeGreaterThan(0);
   });
   it("condition mutations are caught by the evaluator as well", () => {
-    const failedDeploy = ci.replace(" && needs.deploy.result == 'success')) && github.repository", ")) && github.repository");
-    expect(failedDeploy).not.toBe(ci);
-    expect(releaseConditionFailures(failedDeploy).length).toBeGreaterThan(0);
+    const failedShip = ci.replace("needs.plan.outputs.deploy == 'true' && needs.ship.result == 'success')", "needs.plan.outputs.deploy == 'true')");
+    expect(failedShip).not.toBe(ci);
+    expect(releaseConditionFailures(failedShip).length).toBeGreaterThan(0);
     const noCancel = ci.replace("${{ !cancelled() && needs.ci.result == 'success' && needs.version.result", "${{ needs.ci.result == 'success' && needs.version.result");
     expect(noCancel).not.toBe(ci);
     expect(releaseConditionFailures(noCancel).length).toBeGreaterThan(0);
     const noVersion = ci.replace(" && needs.version.result == 'success' && needs.plan.result", " && needs.plan.result");
     expect(noVersion).not.toBe(ci);
     expect(releaseConditionFailures(noVersion).length).toBeGreaterThan(0);
+  });
+});
+
+// The job `ship` (#312): the former migrate and deploy in one job.
+describe("ci.yml: the job ship", () => {
+  it("the static controls of ship hold (needs, condition, environment, order, byte-identical steps, secrets)", () => {
+    expect(shipFailures(ci)).toEqual([]);
+  });
+  it("every step of ship is the byte-identical step of the former migrate/deploy jobs (fingerprints, in order)", () => {
+    const got = steps(jobBlock(ci, "ship")).map((s) => [s.name, stepHash(s)]);
+    expect(got).toEqual(SHIP_STEPS);
+  });
+  describe("the plan output environment is exactly production or production-destructive", () => {
+    it("every case", () => {
+      expect(envCaseFailures(ci)).toEqual([]);
+    });
+    it("a weakened expression is caught by the cases", () => {
+      const raw = ci.replace("environment: ${{ steps.classify.outputs.environment == 'production' && 'production' || 'production-destructive' }}", "environment: ${{ steps.classify.outputs.environment }}");
+      expect(raw).not.toBe(ci);
+      expect(envCaseFailures(raw).length).toBeGreaterThan(0);
+      const open = ci.replace("&& 'production' || 'production-destructive' }}", "&& 'production-destructive' || 'production' }}");
+      expect(open).not.toBe(ci);
+      expect(envCaseFailures(open).length).toBeGreaterThan(0);
+    });
+  });
+  describe("a failed migration step stops the job before the deploy steps (step conditions)", () => {
+    it.each(shipOrderCases.map((c) => [c[0], c]))("%s", (_name, c) => {
+      expect(shipOrderCaseFailures(ci, c)).toEqual([]);
+    });
+    it.each([
+      ["Deploy with if: always()", (t) => t.replace("      - name: Deploy\n        id: deploy\n", "      - name: Deploy\n        id: deploy\n        if: always()\n")],
+      ["Mask the Worker URL with !cancelled()", (t) => t.replace("      - name: Mask the Worker URL\n", "      - name: Mask the Worker URL\n        if: ${{ !cancelled() }}\n")],
+      ["Health check with failure()", (t) => t.replace("      - name: Health check\n        id: health\n", "      - name: Health check\n        id: health\n        if: always()\n")],
+      ["Deploy with an if that ignores the migration (steps.apply.outcome != 'failure' and a status function)", (t) => t.replace("      - name: Deploy\n        id: deploy\n", "      - name: Deploy\n        id: deploy\n        if: ${{ always() && steps.apply.outcome != 'failure' }}\n")],
+    ])("the model catches a step that can run after a failure: %s", (_label, fn) => {
+      const mutated = fn(ci);
+      expect(mutated).not.toBe(ci);
+      expect(shipOrderCases.flatMap((c) => shipOrderCaseFailures(mutated, c)).length).toBeGreaterThan(0);
+    });
+  });
+});
+
+// The step "Resolve BASE" of plan: BASE from the most recent successful deployment of EITHER environment (#312).
+describe("ci.yml: Resolve BASE reads production and production-destructive", () => {
+  let baseRunner;
+  beforeAll(() => {
+    baseRunner = createBaseRunner(ci, sandbox);
+  });
+  it.each(baseCases.map((c) => [c[0], c]))("%s", (_name, c) => {
+    expect(baseCaseFailures(baseRunner, c)).toEqual([]);
+  });
+  it.each(baseMutations)("mutation is caught: %s", (name, fn) => {
+    const mutated = fn(ci);
+    expect(mutated, `the mutation pattern was not found: ${name}`).not.toBe(ci);
+    const runner = createBaseRunner(mutated, sandbox);
+    expect(baseCases.flatMap((c) => baseCaseFailures(runner, c)).length).toBeGreaterThan(0);
   });
 });
 
