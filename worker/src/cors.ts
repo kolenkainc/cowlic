@@ -18,7 +18,7 @@ function allowedOrigin(request: Request): string | null {
 function appendVaryOrigin(headers: Headers): void {  const vary = headers.get("vary");
   if (vary === null) headers.set("vary", "Origin");
   else if (vary.trim() !== "*" && !vary.split(",").some((v) => v.trim().toLowerCase() === "origin")) {
-    headers.set("vary", `${vary}`);
+    headers.set("vary", `${vary}, Origin`);
   }
 }
 

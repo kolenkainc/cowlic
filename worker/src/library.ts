@@ -85,7 +85,7 @@ const int = (v: string | null, def: number, max: number) =>
   Math.min(Math.max(Number.parseInt(v ?? "", 10) || def, 0), max);
 
 const MAX_PAGE = 500; // largest page size honoured (size / *Count)
-const MAX_OFFSET = 1_000_000_000; // offsets must not be clamped to the page size, or clients cannot page past it
+const MAX_OFFSET = 1_000_000; // offsets must not be clamped to the page size, or clients cannot page past it
 
 // The aggregate / join work (song counts, artist names) is done only for the rows of one page: the page is
 // picked first from a narrow subquery (id only, index-friendly), then joined. Reads stay proportional to the

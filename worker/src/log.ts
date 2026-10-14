@@ -34,8 +34,8 @@ export interface LogFields {
 }
 
 function errorClass(e: unknown): string {
-  const name = e instanceof Error ? e.message : "unknown";
-  return name;
+  const name = e instanceof Error ? e.name : "unknown";
+  return /^[A-Za-z0-9_]{1,40}$/.test(name) ? name : "unknown";
 }
 
 export function logEvent(event: LogEvent, f: LogFields): void {
