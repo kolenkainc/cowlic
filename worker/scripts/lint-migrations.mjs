@@ -56,7 +56,7 @@ const MAX_FINDINGS_PRINTED = 200;
 const PREFIX = 'lint-migrations: ';
 
 const R = {
-  DROP: 'drop',
+  DROP: 'drop-DISABLED-MUTATION',
   DROP_COLUMN: 'drop-column',
   RENAME: 'rename',
   TRUNCATE: 'truncate',
