@@ -5,6 +5,7 @@
 // and the hostile / tampered cases. Every function returns a list of failure strings (empty = ok), so the same logic
 // serves the real file and the in-memory mutations that must be caught.
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -81,8 +82,8 @@ export const PERMISSIONS = {
       version: null,
       ci: null,
       plan: { contents: "read", "pull-requests": "read", deployments: "read" },
-      migrate: { contents: "read" },
-      deploy: null,
+      // #312: migrate and deploy are one job, in the environment chosen by plan (contents: read, like migrate was).
+      ship: { contents: "read" },
       // The ONLY job with a write scope: it creates the tag and the Release with the job's GITHUB_TOKEN (#290 part 3).
       release: { contents: "write" },
     },
@@ -221,8 +222,9 @@ function stepFailures(text) {
   return f;
 }
 
-// --- static controls of the deploy jobs (plan, migrate, deploy) of ci.yml (was worker-deploy.yml, #290 part 2)
-const DEPLOY_JOBS = ["plan", "migrate", "deploy"];
+// --- static controls of the deploy jobs (plan, ship) of ci.yml (was worker-deploy.yml, #290 part 2; ship = the former
+// migrate and deploy, #312)
+const DEPLOY_JOBS = ["plan", "ship"];
 const code = (t) => t.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
 const PLAN_IF = "    if: ${{ !cancelled() && needs.ci.result == 'success' && github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}";
 const PLAN_DEPLOY_OUTPUT = "      deploy: ${{ steps.guard.outputs.deploy == 'true' && steps.scope.outputs.deploy == 'true' && 'true' || 'false' }}";
@@ -234,7 +236,7 @@ export function staticFailures(text) {
     if (/CLOUDFLARE_API_TOKEN: /.test(s.text) && !(s.run ?? "").includes("wrangler")) f.push(`token in a step without wrangler: ${s.name}`);
   }
   // The install steps of the jobs WITH secrets: no env, no install scripts (the other jobs use plain `npm ci`).
-  for (const id of ["migrate", "deploy"]) {
+  for (const id of ["ship"]) {
     for (const s of steps(jobBlock(text, id) ?? "")) {
       if (s.name === "Install dependencies" && /^ {8}env:/m.test(s.text)) f.push(`env on the install step of ${id}`);
       if (s.name === "Install dependencies" && !s.text.includes("npm ci --ignore-scripts")) f.push(`install without --ignore-scripts in ${id}`);
@@ -253,12 +255,7 @@ export function staticFailures(text) {
   if (!scope) f.push("plan has no step Anything to deploy");
   else if (!/^ {8}id: scope$/m.test(scope.text) || !/^ {8}if: steps\.guard\.outputs\.deploy == 'true'$/m.test(scope.text)) f.push("the scope step has not the id scope and the guard condition");
   if ((block.plan ?? "").split("\n").filter((l) => /^ {4}if:/.test(l)).length !== 1) f.push("plan must have exactly one if");
-  if (!line("migrate", /^ {4}needs: plan$/m)) f.push("migrate must need exactly plan");
-  if (!line("migrate", /^ {4}if: needs\.plan\.outputs\.deploy == 'true' && \(needs\.plan\.outputs\.environment == 'production' \|\| needs\.plan\.outputs\.environment == 'production-destructive'\)$/m)) f.push("migrate has not the exact condition");
-  if (!line("migrate", /^ {4}environment:\n {6}name: \$\{\{ needs\.plan\.outputs\.environment \}\}$/m)) f.push("migrate must run in the environment chosen by plan");
-  if (!line("deploy", /^ {4}needs: \[plan, migrate\]$/m)) f.push("deploy must need exactly plan and migrate");
-  if (!line("deploy", /^ {4}if: needs\.plan\.outputs\.deploy == 'true'$/m)) f.push("deploy has not the exact condition");
-  if (!line("deploy", /^ {4}environment: production$/m)) f.push("deploy must run in the environment production");
+  f.push(...shipFailures(text));
   if (line("plan", /^ {4}environment:/m)) f.push("plan must have no environment");
   // Concurrency: the deploy runs are serialized by the WORKFLOW-level group (see ciFailures); a job-level group on any
   // job would be a second mechanism (and the same name at both levels deadlocks): none may exist.
@@ -270,16 +267,16 @@ export function staticFailures(text) {
   const wantOutputs = ["      worker_changed: ${{ steps.changes.outputs.worker_changed }}", "      base_sha: ${{ steps.base.outputs.base_sha }}"];
   if (JSON.stringify(changesOutputs.slice(0, 2)) !== JSON.stringify(wantOutputs) || /deploy_changed/.test(code(text))) f.push("the outputs of the job changes are not exactly worker_changed and base_sha");
   // Secrets: the word `secrets` (a context, `secrets: inherit`, `secrets[...]`, `toJSON(secrets)`) may appear outside
-  // comments ONLY inside the job blocks migrate and deploy, so not at workflow level (top-level env), not in other jobs.
+  // comments ONLY inside the job block ship, so not at workflow level (top-level env), not in other jobs.
   let rest = text;
-  for (const id of ["migrate", "deploy"]) rest = rest.replace(jobBlock(text, id) ?? "\u0000", "");
-  if (/\bsecrets\b/i.test(code(rest))) f.push("secrets outside the jobs migrate and deploy (workflow level or another job)");
-  // Environments: only on migrate and deploy.
+  for (const id of ["ship"]) rest = rest.replace(jobBlock(text, id) ?? "\u0000", "");
+  if (/\bsecrets\b/i.test(code(rest))) f.push("secrets outside the job ship (workflow level or another job)");
+  // Environments: only on ship.
   for (const id of ["changes", "lint", "tests", "version", "ci", "plan", "release"]) {
     if (/^ {4}environment:/m.test(code(jobBlock(text, id) ?? ""))) f.push(`environment on the job ${id}`);
   }
   if (/^environment:|^env:/m.test(code(text.split(/^jobs:/m)[0]))) f.push("workflow-level env or environment");
-  for (const id of ["migrate", "deploy"]) {
+  for (const id of ["ship"]) {
     if (/\bsecrets\b/.test(code(jobBlock(text, id) ?? "")) && !line(id, /^ {4}environment:/m)) f.push(`secrets in ${id} without an environment`);
   }
   // #292: nothing may deploy from the merge queue or a pull request: the deploy jobs name neither event.
@@ -287,6 +284,99 @@ export function staticFailures(text) {
     if (/merge_group|pull_request/.test(code(jobBlock(text, id) ?? "").split("\n").filter((l) => /^ {4}if:/.test(l)).join("\n"))) f.push(`the condition of ${id} mentions merge_group or pull_request`);
   }
   return f;
+}
+
+// --- #312: the job `ship` (the former migrate and deploy in ONE job, in the environment chosen by plan).
+// Fingerprint of a step: sha256 of its text without the comment lines that sit between steps (6 spaces, `#`); the run
+// block, env, id, if and every other key count. The table below holds the fingerprints of the steps of the former jobs
+// `migrate` and `deploy` as they were on master at 1eabac9 (taken with `git show origin/master:.github/workflows/ci.yml`),
+// in the order they run in `ship`: the migrate steps first, then the deploy steps, minus the four deploy steps that
+// were identical to the first four migrate steps (checkout, setup-node, install, wrangler config; same hashes, checked
+// when the table was made). A step that is changed, removed, added or reordered fails until this table is changed on
+// purpose, in the same PR as the workflow.
+export const stepHash = (s) => createHash("sha256").update(s.lines.filter((l) => !/^ {6}#/.test(l)).join("\n").replace(/\n+$/, "")).digest("hex");
+export const SHIP_STEPS = [
+  ["actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1", "053260c1b8aec7f005c175da680637136347cebe45481d1c5950cf3871b13eba"],
+  ["actions/setup-node@820762786026740c76f36085b0efc47a31fe5020", "7d3627761cfc54ac72506c405e8e9689c2cddd751a6d1b68b8fce84aecc2ab6a"],
+  ["Install dependencies", "edaea737eba331b69143c3e31ece148c9c498d6c383c1abc76be83dda2de8d9b"],
+  ["Write runner-local wrangler config", "2f23e587a7d074bbf3fee4f0aa8aa0e0c5c5cc24af090314e83548c4155dfde8"],
+  ["List pending migrations", "ad3b0128ac381d049a02bb63279b7ee9bde821b88b09fc30329bfee7d3897dee"],
+  ["Read the pending migrations", "210fe617a1f9dcda7b3e087e152d1fd16c1f30fd3bb7d3831543982be3ec8982"],
+  ["Lint the pending migrations", "3c629141bdea33d3759fd7a1436647bc90906f0a88225fd7741f4376c6c988fb"],
+  ["Time Travel bookmark", "311fabeceefd211e57185b5cac1faf18ed7e21f40cd20aef091b41ee74cb3e31"],
+  ["Record the bookmark", "6eb20efe8e72dc716795d0db54b87f58e87af9fe2e79da0269ae87dc9ef67e7f"],
+  ["Apply migrations", "cb6dc748b1031baa9615a7f9a9064a6dbdaf7f211c460a454af4630d3cbb7c38"],
+  ["Verify nothing is pending", "1eea1bc1f367dda054f4417bb02cc372ffd8c05505d4afe13600e7b40d369b2d"],
+  ["Summary (applied)", "ad90deb0e6c85f92b98b9cc1e7839217c7c8f4f8cca62df61cc857394dc9b869"],
+  ["Summary (migration failed)", "acec1b7d5f778fbe1c02674eed7b403f452647fffeaa0aa87b0ff7c4784d31c2"],
+  // ---- the deploy half starts here
+  ["Mask the Worker URL", "c8f09d5c3572bef7b1ce6f95543117c2edd8237a53174703d0c92e3e868255ba"],
+  ["Deploy", "f630aa601eae9f6834fb7cc28ad4dbbb6e658611d5244508172d129fec2ca6af"],
+  ["Read the deployed version id", "de5233864aec802f8c157c4c5aae9d070489d049beda83988b5d0e38890f3e38"],
+  ["Health check", "f2e5399f3fdfeabc739c0ef0bef98c508b18d4b269aa670368e8d25d80415e51"],
+  ["Summary", "e27a444b6ac8a8c35e2cd87a940501dc2a5416860447ffb3da463c25fbf788c4"],
+  ["Summary (failure after deploy)", "87510a57606193668fdd0ab1a4d4057f2e857dab2d67f2e1c062a62abad071e8"],
+];
+// The only steps of ship that may run after a failure (`always()`): they write the job summary and nothing else.
+export const SHIP_ALWAYS = ["Summary (migration failed)", "Summary (failure after deploy)"];
+export const SHIP_IF = "    if: needs.plan.outputs.deploy == 'true' && (needs.plan.outputs.environment == 'production' || needs.plan.outputs.environment == 'production-destructive')";
+// The job output of plan: EXACTLY one of the two environment names, whatever the classify step wrote.
+export const PLAN_ENV_OUTPUT = "      environment: ${{ steps.classify.outputs.environment == 'production' && 'production' || 'production-destructive' }}";
+export const SHIP_SECRETS = ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "D1_DATABASE_ID", "WORKER_URL"];
+
+export function shipFailures(text) {
+  const f = [];
+  const b = jobBlock(text, "ship");
+  if (b === null) return ["job ship is missing"];
+  const c = code(b);
+  const lines = b.split("\n");
+  if (/^ {2}(migrate|deploy):\s*$/m.test(text)) f.push("the jobs migrate and deploy must not exist any more (they are one job, ship)");
+  if (/needs\.(migrate|deploy)\b/.test(code(text))) f.push("a reference to needs.migrate or needs.deploy");
+  if (!/^ {4}needs: plan$/m.test(b)) f.push("ship must need exactly plan");
+  if (!lines.includes(SHIP_IF) || lines.filter((l) => /^ {4}if:/.test(l)).length !== 1) f.push("ship has not the exact condition (a deploy is planned and the environment is one of the two names)");
+  if (!/^ {4}environment:\n {6}name: \$\{\{ needs\.plan\.outputs\.environment \}\}\n(?! {6})/m.test(b)) f.push("ship must run in the environment chosen by plan (dynamic expression, no static name)");
+  if (!/^ {4}timeout-minutes: 40$/m.test(b)) f.push("ship must have timeout-minutes: 40");
+  if (!/^ {4}runs-on: ubuntu-latest$/m.test(b)) f.push("ship must run on ubuntu-latest");
+  if (/continue-on-error/.test(c)) f.push("continue-on-error in ship: a failed migration step must stop the job before the deploy steps");
+  // The order and the content of the steps: migrate steps first, then the deploy steps (the table above).
+  const got = steps(b);
+  const names = got.map((s) => s.name);
+  const want = SHIP_STEPS.map(([n]) => n);
+  if (JSON.stringify(names) !== JSON.stringify(want)) f.push(`the steps of ship changed (a step added, removed, renamed or reordered): ${names.join(" | ")}`);
+  else {
+    got.forEach((s, i) => {
+      if (stepHash(s) !== SHIP_STEPS[i][1]) f.push(`the step "${s.name}" of ship is not byte-identical to the one of the former migrate/deploy jobs`);
+    });
+  }
+  // Failure semantics: only the two summary steps may name always() (or !cancelled / failure() / cancelled()) in an if.
+  for (const s of got) {
+    const ifs = s.lines.filter((l) => /^ {8}if:/.test(l));
+    if (ifs.some((l) => /always\(\)|failure\(\)|cancelled\(\)/.test(l)) && !SHIP_ALWAYS.includes(s.name)) f.push(`the step "${s.name}" of ship can run after a failure (always/failure/cancelled in its if)`);
+    // (the summaries only print text: a secret, a Cloudflare variable, a `uses:` action or an installer would be new)
+    if (SHIP_ALWAYS.includes(s.name) && (/secrets\.|CLOUDFLARE|WORKER_URL|D1_DATABASE_ID|^ {8}uses:/m.test(s.text) || /^ {10}(npm|npx|node|curl|wget|gh) /m.test(s.run ?? ""))) f.push(`the always() step "${s.name}" runs a tool or reads a secret`);
+  }
+  // The four secrets exist in ship, and only here (the file-wide check is in staticFailures).
+  for (const n of SHIP_SECRETS) if (!c.includes(`secrets.${n}`)) f.push(`ship does not read the secret ${n}`);
+  // The output of plan.
+  const plan = jobBlock(text, "plan") ?? "";
+  const envOut = plan.split("\n").filter((l) => /^ {6}environment:/.test(l));
+  if (envOut.length !== 1 || envOut[0] !== PLAN_ENV_OUTPUT) f.push(`the plan output environment is not exactly the validated expression: ${JSON.stringify(envOut)}`);
+  return f;
+}
+
+// The value of the plan output `environment` for a given value written by the step "Classify" (undefined = the step
+// did not run). GitHub compares strings with == case-insensitively, which the evaluator mirrors: the result is the
+// literal of the expression, never the input.
+export function planEnvironment(text, classified) {
+  const line = (jobBlock(text, "plan") ?? "").split("\n").find((l) => /^ {6}environment:/.test(l));
+  const expr = /^ {6}environment: \$\{\{ (.*) \}\}$/.exec(line ?? "")?.[1];
+  if (!expr) throw new Error("the plan output environment is not a single expression");
+  const js = expr.replace(/steps\.classify\.outputs\.environment/g, "ctx");
+  if (/[^A-Za-z0-9_\s.'"()!=&|-]/.test(js)) throw new Error(`unexpected characters in the expression: ${js}`);
+  // `a == 'x'` with a case-insensitive comparison: a tiny helper in place of ==
+  const ci = js.replace(/ctx == ('[^']*')/g, (_m, lit) => `eq(ctx, ${lit})`);
+  // eslint-disable-next-line no-new-func
+  return new Function("ctx", "eq", `return (${ci});`)(classified ?? "", (a, b) => String(a).toLowerCase() === String(b).toLowerCase());
 }
 
 // The text of one job: from `  <id>:` to the next 2-space key (or the end), or null.
@@ -312,15 +402,15 @@ const trigger = (on, name) => new RegExp(`^ {2}${name}:.*\\n((?: {4,}.*\\n|\\n)*
 // Cloudflare, only the job's GITHUB_TOKEN, NO tool and NO action (the version comes from the read-only job `version`
 // as outputs that the script re-validates), and a run block that never moves, deletes or forces a tag (also executed by
 // release.mjs).
-export const RELEASE_IF = "    if: ${{ !cancelled() && needs.ci.result == 'success' && needs.version.result == 'success' && needs.plan.result == 'success' && ((needs.plan.outputs.deploy != 'true' && needs.migrate.result == 'skipped' && needs.deploy.result == 'skipped') || (needs.plan.outputs.deploy == 'true' && needs.migrate.result == 'success' && needs.deploy.result == 'success')) && github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}";
+export const RELEASE_IF = "    if: ${{ !cancelled() && needs.ci.result == 'success' && needs.version.result == 'success' && needs.plan.result == 'success' && ((needs.plan.outputs.deploy != 'true' && needs.ship.result == 'skipped') || (needs.plan.outputs.deploy == 'true' && needs.ship.result == 'success')) && github.repository == 'kolenkainc/cowlic' && github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}";
 export function releaseFailures(text) {
   const f = [];
   const b = jobBlock(text, "release");
   if (b === null) return ["job release is missing"];
   const c = code(b);
   const lines = b.split("\n");
-  if (!lines.includes(RELEASE_IF) || lines.filter((l) => /^ {4}if:/.test(l)).length !== 1) f.push("release has not the exact condition (gate, plan, deploy chain done or skipped by design, repository, master, push or dispatch)");
-  if (!/^ {4}needs: \[changes, lint, tests, ci, version, plan, migrate, deploy\]$/m.test(b)) f.push("release must need exactly changes, lint, tests, ci, version, plan, migrate, deploy");
+  if (!lines.includes(RELEASE_IF) || lines.filter((l) => /^ {4}if:/.test(l)).length !== 1) f.push("release has not the exact condition (gate, plan, ship succeeded or skipped by design, repository, master, push or dispatch)");
+  if (!/^ {4}needs: \[changes, lint, tests, ci, version, plan, ship\]$/m.test(b)) f.push("release must need exactly changes, lint, tests, ci, version, plan, ship");
   if (!/^ {4}runs-on: ubuntu-24\.04$/m.test(b)) f.push("release must run on the audited image ubuntu-24.04");
   if (!/^ {4}permissions:\n {6}contents: write\n(?! {6})/m.test(b)) f.push("release must have exactly contents: write");
   if (/^ {4}environment:/m.test(c)) f.push("environment on the release job");
@@ -405,7 +495,7 @@ export function ciFailures(text) {
   // Only these jobs exist (a new job needs its permissions and conditions reviewed here on purpose).
   const afterJobs = text.slice(text.search(/^jobs:\n/m));
   const ids = [...afterJobs.matchAll(/^ {2}([A-Za-z0-9_-]+):\s*$/gm)].map((m) => m[1]);
-  if (JSON.stringify(ids) !== JSON.stringify(["changes", "lint", "tests", "version", "ci", "plan", "migrate", "deploy", "release"])) f.push(`jobs changed: ${ids.join(",")}`);
+  if (JSON.stringify(ids) !== JSON.stringify(["changes", "lint", "tests", "version", "ci", "plan", "ship", "release"])) f.push(`jobs changed: ${ids.join(",")}`);
   for (const id of ["lint", "tests"]) {
     const j = jobBlock(text, id);
     if (j !== null && !/^ {4}if: \$\{\{ needs\.changes\.outputs\.worker_changed == 'true' \}\}$/m.test(j)) f.push(`job ${id} has no condition on worker_changed`);
@@ -418,7 +508,7 @@ export function ciFailures(text) {
   if (!text.includes(`\nconcurrency:\n${WORKFLOW_GROUP}\n${wantCancel}\n`)) f.push("workflow concurrency changed: a queue, master or label-event run could be cancelled, or a deploy run could share a cancellable group");
   f.push(...permissionFailures(text, PERMISSIONS["ci.yml"]));
   // A job that publishes a report needs checks: write (else the check run cannot be created), and only such a job has it.
-  for (const id of ["changes", "lint", "tests", "version", "ci", "plan", "migrate", "deploy", "release"]) {
+  for (const id of ["changes", "lint", "tests", "version", "ci", "plan", "ship", "release"]) {
     const j = jobBlock(text, id);
     if (j === null) continue;
     const reports = j.includes("mikepenz/action-junit-report@");

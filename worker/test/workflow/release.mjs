@@ -28,8 +28,7 @@ export function releaseCondition(text) {
         "needs.version.result": c.version ?? "success",
         "needs.plan.result": c.plan,
         "needs.plan.outputs.deploy": c.out,
-        "needs.migrate.result": c.migrate,
-        "needs.deploy.result": c.deploy,
+        "needs.ship.result": c.ship,
         "github.repository": c.repo ?? "kolenkainc/cowlic",
         "github.ref": c.ref ?? "refs/heads/master",
         "github.event_name": c.event ?? "push",
@@ -40,29 +39,26 @@ export function releaseCondition(text) {
 const R = ["success", "failure", "cancelled", "skipped"];
 // Named combinations: [name, context, expected]
 export const releaseConditionCases = [
-  ["deploy done: plan, migrate and deploy succeeded", { ci: "success", plan: "success", out: "true", migrate: "success", deploy: "success" }, true],
-  ["nothing to deploy: plan succeeded, migrate and deploy skipped by design", { ci: "success", plan: "success", out: "false", migrate: "skipped", deploy: "skipped" }, true],
-  ["manual dispatch with a completed deploy", { ci: "success", plan: "success", out: "true", migrate: "success", deploy: "success", event: "workflow_dispatch" }, true],
-  ["deploy FAILED", { ci: "success", plan: "success", out: "true", migrate: "success", deploy: "failure" }, false],
-  ["deploy CANCELLED", { ci: "success", plan: "success", out: "true", migrate: "success", deploy: "cancelled" }, false],
-  ["deploy skipped although a deploy was planned", { ci: "success", plan: "success", out: "true", migrate: "success", deploy: "skipped" }, false],
-  ["migrate FAILED (deploy skipped)", { ci: "success", plan: "success", out: "true", migrate: "failure", deploy: "skipped" }, false],
-  ["migrate rejected or cancelled (deploy skipped)", { ci: "success", plan: "success", out: "true", migrate: "cancelled", deploy: "skipped" }, false],
-  ["migrate skipped although a deploy was planned", { ci: "success", plan: "success", out: "true", migrate: "skipped", deploy: "skipped" }, false],
-  ["nothing to deploy but migrate ran", { ci: "success", plan: "success", out: "false", migrate: "success", deploy: "skipped" }, false],
-  ["nothing to deploy but deploy ran", { ci: "success", plan: "success", out: "false", migrate: "skipped", deploy: "success" }, false],
-  ["the version job FAILED", { ci: "success", version: "failure", plan: "success", out: "false", migrate: "skipped", deploy: "skipped" }, false],
-  ["the version job was skipped", { ci: "success", version: "skipped", plan: "success", out: "false", migrate: "skipped", deploy: "skipped" }, false],
-  ["the version job was cancelled", { ci: "success", version: "cancelled", plan: "success", out: "true", migrate: "success", deploy: "success" }, false],
-  ["plan FAILED", { ci: "success", plan: "failure", out: "", migrate: "skipped", deploy: "skipped" }, false],
-  ["plan skipped", { ci: "success", plan: "skipped", out: "", migrate: "skipped", deploy: "skipped" }, false],
-  ["the gate ci failed", { ci: "failure", plan: "skipped", out: "", migrate: "skipped", deploy: "skipped" }, false],
-  ["the gate ci cancelled", { ci: "cancelled", plan: "skipped", out: "", migrate: "skipped", deploy: "skipped" }, false],
-  ["the run was cancelled", { cancelled: true, ci: "success", plan: "success", out: "false", migrate: "skipped", deploy: "skipped" }, false],
-  ["pull_request", { ci: "success", plan: "success", out: "false", migrate: "skipped", deploy: "skipped", event: "pull_request" }, false],
-  ["merge_group", { ci: "success", plan: "success", out: "false", migrate: "skipped", deploy: "skipped", event: "merge_group" }, false],
-  ["another ref (dispatch from a branch)", { ci: "success", plan: "success", out: "false", migrate: "skipped", deploy: "skipped", event: "workflow_dispatch", ref: "refs/heads/feat/x" }, false],
-  ["a fork", { ci: "success", plan: "success", out: "false", migrate: "skipped", deploy: "skipped", repo: "someone/cowlic" }, false],
+  ["deploy done: plan succeeded and ship succeeded", { ci: "success", plan: "success", out: "true", ship: "success" }, true],
+  ["nothing to deploy: plan succeeded, ship skipped by design", { ci: "success", plan: "success", out: "false", ship: "skipped" }, true],
+  ["manual dispatch with a completed ship", { ci: "success", plan: "success", out: "true", ship: "success", event: "workflow_dispatch" }, true],
+  ["ship FAILED (a migration step, the deploy or the health check)", { ci: "success", plan: "success", out: "true", ship: "failure" }, false],
+  ["ship CANCELLED or rejected (the approval of production-destructive)", { ci: "success", plan: "success", out: "true", ship: "cancelled" }, false],
+  ["ship skipped although a deploy was planned", { ci: "success", plan: "success", out: "true", ship: "skipped" }, false],
+  ["nothing to deploy but ship ran and succeeded", { ci: "success", plan: "success", out: "false", ship: "success" }, false],
+  ["nothing to deploy but ship failed", { ci: "success", plan: "success", out: "false", ship: "failure" }, false],
+  ["the version job FAILED", { ci: "success", version: "failure", plan: "success", out: "false", ship: "skipped" }, false],
+  ["the version job was skipped", { ci: "success", version: "skipped", plan: "success", out: "false", ship: "skipped" }, false],
+  ["the version job was cancelled", { ci: "success", version: "cancelled", plan: "success", out: "true", ship: "success" }, false],
+  ["plan FAILED", { ci: "success", plan: "failure", out: "", ship: "skipped" }, false],
+  ["plan skipped", { ci: "success", plan: "skipped", out: "", ship: "skipped" }, false],
+  ["the gate ci failed", { ci: "failure", plan: "skipped", out: "", ship: "skipped" }, false],
+  ["the gate ci cancelled", { ci: "cancelled", plan: "skipped", out: "", ship: "skipped" }, false],
+  ["the run was cancelled", { cancelled: true, ci: "success", plan: "success", out: "false", ship: "skipped" }, false],
+  ["pull_request", { ci: "success", plan: "success", out: "false", ship: "skipped", event: "pull_request" }, false],
+  ["merge_group", { ci: "success", plan: "success", out: "false", ship: "skipped", event: "merge_group" }, false],
+  ["another ref (dispatch from a branch)", { ci: "success", plan: "success", out: "false", ship: "skipped", event: "workflow_dispatch", ref: "refs/heads/feat/x" }, false],
+  ["a fork", { ci: "success", plan: "success", out: "false", ship: "skipped", repo: "someone/cowlic" }, false],
 ];
 
 // The independent oracle for the exhaustive run: written as a decision list, not as the expression.
@@ -72,8 +68,8 @@ function oracle(c) {
   if (c.event !== "push" && c.event !== "workflow_dispatch") return false;
   if (c.ci !== "success" || c.plan !== "success") return false;
   if ((c.version ?? "success") !== "success") return false;
-  if (c.out === "true") return c.migrate === "success" && c.deploy === "success";
-  return c.migrate === "skipped" && c.deploy === "skipped";
+  if (c.out === "true") return c.ship === "success";
+  return c.ship === "skipped";
 }
 
 export function releaseConditionFailures(text) {
@@ -96,13 +92,12 @@ export function releaseConditionFailures(text) {
             for (const version of R)
               for (const plan of R)
                 for (const out of ["true", "false", ""])
-                  for (const migrate of R)
-                    for (const deploy of R) {
-                      const c = { cancelled, repo, ref, event, ci, version, plan, out, migrate, deploy };
-                      if (cond(c) !== oracle(c)) {
-                        if (n++ < 5) f.push(`exhaustive: ${JSON.stringify(c)} differs from the oracle`);
-                      }
+                  for (const ship of R) {
+                    const c = { cancelled, repo, ref, event, ci, version, plan, out, ship };
+                    if (cond(c) !== oracle(c)) {
+                      if (n++ < 5) f.push(`exhaustive: ${JSON.stringify(c)} differs from the oracle`);
                     }
+                  }
   return f;
 }
 
