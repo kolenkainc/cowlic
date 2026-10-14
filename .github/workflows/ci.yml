@@ -1,12 +1,19 @@
-# Worker CI. Contract: docs/worker-cicd.md (section 12.1, rules in 3 and 5.1 rule 5a, pins in 6).
-# Status check name: "Worker CI / ci" (stable on purpose: the owner's master ruleset requires the context "ci").
-# pull_request has NO paths filter: the required check `ci` must be reported on every PR, or a PR that touches
-# nothing under worker/ could never merge. The expensive steps are skipped by step-level `if:` (not a job-level
-# `if:`: a skipped job reports "skipped", a job with skipped steps reports success) when neither worker/ nor this
-# workflow changed. push to master stays path-filtered: nothing needs a run for a docs-only push, and the ruleset
-# only needs the check on pull requests.
+# CI. Contract: docs/worker-cicd.md (section 12.1, rules in 3 and 5.1 rule 5a, pins in 6) and docs/releasing.md.
+# One workflow for every check (#290, part 1; replaces version.yml and worker-ci.yml). worker-deploy.yml is separate
+# until part 2 and still deploys only from push to master and its own manual dispatch.
+#
+# Stages (jobs): changes (what changed), lint (typecheck, migrations), tests (migration lint tests and Vitest, with
+# reports), version (GitVersion, read-only), ci (the gate). Check contexts (the job names; the UI shows
+# "<workflow> / <job>"): `ci`, `changes`, `lint`, `tests`, `version`, plus the report check runs "Test Report" and
+# "Test Report (Vitest)". The owner's master ruleset requires the context `ci` (integration 15368): it is the gate job
+# below, which always runs and reports on pull_request, push to master and merge_group.
+#
+# pull_request, push and merge_group have NO path or branch filter: a skipped workflow would leave the required check
+# missing and block the PR or the queue. What is skipped instead is whole jobs (lint, tests) by the job-level `if:` on
+# the output of `changes`, and the gate `ci` accepts a skipped job only when `changes` said it was not needed.
+# `ci` itself has no condition except `always()` (a skipped required check counts as passed).
 # No secrets and no `environment:` anywhere in this file. No pull_request_target (section 3 rule 3).
-name: Worker CI
+name: CI
 
 on:
   pull_request:
@@ -15,42 +22,37 @@ on:
     types: [opened, synchronize, reopened, labeled, unlabeled]
   push:
     branches: [master]
-    paths:
-      - "worker/**"
-      - ".github/workflows/worker-ci.yml"
   # #292: the master ruleset has a merge queue and requires `ci`; the queue sends merge_group (checks_requested)
   # and waits for the required check on the gh-readonly-queue/* commit. No path filter: `ci` must always report.
-  # This workflow never deploys; worker-deploy.yml must NOT get this trigger (asserted by test/workflow).
+  # Nothing here deploys or releases; worker-deploy.yml must NOT get this trigger (asserted by test/workflow).
   merge_group:
     types: [checks_requested]
 
 permissions:
   contents: read
 
-# Section 3 rule 5: superseded PR runs are cancelled (cancelling CI is fine; deploys are never cancelled).
-# The event name is in the group and cancel-in-progress is true only for pull_request: a merge-queue run is never
-# cancelled by a PR run or by another queue entry (each queue entry also has its own ref).
+# Section 3 rule 5: a run superseded by a new commit on the PR is cancelled (cancelling CI is fine; deploys are never
+# cancelled). cancel-in-progress is true only for the pull_request actions opened, reopened and synchronize. A label
+# event (labeled/unlabeled, for example review-completed being added) must NOT cancel the run in progress on the same
+# commit: with always() the gate of a cancelled run would report a red `ci`. The label run waits in the group instead.
+# The event name is in the group, so a push to master or a merge-queue run is never cancelled by a PR run, and
+# cancel-in-progress is false for them. Note: GitHub still drops an OLDER PENDING run of a group for a newer pending one
+# even with cancel-in-progress false; only runs already in progress are kept.
 concurrency:
-  group: worker-ci-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && contains(fromJSON('["opened","reopened","synchronize"]'), github.event.action) }}
 
 jobs:
-  ci:
-    name: ci
+  # Stage 1: what changed. fetch-depth 0 is required: with depth 1 there is no origin/master and no base commit.
+  changes:
+    name: changes
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    # #289: checks: write only for the "Test Report" check run (the report action creates it). Narrowest scope: this
-    # job, no other. No pull-requests: write (PR comments are off). The token is not passed to any step but the report.
-    permissions:
-      contents: read
-      checks: write
-    defaults:
-      run:
-        shell: bash
-        working-directory: worker
+    timeout-minutes: 5
+    outputs:
+      worker_changed: ${{ steps.changes.outputs.worker_changed }}
+      base_sha: ${{ steps.base.outputs.base_sha }}
     steps:
-      # Pins: section 6 audit table (full commit SHAs). fetch-depth 0 is required: with depth 1 there is
-      # no origin/master and no base commit, so the lint would exit 2 (section 12.1).
+      # Pins: section 6 audit table (full commit SHAs).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -59,9 +61,11 @@ jobs:
       # BASE = the commit to compare against. Untrusted values come in through env: only (section 3 rule 7).
       # pull_request: current origin/master. push: the previous head of master. merge_group: the queue's
       # base_sha, and only if head_sha (40 lowercase hex, like base_sha) is the checked-out commit. If it
-      # cannot be resolved, BASE_SHA stays empty: the detect step then treats worker/ as changed (run everything)
-      # and the steps that need a base fail (fail closed, never "unchanged").
+      # cannot be resolved, base_sha stays empty: the detect step then treats worker/ as changed (run everything)
+      # and the steps that need a base fail (fail closed, never "unchanged"). The value is passed to the later jobs as
+      # a job output (a git-resolved full SHA or empty).
       - name: Resolve base commit
+        id: base
         env:
           EVENT_NAME: ${{ github.event_name }}
           BEFORE_SHA: ${{ github.event.before }}
@@ -91,13 +95,14 @@ jobs:
             esac
           fi
           if [ -z "$base" ]; then
-            echo "::warning::cannot resolve the base commit: the worker steps will run and fail closed"
+            echo "::warning::cannot resolve the base commit: the worker jobs will run and fail closed"
           fi
           echo "BASE_SHA=$base" >> "$GITHUB_ENV"
+          echo "base_sha=$base" >> "$GITHUB_OUTPUT"
 
       # worker_changed = any file under worker/ or this workflow or worker-deploy.yml (checked by the workflow tests of
       # "Vitest tests", #272) differs from the base. Fail closed: no base or a git failure means true.
-      # The pathspecs are :(top)-anchored because the job runs in worker/.
+      # The pathspecs are :(top)-anchored so they do not depend on the working directory.
       - name: Detect worker changes
         id: changes
         run: |
@@ -106,7 +111,7 @@ jobs:
             echo "worker_changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if ! git diff --name-only "$BASE_SHA"...HEAD -- ':(top)worker' ':(top).github/workflows/worker-ci.yml' ':(top).github/workflows/worker-deploy.yml' > "$RUNNER_TEMP/changed.txt"; then
+          if ! git diff --name-only "$BASE_SHA"...HEAD -- ':(top)worker' ':(top).github/workflows/ci.yml' ':(top).github/workflows/worker-deploy.yml' > "$RUNNER_TEMP/changed.txt"; then
             echo "git diff failed: treating worker as changed"
             echo "worker_changed=true" >> "$GITHUB_OUTPUT"
             exit 0
@@ -115,30 +120,45 @@ jobs:
             echo "worker changed"
             echo "worker_changed=true" >> "$GITHUB_OUTPUT"
           else
-            echo "nothing under worker/ changed: worker steps skipped"
+            echo "nothing under worker/ changed: lint and tests skipped"
             echo "worker_changed=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - if: steps.changes.outputs.worker_changed == 'true'
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+  # Stage 2: typecheck and migrations. A job-level `if:` is fine here: the gate `ci` decides what a skip means.
+  lint:
+    name: lint
+    needs: changes
+    if: ${{ needs.changes.outputs.worker_changed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           package-manager-cache: false # no cache at all (section 6)
 
-      # Plain npm ci: this job has no secrets, and the smoke tests need the workerd install script (section 4.2 item 6).
+      # Plain npm ci: this job has no secrets.
       - name: Install dependencies
-        if: steps.changes.outputs.worker_changed == 'true'
         run: npm ci
 
       - name: Typecheck
-        if: steps.changes.outputs.worker_changed == 'true'
         run: npx tsc --noEmit
 
       # Section 5.1 rule 5a. Applied migrations are immutable: a file that exists in the base and is modified,
       # renamed or deleted fails the job. Exit behaviour: diff output present -> exit 1; no output -> pass;
       # git failure (e.g. unreadable base) -> exit 1 as well (fail closed). Fix mistakes with a NEW migration.
       - name: Migrations are immutable
-        if: steps.changes.outputs.worker_changed == 'true'
+        env:
+          BASE_SHA: ${{ needs.changes.outputs.base_sha }}
         run: |
           [ -n "$BASE_SHA" ] || { echo "no base commit"; exit 1; }
           changed=$(git diff --relative --name-status --diff-filter=MRD "$BASE_SHA"...HEAD -- migrations/)
@@ -154,8 +174,8 @@ jobs:
       # #292: merge_group has no pull_request payload, so APPROVED is false there and a destructive finding fails
       # the queue run (fail closed, by choice); the PR run already showed the finding and the label.
       - name: Lint new migrations
-        if: steps.changes.outputs.worker_changed == 'true'
         env:
+          BASE_SHA: ${{ needs.changes.outputs.base_sha }}
           APPROVED: ${{ contains(github.event.pull_request.labels.*.name, 'destructive-migration-approved') }}
         run: |
           [ -n "$BASE_SHA" ] || { echo "no base commit"; exit 1; }
@@ -168,14 +188,43 @@ jobs:
           if [ "$APPROVED" = "true" ]; then args+=(--approved); fi
           node scripts/lint-migrations.mjs "${args[@]}" "${added[@]}"
 
+  # Stage 3: tests. The only job with checks: write (the report action creates its check runs), narrowest scope:
+  # this job, no other. No pull-requests: write (PR comments are off). The token goes to no step but the reports.
+  tests:
+    name: tests
+    needs: changes
+    if: ${{ needs.changes.outputs.worker_changed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      checks: write
+    defaults:
+      run:
+        shell: bash
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          package-manager-cache: false # no cache at all (section 6)
+
+      # Plain npm ci: this job has no secrets, and the smoke tests need the workerd install script (section 4.2 item 6).
+      - name: Install dependencies
+        run: npm ci
+
       # #286 / #289: the linter gates destructive D1 migrations, and its own tests were wired nowhere. Runs exactly
       # one file (deliberate: another *.test.mjs is not picked up silently). Two reporters: spec to stdout (the
       # human-readable log) and junit to a file under RUNNER_TEMP (read by the "Test Report" step below, never
-      # committed or uploaded). The node exit code is the verdict of THIS step: a failing test fails the job `ci`
-      # whether or not the report can be published (fork PRs have a read-only token).
+      # committed or uploaded). The node exit code is the verdict of THIS step: a failing test fails the job `tests`
+      # (and so the gate `ci`) whether or not the report can be published (fork PRs have a read-only token).
       - name: Migration lint tests
         id: lint_tests
-        if: steps.changes.outputs.worker_changed == 'true'
         run: |
           node --test --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination="$RUNNER_TEMP/lint-tests.xml" scripts/lint-migrations.test.mjs
 
@@ -185,7 +234,7 @@ jobs:
       # fail_on_failure / require_tests: red report on a failed test or on zero collected tests (fail_on_parse_error:
       # an unreadable XML). comment is off, so no pull-requests: write. Fork PRs: the token is read-only, so creating
       # the check run fails; the action only logs that, and continue-on-error covers the rest on forks, while the
-      # test step above still fails `ci` on a real failure.
+      # test step above still fails the job on a real failure.
       - name: Test Report
         id: test_report
         if: ${{ !cancelled() && (steps.lint_tests.outcome == 'success' || steps.lint_tests.outcome == 'failure') }}
@@ -221,14 +270,14 @@ jobs:
           fi
 
       # #285: Vitest runs everything under worker/test in three projects: unit (paging, log-leak, CORS with stubbed D1
-      # and Telegram), workflow (the run blocks of worker-deploy.yml, hostile titles, mutations; needs bash) and smoke
-      # (the Worker on a REAL local D1 via wrangler, migrated and legacy schema; fake credentials, no secrets).
-      # Two reporters: default to stdout and junit to a file under RUNNER_TEMP (read by the report step below). The
-      # exit code of vitest is the verdict of THIS step: a failing test, zero collected tests (passWithNoTests
-      # false) and a committed .only (allowOnly false) all fail it. No PR context: works on merge_group too.
+      # and Telegram), workflow (the run blocks of worker-deploy.yml, hostile titles, mutations, and the static checks
+      # of this file; needs bash) and smoke (the Worker on a REAL local D1 via wrangler, migrated and legacy schema;
+      # fake credentials, no secrets). Two reporters: default to stdout and junit to a file under RUNNER_TEMP (read by
+      # the report step below). The exit code of vitest is the verdict of THIS step: a failing test, zero collected
+      # tests (passWithNoTests false) and a committed .only (allowOnly false) all fail it. No PR context: works on
+      # merge_group too.
       - name: Vitest tests
         id: vitest
-        if: steps.changes.outputs.worker_changed == 'true'
         run: |
           npx vitest run --reporter=default --reporter=junit --outputFile.junit="$RUNNER_TEMP/vitest.xml"
 
@@ -248,13 +297,13 @@ jobs:
 
       # Vitest has no switch against skipped tests and no minimum count, so both are checked here on the numeric
       # outputs of the report step (no text parsing): skipped must be 0 (a skipped test is a silently dropped check)
-      # and passed must reach MIN_TESTS, a pinned number just below the real count (278 on 2026-10-14: 106 unit,
-      # 75 workflow, 51 + 46 smoke) so one or two removals do not trip it but a lost file or area does. NOT dynamic:
-      # raise it deliberately when tests are added, lower it deliberately when tests are removed on purpose.
+      # and passed must reach MIN_TESTS, a pinned number just below the real count (372 on 2026-10-14: 106 unit, 169
+      # workflow, 51 + 46 smoke) so a few removals do not trip it but a lost file or area does. NOT dynamic: raise it deliberately when tests are added,
+      # lower it deliberately when tests are removed on purpose.
       - name: Minimum test count (Vitest)
         if: ${{ steps.vitest.outcome == 'success' }}
         env:
-          MIN_TESTS: "272"
+          MIN_TESTS: "366"
           PASSED: ${{ steps.vitest_report.outputs.passed }}
           SKIPPED: ${{ steps.vitest_report.outputs.skipped }}
         run: |
@@ -270,3 +319,87 @@ jobs:
             echo "too few passed tests: a test file registers nothing or tests were lost"
             exit 1
           fi
+
+  # Calculates the GitVersion version and prints it in the job summary. Read-only: it never tags or releases.
+  # Contract: docs/releasing.md. Config: GitVersion.yml (GitVersion 6.x, GitHubFlow/v1). Runs on every event, also on
+  # merge_group. It is NOT part of the gate (as before: it was never a required check), so a GitVersion problem on
+  # an unusual ref cannot stall the queue; the job reports its own check `version`.
+  version:
+    name: version
+    # Pinned image (not -latest): the audited image ships .NET SDK 8, 9 and 10.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # Exact tool version (audit in docs/releasing.md). Never upgrade without confirmation.
+      GITVERSION_TOOL_VERSION: "6.8.2"
+      DOTNET_NOLOGO: "1"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+    steps:
+      # Same pin as above. fetch-depth 0: GitVersion needs the full history and all tags.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install GitVersion.Tool
+        run: |
+          dotnet --list-sdks
+          dotnet tool install GitVersion.Tool --tool-path "$RUNNER_TEMP/gitversion" --version "$GITVERSION_TOOL_VERSION"
+
+      # Branch/ref names reach GitVersion through the runner environment (GITHUB_REF), never through the command line.
+      - name: Calculate version
+        run: |
+          "$RUNNER_TEMP/gitversion/dotnet-gitversion" . /output json /verbosity Quiet > "$RUNNER_TEMP/gitversion.json"
+          {
+            echo "### Version"
+            echo
+            echo "| Variable | Value |"
+            echo "|---|---|"
+            for key in SemVer FullSemVer MajorMinorPatch PreReleaseLabel CommitsSinceVersionSource VersionSourceSha; do
+              echo "| $key | \`$(jq -r --arg k "$key" '.[$k] // ""' "$RUNNER_TEMP/gitversion.json")\` |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          jq -r '"Calculated version: " + .FullSemVer' "$RUNNER_TEMP/gitversion.json"
+
+  # The gate: the REQUIRED check `ci`. Always runs (a skipped required check counts as passed, so there is no other
+  # condition, ever) and aggregates the needed jobs. `changes` must have succeeded and say true or false; when worker
+  # files changed, `lint` and `tests` must have succeeded; otherwise they may be skipped (not needed). Failed,
+  # cancelled or any unexpected result fails the gate. No checkout, no secrets: only the results come in, through env.
+  ci:
+    name: ci
+    needs: [changes, lint, tests]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Aggregate results
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          WORKER_CHANGED: ${{ needs.changes.outputs.worker_changed }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          TESTS_RESULT: ${{ needs.tests.result }}
+        run: |
+          echo "changes=$CHANGES_RESULT worker_changed=$WORKER_CHANGED lint=$LINT_RESULT tests=$TESTS_RESULT"
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "changes did not succeed"
+            exit 1
+          fi
+          case "$WORKER_CHANGED" in
+            true) allowed="success" ;;
+            false) allowed="success skipped" ;;
+            *) echo "worker_changed is missing or invalid: '$WORKER_CHANGED'"; exit 1 ;;
+          esac
+          fail=0
+          for pair in "lint=$LINT_RESULT" "tests=$TESTS_RESULT"; do
+            name="${pair%%=*}"
+            result="${pair#*=}"
+            ok=0
+            for a in $allowed; do
+              if [ "$result" = "$a" ]; then ok=1; fi
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "$name: '$result' is not acceptable (allowed: $allowed)"
+              fail=1
+            fi
+          done
+          exit "$fail"
