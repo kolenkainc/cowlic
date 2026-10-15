@@ -7,6 +7,8 @@ with the shared ingest engine (ingest.run_lastfm) and keeps its own progress. Co
   bootstrap.py status [--config FILE]
   bootstrap.py covers --max-new N --max-minutes M [--retry-days D] [--retry-failed-days D] [--result-json FILE]
   bootstrap.py covers --count [--retry-days D] [--retry-failed-days D]
+  bootstrap.py covers --dry-run --max-new N --max-minutes M [--retry-days D] [--retry-failed-days D] [--result-json FILE]
+  bootstrap.py covers --apply-plan FILE --max-new N --max-minutes M [--retry-days D] [--retry-failed-days D] [--result-json FILE]
 
   rank    computes the ranking once (Last.fm) and stores it (bootstrap_ranking); refuses to recompute without --refresh.
   plan    dry run: which artists the next session would reach and how many matches it would attempt. Downloads nothing,
@@ -21,12 +23,19 @@ with the shared ingest engine (ingest.run_lastfm) and keeps its own progress. Co
           lock and has the 21:10 guard. Never reads the ranking or the progress file; needs no Last.fm key and no config.
           --count is read-only (D1 reads only, no YouTube, no Telegram, no write), takes no caps, has no 21:10 guard and
           prints how many albums and artists lack a cover and how many rest in the cooldown. Logic: bootstrap_covers.py.
+          --dry-run (#352) classifies each album by rule (strict guard, narrow name normalisation, album-level search with a
+          tracklist check), prints counts per rule and guard, and writes cover-plan.json (approved: false). It reads D1 and
+          searches YouTube Music only: no D1 write, no Telegram, no cooldown change. Same lock, caps and 21:10 guard.
+          --apply-plan FILE applies exactly the plan's accepts, and ONLY when the owner set "approved": true in the file by
+          hand; otherwise it refuses (exit 2) before any other work. Docs: docs/cover-art.md section 12.
 
 Files (state directory ${XDG_STATE_HOME:-$HOME/.local/state}/cowlic/, directory 0700, files 0600, atomic writes):
   bootstrap-ranking.json   written by `rank` only (bootstrap_ranking.py)
   bootstrap-state.json     the ENGINE's own RunState (cooldowns, scan dates); this file is never written by bootstrap
                            itself, only by the engine; the nightly ingest-state.json is never read or written
   cover-backfill.json      written by `covers` only (bootstrap_covers.py): album id -> {result no_match|mismatch|failed, on date}
+  cover-plan.json          written by `covers --dry-run` only (approved false; the owner sets true by hand): album id -> {rule,
+                           browse_id, cover_url}; ids, words and URLs only, no names
   bootstrap-progress.json  the single truth about each artist, written only here: {version, ranking_computed_at,
                            sessions, artists: {<lfm:hash>: {status, enum, truncated, tracks_added, tracks_seen,
                            failures, updated}}}; status pending | partial | done | parked, an absent key is pending.
@@ -774,6 +783,10 @@ def cover_query() -> Callable:
 
 
 def cover_usage_problem(args) -> str | None:
+    if args.count and (args.dry_run or args.apply_plan):
+        return "covers --count cannot be combined with --dry-run or --apply-plan"
+    if args.dry_run and args.apply_plan:
+        return "covers --dry-run and --apply-plan are different modes"
     if args.count:
         if args.max_new is not None or args.max_minutes is not None or args.result_json:
             return "covers --count is read-only and takes no --max-new, --max-minutes or --result-json"
@@ -811,7 +824,18 @@ def _covers_locked(args, directory: Path) -> int:
         if problem:
             refuse(problem)
             return EXIT_GUARD
-    problem = cover_env(D1_ENV if args.count else COVERS_ENV)
+    plan = None
+    if args.apply_plan:  # the owner's approval is checked before anything else is read or contacted
+        try:
+            plan = bootstrap_covers.load_plan(args.apply_plan)
+        except bootstrap_covers.PlanError as e:
+            refuse(f"plan file unusable: {e}")
+            return EXIT_USAGE
+        if not plan.approved:
+            refuse('the plan is not approved: review it, then set "approved": true in the file by hand '
+                   "(docs/cover-art.md section 12)")
+            return EXIT_USAGE
+    problem = cover_env(D1_ENV if args.count or args.dry_run else COVERS_ENV)
     if problem:
         refuse(problem)
         return EXIT_USAGE
@@ -840,8 +864,16 @@ def _covers_locked(args, directory: Path) -> int:
     ingest.log(f"covers: {len(todo)} album(s) without a cover to work ({skipped['unknown']} unknown album skipped), "
                f"--max-new {args.max_new}, --max-minutes {args.max_minutes}, retry cooldown {args.retry_days} days")
     limits = make_limits(args.max_new, args.max_minutes)
+    if args.dry_run:
+        return _covers_dry_run(args, directory, todo, backends, state, limits)
+    attempt_fn = None
+    if plan is not None:
+        planned = [t for t in todo if t.album_id in plan.entries]
+        ingest.log(f"covers: applying the approved plan: {len(planned)} of {len(plan.entries)} planned album(s) are still "
+                   f"without a cover; {len(todo) - len(planned)} other album(s) are left alone")
+        todo, attempt_fn = planned, bootstrap_covers.apply_planned(plan)
     run = bootstrap_covers.run_backfill(todo, backends, state, limits, today, args.retry_days,
-                                        args.retry_failed_days)
+                                        args.retry_failed_days, attempt_fn)
     c = run.counts
     ingest.log("covers: " + ", ".join(f"{k} {v}" for k, v in c.items()) + f", cooldown {run.cooldown}, "
                f"not attempted {run.not_attempted}")
@@ -855,6 +887,31 @@ def _covers_locked(args, directory: Path) -> int:
     ingest.log(f"stop reason: {run.stop_reason}")
     counts = {**c, "cooldown": run.cooldown, "not_attempted": run.not_attempted}
     _write_result(args, code, run.stop_reason, counts, None)
+    return code
+
+
+def _covers_dry_run(args, directory: Path, todo, backends, state, limits) -> int:
+    """covers --dry-run: classify, print counts, write the plan. Nothing else is written (not D1, not Telegram, not the
+    cooldown file)."""
+    run = bootstrap_covers.run_plan(todo, backends, state, limits, today, args.retry_days, args.retry_failed_days)
+    for line in bootstrap_covers.plan_lines(run):
+        print(line)
+    code = EXIT_OK
+    try:
+        bootstrap_covers.write_plan(directory / bootstrap_covers.PLAN_FILE, run.entries, today())
+        print(f"covers dry-run: plan written to {bootstrap_covers.PLAN_FILE} in the state directory "
+              f"({len(run.entries)} entries, approved false)")
+    except OSError as e:
+        ingest.log(f"ERROR covers: cannot write {bootstrap_covers.PLAN_FILE} ({type(e).__name__})")
+        code = EXIT_FAILED
+    if run.interrupted:
+        sign_in_stop()
+        code = EXIT_SIGN_IN
+    elif run.failed:
+        code = max(code, EXIT_FAILED)
+    ingest.log(f"stop reason: {run.stop_reason}")
+    _write_result(args, code, run.stop_reason, {**run.accepts, "failed": run.failed, "cooldown": run.cooldown,
+                                                "not_attempted": run.not_attempted}, None)
     return code
 
 
@@ -956,6 +1013,12 @@ def build_parser() -> argparse.ArgumentParser:
     covers.add_argument("--count", action="store_true",
                         help="read-only dry count (D1 reads only): albums and artists without a cover, and the cooldown; "
                              "takes no caps")
+    covers.add_argument("--dry-run", action="store_true",
+                        help="classify the albums by rule and write the plan file (cover-plan.json, approved false); reads "
+                             "D1 and searches YouTube Music only, writes no D1 row, sends nothing to Telegram; needs the caps")
+    covers.add_argument("--apply-plan", type=Path, metavar="FILE", default=None,
+                        help='apply exactly the accepts of this plan file; refused unless the owner set "approved": true '
+                             "in it by hand; needs the caps")
     covers.add_argument("--max-new", type=_caps(MAX_NEW_RANGE), default=None, metavar="N",
                         help="REQUIRED unless --count: stop after N albums were attempted (1..1000000)")
     covers.add_argument("--max-minutes", type=_caps(MAX_MINUTES_RANGE), default=None, metavar="M",

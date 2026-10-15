@@ -216,8 +216,27 @@ def artists_match(wanted: str, names: list[str]) -> bool:
                for a in (wanted, transliterate_to_cyrillic(wanted)) for n in names)
 
 
-def albums_match(wanted: str, found: str) -> bool:
-    nw, nf = normalize(wanted), normalize(found)
+# Narrow name normalisation (#352), used ONLY by the cover backfill's second pass and the album-level source, never by the
+# default guard. It strips exactly two format suffixes (a trailing " - Single" and a trailing standalone "[Explicit]",
+# case-insensitive, repeated) and, when one name is Latin and the other Cyrillic, compares the transliterated names.
+# Everything else of the guard (ratio, plural, number, edition words) is applied unchanged on the result.
+_FORMAT_SUFFIX = re.compile(r"(?:\s+-\s+single|\s+\[\s*explicit\s*\])\s*$", re.IGNORECASE)
+_CYRILLIC = re.compile(r"[\u0400-\u04FF]")
+
+
+def strip_format_suffix(name: str) -> str:
+    """Name without trailing ' - Single' / '[Explicit]' tokens; the original when nothing would be left."""
+    out = name.strip()
+    while True:
+        cut = _FORMAT_SUFFIX.sub("", out)
+        if cut == out:
+            break
+        out = cut
+    return out if out.strip() else name
+
+
+def _same_album(nw: str, nf: str) -> bool:
+    """The guard body on two normalised names: ratio, plural pair, numbers, edition words."""
     if not nw or not nf or SequenceMatcher(None, nw, nf).ratio() < COVER_ALBUM_MIN_SIMILARITY:
         return False
     ww, wf = set(nw.split()), set(nf.split())
@@ -228,9 +247,30 @@ def albums_match(wanted: str, found: str) -> bool:
     return not (ww ^ wf) & _EDITION_WORDS  # (Deluxe), (Live), Remastered, ...: another release
 
 
-def cover_url_from_match(album: str | None, artist: str, m) -> tuple[str | None, str]:
+def _script_pair(a: str, b: str) -> bool:
+    """True when one name is Latin only and the other Cyrillic only (the only case a transliteration may bridge: the table
+    is lossy, so two Latin names must never be compared through it)."""
+    return (has_latin(a) and not _CYRILLIC.search(a) and bool(_CYRILLIC.search(b)) and not has_latin(b)) \
+        or (has_latin(b) and not _CYRILLIC.search(b) and bool(_CYRILLIC.search(a)) and not has_latin(a))
+
+
+def albums_match(wanted: str, found: str, narrow: bool = False) -> bool:
+    if not narrow:
+        return _same_album(normalize(wanted), normalize(found))
+    nw, nf = normalize(strip_format_suffix(wanted)), normalize(strip_format_suffix(found))
+    if _same_album(nw, nf):
+        return True
+    if _script_pair(nw, nf):
+        # the edition words are looked for in the ORIGINAL words too: a Latin 'deluxe' must not vanish in the transliteration
+        return _same_album(transliterate_to_cyrillic(nw), transliterate_to_cyrillic(nf)) \
+            and not (set(nw.split()) ^ set(nf.split())) & _EDITION_WORDS
+    return False
+
+
+def cover_url_from_match(album: str | None, artist: str, m, narrow: bool = False) -> tuple[str | None, str]:
     """(cover URL or None, reason). Reason is a fixed class word (never a title or a name): ok, no_album,
-    no_thumbnail, album_mismatch, artist_mismatch. `album` is the TRACK's album name (None for an unknown album)."""
+    no_thumbnail, album_mismatch, artist_mismatch. `album` is the TRACK's album name (None for an unknown album).
+    `narrow` selects the narrow name normalisation of #352 (default: the strict guard, unchanged)."""
     base, found = getattr(m, "thumbnail_base", None), getattr(m, "album", None)
     if not isinstance(base, str) or not base.startswith("https://"):
         return None, "no_thumbnail"
@@ -238,12 +278,19 @@ def cover_url_from_match(album: str | None, artist: str, m) -> tuple[str | None,
         return None, "no_album"
     if not isinstance(found, str):
         return None, "no_match_album"
-    if not albums_match(album, found):
+    if not albums_match(album, found, narrow):
         return None, "album_mismatch"
     names = _match_artist_names(m)
     if not names or not artists_match(artist, names):
         return None, "artist_mismatch"
     return base + COVER_SIZE_SUFFIX, "ok"
+
+
+def thumbnail_base(result) -> str | None:
+    """The https thumbnail base (size suffix cut off) of a search or album result, or None."""
+    thumbs = result.get("thumbnails") if isinstance(result, dict) else None
+    url = thumbs[0].get("url") if isinstance(thumbs, list) and thumbs and isinstance(thumbs[0], dict) else None
+    return url.rsplit("=", 1)[0] if isinstance(url, str) and url.startswith("https://") and "=" in url else None
 
 
 def _match_artist_names(m) -> list[str]:

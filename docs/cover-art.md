@@ -334,3 +334,78 @@ artist 800 px square); the repo code reads in section 6; the OpenSubsonic and To
 NOT verified: any Symfonium behaviour; the MusicBrainz and CAA calls (one request got 503, not retried); the real count of
 cover-less albums and artists in D1 (no D1 read was made); the origin resolution of the source art; behaviour for any
 artist other than The Kooks; any write to Telegram, D1 or the Worker (none was done).
+
+## 12. Backfill second source, dry run and approved plan (#352)
+
+Why: the first backfill (section 7, #250) left about 184 albums without a cover. The read-only investigation #350 found that the
+guards are right: about 40% of the rejected hits are a recording by ANOTHER artist (cover, karaoke, namesake), and about half are
+the right artist but another release (compilation, deluxe, the single). Loosening the album ratio, the edition words or the
+artist check would store wrong covers, and a stored cover wins for good (`UPDATE ... WHERE cover_file_id IS NULL`, #271).
+So nothing is loosened. Two narrow additions are made, and nothing is written without a dry run and the owner's review.
+
+### 12.1 The rules (all of them keep the guards of section 7)
+
+The default path (`covers --max-new N --max-minutes M`, no flag below) is unchanged: strict guard only.
+
+1. **`track`**: the existing guard on the track-level match (album similarity >= 0.9, edition words, plural-only differences,
+   numbers and Roman numerals, artist check with the Latin/Cyrillic bar 0.8). Only reported in a dry run.
+2. **`normalised`** (`match.albums_match(..., narrow=True)`): the same guard after two narrow steps on the album names.
+   (a) A trailing ` - Single` and a trailing standalone `[Explicit]` are dropped from both names (case-insensitive, repeated;
+   `(Explicit)`, `Single - Name`, `Name-Single`, `Name - Single Remix` are NOT touched). (b) When one name is Latin only and the
+   other Cyrillic only, the two names are also compared after the Latin -> Cyrillic transliteration table that the artist check
+   already uses (a small deterministic table, no dependency). The table is lossy (`w` and `v` give the same letter), so it is
+   never applied to two Latin names. After either step, ratio, plural, number and edition checks apply unchanged; in the
+   transliteration step the edition words are also looked for in the original Latin words. The artist check applies unchanged.
+3. **`album_search`** (`bootstrap_covers.album_level`): for an album neither rule above accepts, one `ytmusicapi` search with
+   filter `albums` for `<stored artist> <stored album>` (5 hits). A hit must pass the narrow album compare, the artist check
+   (Cyrillic bar), the pseudo-artist denylist (`Various Artists`, `Unknown`, ...: stored artist and every credited artist), and a
+   TRACKLIST CHECK: `get_album` of the hit must list a track whose title meets the matcher's title bar (similarity or relaxed
+   similarity >= 0.85) with the same variant markers (a live or remix track is not the stored track). At most 3 `get_album`
+   calls per album; the first hit that passes everything wins and its own thumbnail (`=w1200-h1200-l90-rj`) is the cover. A
+   candidate that fails the tracklist check is rejected. Per-track thumbnails for singles are NOT used: for a single the song's
+   thumbnail is mostly the art of a compilation or of another artist's release.
+
+All YouTube Music calls (search, `get_album`) are paced (1.5 s plus jitter), retried only for transient errors, and a sign-in
+challenge ends the run with exit 3: no cookies, proxies, PO-token tricks or client rotation (#62).
+
+### 12.2 Dry run, review, approval, apply
+
+```
+ingest/.venv/bin/python ingest/bootstrap.py covers --dry-run --max-new N --max-minutes M --retry-days 0 --retry-failed-days 0
+```
+
+- Reads D1 and searches YouTube Music only. It never writes D1, never sends to Telegram and never changes
+  `cover-backfill.json`. It takes the shared lock, needs both caps and has the 21:10 guard like the other modes. The albums of
+  the first backfill rest in the cooldown (30 days), so a dry run over them needs `--retry-days 0`.
+- It prints counts only: how many albums each rule would accept, how many the first source did not accept (by reason word), and
+  how many every source rejected (by the album-level reason word: `no_hits`, `album_mismatch`, `artist_mismatch`,
+  `pseudo_artist`, `no_browse_id`, `tracklist`, `no_thumbnail`).
+- It writes the PLAN `cover-plan.json` in the private state directory (`~/.local/state/cowlic/`, file 0600, directory 0700):
+  `{"version": 1, "approved": false, "created": "YYYY-MM-DD", "entries": {<album id>: {"rule", "browse_id", "cover_url"}}}`.
+  Album ids are hashes; there is no artist, album or track name in the plan or in the output. `approved` is always written
+  `false`; a new dry run overwrites the plan and resets it.
+- The owner reviews the plan (the cover URLs can be looked at in a browser; the album ids can be resolved against D1 by the
+  owner) and, if it is right, sets `"approved": true` BY HAND in the file (an editor; the value must be the JSON `true`, not
+  `"true"` or `1`). Remove an entry to leave that album out. The file must not be group or world writable.
+- The real step:
+
+```
+ingest/.venv/bin/python ingest/bootstrap.py covers --apply-plan ~/.local/state/cowlic/cover-plan.json --max-new N --max-minutes M --retry-days 0
+```
+
+  It REFUSES (exit 2, before D1, YouTube or Telegram are touched) unless the plan parses strictly and is approved. It then
+  applies exactly the planned albums that are still cover-less (no new search, no new decision), under the same lock,
+  21:10 guard, caps and cooldown; other albums are left alone. The hardened thumbnail fetch (host allowlist, JPEG check) and
+  `UPDATE albums SET cover_file_id = ? WHERE id = ? AND cover_file_id IS NULL` are the same as in section 7, so a cover that
+  exists wins. `--retry-days 0` is needed again only if those albums still rest in the cooldown. A YouTube sign-in challenge
+  is exit 3 as everywhere.
+- `scripts/run-bootstrap-local.sh` does not know `--dry-run` and `--apply-plan` yet (it rejects unknown options); run the two
+  steps through `bootstrap.py` directly, which takes the lock itself.
+
+### 12.3 Honest expectation
+
+On a random sample of 30 of the 184 albums, the normalisation accepted 3 and the album-level search added about 4 (its tracklist
+check was designed, not measured). That is roughly 40 of 184 albums, with a wide interval. The rest stay without a cover by
+design: recordings by another artist and releases that YouTube Music does not list under the stored name or only as a
+compilation. For those the safe path is a cover chosen by the owner and a manual D1 update. The dry run prints the real
+numbers; the owner decides after looking at them.
