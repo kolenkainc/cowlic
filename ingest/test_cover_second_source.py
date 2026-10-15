@@ -447,6 +447,14 @@ class DryRunTest(SecondSourceBase):
         self.dry()
         self.assertFalse(self.plan()["approved"])
 
+    def test_the_artists_mode_cannot_be_combined_with_the_plan_modes(self):
+        self.mixed_library()
+        for flag in (("--dry-run",), ("--apply-plan", str(self.plan_path()))):
+            with self.subTest(flag=flag):
+                self.assertEqual(self.covers("--artists", *flag), 2)
+                self.assertIn("--artists", self.err)
+        self.assertEqual((self.d1.writes, self.fb.uploads), ([], []))
+
     def test_the_dry_run_needs_the_caps_and_excludes_the_other_modes(self):
         self.mixed_library()
         for argv in (("covers", "--dry-run"), ("covers", "--dry-run", "--count"),

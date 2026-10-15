@@ -272,6 +272,14 @@ deploy, which is the acceptance step of ticket 6.
   between sessions. If an ingest run adds a cover for the same album meanwhile, `COALESCE` and `IS NULL` keep the first
   one; the cost is one orphan Telegram photo, harmless. The backfill does not read or write the Last.fm ranking or the
   bootstrap progress file.
+- **Artist photos, as built (#253).** `covers --artists` (and `covers --artists --count`) is a MODE flag of `covers`, not a
+  new subcommand, so the wrapper needs no logic (its tests only pin that the flag is forwarded and every rule of `covers`
+  applies). It reuses the album machinery: the shared lock, the 21:10 guard, the caps, a cooldown file of its own
+  (`artist-photo-backfill.json`) and exit 3. Per artist it calls the SAME functions as the ingest path: `find_match` on one
+  stored track, `match.artist_id_from_match` (artist-name check with the Cyrillic bar, pseudo-artist denylist),
+  `deps.artist_photo_url` (`get_artist`, suffix `=w800-h800-p-l90-rj`) and `deps.upload_artist_image` (the hardened fetch),
+  then `UPDATE artists SET image_file_id = ? WHERE id = ? AND image_file_id IS NULL`. A database without the column is a
+  clean skip. How to run it: `docs/bootstrap.md` section 11, "Artist photos".
 - **Until it lands** the running bootstrap keeps adding cover-less albums; once (a) merges, new albums get covers and the
   backfill closes the old gap, so the order in section 8 is (a) first, backfill after.
 
