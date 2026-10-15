@@ -29,13 +29,19 @@ export async function startTelegramStub(knownIds) {
     if (getFile && req.method === "GET") {
       if (getFile[1] !== STUB_TOKEN) return reject(res, 401, "getFile wrong token");
       const id = url.searchParams.get("file_id") ?? "";
-      getFileIds.push(id);      if (!known.has(id)) return reject(res, 400, "getFile unknown id");
+      getFileIds.push(id);
+      if (!known.has(id)) return reject(res, 400, "getFile unknown id");
       res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, result: { file_id: id, file_path: `stub/${id}.bin` } }));
       return;
     }
     if (file && (req.method === "GET" || req.method === "HEAD")) {
       if (file[1] !== STUB_TOKEN) return reject(res, 401, "download wrong token");
-      const id = decodeURIComponent(file[2]);
+      let id;
+      try {
+        id = decodeURIComponent(file[2]);
+      } catch {
+        return reject(res, 400, "download malformed id");
+      }
       if (!known.has(id)) return reject(res, 404, "download unknown id");
       const range = req.headers.range ?? null;
       downloads.push({ id, range });

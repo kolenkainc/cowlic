@@ -193,8 +193,7 @@ export function registerSmokeSuite(fixture) {
   // upstream (bot token, file URL, stub address) in any response: the file URL contains the token, so /stream proxies
   // bytes and never redirects.
   describe("stream and the Telegram stub", () => {
-    const streamUrl = `/rest/stream?${"${AUTH}"}&id=t1`;
-    const url = () => streamUrl.replace("${AUTH}", ctx.auth);
+    const url = () => `/rest/stream?${ctx.auth}&id=t1`;
     it("stream t1: the exact track file id and bytes (200)", async () => {
       const res = await fetchPath(url(), { signal: AbortSignal.timeout(20_000) });
       expect(res.status).toBe(200);

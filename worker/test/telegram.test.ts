@@ -181,6 +181,21 @@ describe("the Worker with TG_API_BASE", () => {
     expect(res.status).toBe(502);
     expect(calls).toEqual([]);
   });
+  it("invalid override fails closed BEFORE any cache read, even when the file path is cached (stream and getCoverArt)", async () => {
+    const match = vi.fn(async (req: Request) =>
+      req.url === `https://cowlic.invalid/tg-file-path/${encodeURIComponent(FILE_ID)}` ? new Response(FILE_PATH) : undefined,
+    );
+    const put = vi.fn(async () => {});
+    vi.stubGlobal("caches", { default: { match, put } });
+    const env = envWith({ TG_API_BASE: "http://evil.example" });
+    const res = await worker.fetch(new Request(`https://worker.example.test/rest/stream?${authQuery}&id=t1`), env);
+    expect(res.status).toBe(502);
+    const cover = await worker.fetch(new Request(`https://worker.example.test/rest/getCoverArt?${authQuery}&id=al1`), env);
+    expect(cover.status).toBe(502);
+    expect(calls).toEqual([]);
+    expect(match).not.toHaveBeenCalled();
+    expect(put).not.toHaveBeenCalled();
+  });
   it("no response exposes the bot token, the file path, the upstream host or the file URL, valid or invalid override", async () => {
     for (const base of [undefined, "http://127.0.0.1:8081", "https://tg.example.test", "http://evil.example"]) {
       const res = await stream(base === undefined ? {} : { TG_API_BASE: base });

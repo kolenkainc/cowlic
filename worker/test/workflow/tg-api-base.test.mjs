@@ -2,13 +2,14 @@
 // must never get it: not from wrangler.toml, not from a workflow (ci.yml deploy chain `plan`/`ship`, or any other
 // workflow), not from the deploy tooling. These checks read the committed files; the mutation tests prove the scan
 // really flags an addition.
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const workerDir = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-const workflowsDir = resolve(workerDir, "../.github/workflows");
+const repoDir = resolve(workerDir, "..");
+const workflowsDir = resolve(repoDir, ".github/workflows");
 const NAME = "TG_API_BASE";
 
 /** True when the text mentions the variable in any letter case (a case variant must not slip through). */
@@ -34,8 +35,32 @@ describe("TG_API_BASE is never part of the production configuration (#301)", () 
   it("wrangler.toml does not mention it (no [vars], not in the secret list comment either)", () => {
     expect(mentions(readFileSync(join(workerDir, "wrangler.toml"), "utf8"))).toBe(false);
   });
-  it("package.json (scripts) does not mention it", () => {
-    expect(mentions(readFileSync(join(workerDir, "package.json"), "utf8"))).toBe(false);
+  it("every committed worker/wrangler*.toml does not mention it", () => {
+    const tomls = readdirSync(workerDir).filter((f) => /^wrangler.*\.toml$/.test(f));
+    expect(tomls).toContain("wrangler.toml");
+    for (const f of tomls) expect(mentions(readFileSync(join(workerDir, f), "utf8")), f).toBe(false);
+  });
+  it("worker/package.json and the root package.json (scripts) do not mention it", () => {
+    for (const p of [join(workerDir, "package.json"), join(repoDir, "package.json")]) {
+      if (existsSync(p)) expect(mentions(readFileSync(p, "utf8")), p).toBe(false);
+    }
+  });
+  it("no file under scripts/ (root or worker) mentions it or passes --var", () => {
+    const files = [];
+    const walk = (d) => {
+      if (!existsSync(d)) return;
+      for (const e of readdirSync(d, { withFileTypes: true })) {
+        if (e.isDirectory()) walk(join(d, e.name));
+        else files.push(join(d, e.name));
+      }
+    };
+    walk(join(repoDir, "scripts"));
+    walk(join(workerDir, "scripts"));
+    for (const f of files) {
+      const text = readFileSync(f, "utf8");
+      expect(mentions(text), f).toBe(false);
+      expect(/--var\b/.test(text), `${f} passes --var`).toBe(false);
+    }
   });
   it("ci.yml with the variable added to the ship job would be flagged (mutation)", () => {
     const ci = readFileSync(join(workflowsDir, "ci.yml"), "utf8");
