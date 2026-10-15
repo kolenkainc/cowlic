@@ -1,7 +1,8 @@
-// Harness of the real-D1 smoke tests (was scripts/smoke-ci.mjs): no secrets, no network apart from wrangler's local
-// runtime, no real Telegram. In a throwaway temp dir (removed by stop()):
+// Harness of the real-D1 smoke tests (was scripts/smoke-ci.mjs): no secrets, no outbound network (only wrangler's
+// local runtime and a local Telegram stub on 127.0.0.1), no real Telegram. In a throwaway temp dir (removed by stop()):
 //   1. a wrangler config derived from the committed wrangler.toml (the placeholder database_id is fine in local mode)
-//   2. a FAKE .dev.vars next to it: TG_BOT_TOKEN=dummy (never sent anywhere), random Subsonic user/password per run
+//   2. a FAKE .dev.vars next to it: TG_BOT_TOKEN=<fake> and TG_API_BASE=<the stub's loopback URL> (test-only override,
+//      src/telegram.ts; #301), random Subsonic user/password per run
 //   3. `wrangler d1 migrations apply DB --local` (proves the migrations apply to an empty database; for the legacy
 //      schema only 0001 + 0002)
 //   4. a seed from scripts/fixtures (synthetic rows, fake Telegram ids)
@@ -17,6 +18,14 @@ import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { unstable_dev } from "wrangler";
+import { STUB_TOKEN, startTelegramStub } from "./telegram-stub.mjs";
+
+// The fake Telegram file ids of scripts/fixtures/smoke-seed*.sql (track, album cover, artist photo).
+export const FIXTURE_FILE_IDS = {
+  track: "FAKE_TG_FILE_ID_NOT_REAL",
+  albumCover: "FAKE_ALBUM_COVER_ID_NOT_REAL",
+  artistImage: "FAKE_ARTIST_IMAGE_ID_NOT_REAL",
+};
 
 const run = promisify(execFile);
 const workerDir = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -38,6 +47,7 @@ export async function startSmokeWorker({ legacy }) {
   for (const k of Object.keys(process.env)) if (/^(CLOUDFLARE_|CF_|TG_|SUBSONIC_|WRANGLER_API)/.test(k)) delete process.env[k];
   Object.assign(process.env, env);
 
+  const stub = await startTelegramStub(Object.values(FIXTURE_FILE_IDS));
   try {
     const toml = readFileSync(join(workerDir, "wrangler.toml"), "utf8");
     let migrationsDir = join(workerDir, "migrations");
@@ -58,7 +68,7 @@ export async function startSmokeWorker({ legacy }) {
 
     const user = `ci-${randomBytes(6).toString("hex")}`;
     const password = randomBytes(16).toString("hex");
-    writeFileSync(join(tmp, ".dev.vars"), `TG_BOT_TOKEN=dummy\nSUBSONIC_USER=${user}\nSUBSONIC_PASSWORD=${password}\n`);
+    writeFileSync(join(tmp, ".dev.vars"), `TG_BOT_TOKEN=${STUB_TOKEN}\nTG_API_BASE=${stub.base}\nSUBSONIC_USER=${user}\nSUBSONIC_PASSWORD=${password}\n`);
 
     const state = join(tmp, "state");
     mkdirSync(state);
@@ -86,12 +96,15 @@ export async function startSmokeWorker({ legacy }) {
       salt: SALT,
       auth,
       j,
+      stub,
       stop: async () => {
         await worker.stop();
+        await stub.close();
         rmSync(tmp, { recursive: true, force: true });
       },
     };
   } catch (e) {
+    await stub.close();
     rmSync(tmp, { recursive: true, force: true });
     throw e;
   }
