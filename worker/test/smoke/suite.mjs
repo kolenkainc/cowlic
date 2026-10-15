@@ -1,9 +1,11 @@
 // The smoke checks of the Worker against a real local D1 (was scripts/smoke.mjs in CI mode). Registered once per
 // schema: fixture "ci" (fully migrated DB, scripts/fixtures/smoke-seed.sql; artist ar2 has a photo, ar1 has none) and
 // fixture "legacy" (migrations 0001+0002 only, smoke-seed-pre0003.sql; no artists.image_file_id).
-// The 6 stream checks need real Telegram: they are not here, they stay in scripts/smoke.mjs (the owner's local run).
+// Telegram is a local stub (test/smoke/telegram-stub.mjs, reached through TG_API_BASE, #301): no outbound network. The
+// 6 stream checks against the REAL Telegram stay in scripts/smoke.mjs (the owner's local run).
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { startSmokeWorker } from "./harness.mjs";
+import { FIXTURE_FILE_IDS, startSmokeWorker } from "./harness.mjs";
+import { STUB_TOKEN, bytesFor } from "./telegram-stub.mjs";
 
 const STUB_ENDPOINTS = [
   "getPlaylists", "getGenres", "getStarred2", "getScanStatus", "startScan", "getNowPlaying",
@@ -23,6 +25,7 @@ export function registerSmokeSuite(fixture) {
   });
 
   const fetchPath = (path, init) => ctx.worker.fetch(path, init);
+  const coverUrl = (id) => `/rest/getCoverArt?${ctx.auth}&id=${encodeURIComponent(id)}`;
 
   describe(`smoke on the ${legacy ? "legacy 0001+0002" : "fully migrated"} schema`, () => {
     it("ping with valid token", async () => {
@@ -99,27 +102,24 @@ export function registerSmokeSuite(fixture) {
     });
   });
 
-  // getCoverArt: 404 + error 70 means "no such cover". A found cover is proxied from Telegram; with the fake CI
-  // token Telegram refuses, so "found" shows as the upstream error 502 (not 404): the id resolved to a file id.
+  // getCoverArt: 404 + error 70 means "no such cover". A found cover is proxied from the local Telegram stub
+  // (TG_API_BASE, #301): the exact file id reaches the stub and the exact bytes of that id come back. A wrong id makes
+  // the stub refuse (502 here), a hang hits the request timeout below and throws: both fail the test.
   describe("artist images and cover art", () => {
-    // A found cover makes the Worker call the REAL api.telegram.org (hardcoded in src/telegram.ts) with the dummy bot
-    // token. Normally Telegram answers at once, but CI run 38549763188 saw that call hang for 60 s. The lookup in D1
-    // happens BEFORE that call, so "no answer within 15 s" can only mean the id was found and the upstream is slow:
-    // it counts as resolved (status 0). A cover that does not exist answers 404 / error 70 immediately, so the
-    // negative checks are not weakened.
     const cover = async (id) => {
-      let res;
-      try {
-        res = await fetchPath(`/rest/getCoverArt?${ctx.auth}&id=${encodeURIComponent(id)}`, { signal: AbortSignal.timeout(15_000) });
-      } catch (e) {
-        if (e?.name === "TimeoutError" || e?.name === "AbortError") return { status: 0, code: undefined };
-        throw e;
-      }
+      const res = await fetchPath(coverUrl(id), { signal: AbortSignal.timeout(20_000) });
       const body = res.headers.get("content-type")?.includes("json") ? (await res.json())["subsonic-response"] : {};
       return { status: res.status, code: body.error?.code };
     };
-    const resolved = (c) => c.status !== 404 && c.code !== 70;
     const notFound = (c) => c.status === 404 && c.code === 70;
+    // Fetch a found cover and assert status, content type and the exact bytes of `fileId`.
+    const expectBytes = async (id, fileId) => {
+      const res = await fetchPath(coverUrl(id), { signal: AbortSignal.timeout(20_000) });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("image/jpeg");
+      expect(await res.text()).toBe(bytesFor(fileId).toString());
+      expect(ctx.stub.getFileIds).toContain(fileId);
+    };
 
     it("artist without image has no coverArt (getArtists)", async () => {
       const x = await ctx.j("getArtists");
@@ -142,8 +142,8 @@ export function registerSmokeSuite(fixture) {
       expect(x.album?.coverArt).toBe("al1");
       expect(x.album.song?.[0]?.coverArt).toBe("al1");
     });
-    it("getCoverArt album id resolves (unchanged)", async () => {
-      expect(resolved(await cover("al1"))).toBe(true);
+    it("getCoverArt album id: the exact album cover file id and bytes", async () => {
+      await expectBytes("al1", FIXTURE_FILE_IDS.albumCover);
     });
     it("getCoverArt ar-<artist without image> -> 404, error 70", async () => {
       expect(notFound(await cover("ar-ar1"))).toBe(true);
@@ -183,10 +183,48 @@ export function registerSmokeSuite(fixture) {
       it("search3: artist with image has coverArt ar-<id>", async () => {
         expect((await ctx.j("search3&query=Zed")).searchResult3?.artist?.[0]?.coverArt).toBe("ar-ar2");
       });
-      it("getCoverArt ar-<artist with image> resolves (not 404)", async () => {
-        const c = await cover("ar-ar2");
-        expect(resolved(c), `status=${c.status}`).toBe(true);
+      it("getCoverArt ar-<artist with image>: the exact artist image file id and bytes", async () => {
+        await expectBytes("ar-ar2", FIXTURE_FILE_IDS.artistImage);
       });
     }
+  });
+
+  // The Telegram storage path against the local stub: exact id and bytes, Range passed through, and nothing of the
+  // upstream (bot token, file URL, stub address) in any response: the file URL contains the token, so /stream proxies
+  // bytes and never redirects.
+  describe("stream and the Telegram stub", () => {
+    const url = () => `/rest/stream?${ctx.auth}&id=t1`;
+    it("stream t1: the exact track file id and bytes (200)", async () => {
+      const res = await fetchPath(url(), { signal: AbortSignal.timeout(20_000) });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("audio/mpeg");
+      expect(await res.text()).toBe(bytesFor(FIXTURE_FILE_IDS.track).toString());
+      expect(ctx.stub.getFileIds).toContain(FIXTURE_FILE_IDS.track);
+    });
+    it("stream with Range: 206 with the exact slice, Range reached the stub", async () => {
+      const res = await fetchPath(url(), { headers: { range: "bytes=5-14" }, signal: AbortSignal.timeout(20_000) });
+      const all = bytesFor(FIXTURE_FILE_IDS.track);
+      expect(res.status).toBe(206);
+      expect(res.headers.get("content-range")).toBe(`bytes 5-14/${all.length}`);
+      expect(await res.text()).toBe(all.subarray(5, 15).toString());
+      expect(ctx.stub.downloads.some((d) => d.id === FIXTURE_FILE_IDS.track && d.range === "bytes=5-14")).toBe(true);
+    });
+    it("no response exposes the token, the file URL, the stub address or a redirect", async () => {
+      // Found responses (200) and a refused one (404 cover that does not exist).
+      for (const call of [url(), coverUrl("al1"), coverUrl("ar-ar1")]) {
+        const res = await fetchPath(call, { signal: AbortSignal.timeout(20_000) });
+        const text = [...res.headers].map(([k, v]) => `${k}: ${v}`).join("\n") + "\n" + (await res.text());
+        for (const secret of [STUB_TOKEN, ctx.stub.base, ctx.stub.base.replace("http://", ""), "/file/bot", "stub/"]) {
+          expect(text, `a response leaks ${secret === STUB_TOKEN ? "the token" : secret}`).not.toContain(secret);
+        }
+        expect(res.headers.get("location")).toBeNull();
+        expect([200, 404]).toContain(res.status);
+      }
+    });
+    it("the stub saw only well-formed calls with the right token, for known ids", () => {
+      expect(ctx.stub.unexpected).toEqual([]);
+      const known = new Set(Object.values(FIXTURE_FILE_IDS));
+      expect(ctx.stub.getFileIds.every((id) => known.has(id))).toBe(true);
+    });
   });
 }
