@@ -117,6 +117,9 @@ class CoverState:
     Written atomically (ingest.atomic_write_json: 0600, directory 0700) after every change, so a killed run keeps what it
     learned. Strict on read: any unknown field or malformed entry refuses the file (it is never silently dropped)."""
 
+    FILE_KEY = "albums"   # the object's key in the file; the artist-photo state (#253) is a subclass with "artists"
+    ID_RE = ALBUM_ID
+
     def __init__(self, path: Path):
         self.path = path
         self.albums: dict[str, dict] = {}
@@ -127,15 +130,15 @@ class CoverState:
         state = cls(path)
         if doc is None:
             return state
-        if not isinstance(doc, dict) or set(doc) != {"version", "albums"}:
+        if not isinstance(doc, dict) or set(doc) != {"version", cls.FILE_KEY}:
             raise CoverStateError("missing or unknown fields")
         if isinstance(doc["version"], bool) or doc["version"] != STATE_VERSION:
             raise CoverStateError("unknown version")
-        albums = doc["albums"]
+        albums = doc[cls.FILE_KEY]
         if not isinstance(albums, dict) or len(albums) > STATE_MAX_ENTRIES:
             raise CoverStateError("albums is not an object of a sane size")
         for key, e in albums.items():
-            ok = (isinstance(key, str) and ALBUM_ID.fullmatch(key) and isinstance(e, dict) and set(e) == {"result", "on"}
+            ok = (isinstance(key, str) and cls.ID_RE.fullmatch(key) and isinstance(e, dict) and set(e) == {"result", "on"}
                   and e["result"] in COOLDOWN_RESULTS and _iso_date(e["on"]))
             if not ok:
                 raise CoverStateError("an entry is malformed")
@@ -158,7 +161,7 @@ class CoverState:
         return self.albums.pop(album_id, None) is not None
 
     def save(self) -> None:
-        ingest.atomic_write_json(self.path, {"version": STATE_VERSION, "albums": self.albums})  # OSError on failure
+        ingest.atomic_write_json(self.path, {"version": STATE_VERSION, self.FILE_KEY: self.albums})  # OSError on failure
 
 
 # ---- the work list ----

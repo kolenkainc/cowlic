@@ -7,6 +7,8 @@ with the shared ingest engine (ingest.run_lastfm) and keeps its own progress. Co
   bootstrap.py status [--config FILE]
   bootstrap.py covers --max-new N --max-minutes M [--retry-days D] [--retry-failed-days D] [--result-json FILE]
   bootstrap.py covers --count [--retry-days D] [--retry-failed-days D]
+  bootstrap.py covers --artists --max-new N --max-minutes M [--retry-days D] [--retry-failed-days D] [--result-json FILE]
+  bootstrap.py covers --artists --count [--retry-days D] [--retry-failed-days D]
 
   rank    computes the ranking once (Last.fm) and stores it (bootstrap_ranking); refuses to recompute without --refresh.
   plan    dry run: which artists the next session would reach and how many matches it would attempt. Downloads nothing,
@@ -21,6 +23,10 @@ with the shared ingest engine (ingest.run_lastfm) and keeps its own progress. Co
           lock and has the 21:10 guard. Never reads the ranking or the progress file; needs no Last.fm key and no config.
           --count is read-only (D1 reads only, no YouTube, no Telegram, no write), takes no caps, has no 21:10 guard and
           prints how many albums and artists lack a cover and how many rest in the cooldown. Logic: bootstrap_covers.py.
+          --artists (#253) switches to the artists stored without a photo (image_file_id IS NULL): the shared matcher, the
+          ingest artist guard, one get_artist, the hardened fetch, `UPDATE artists SET image_file_id = ? WHERE id = ? AND
+          image_file_id IS NULL`; cooldown in artist-photo-backfill.json; a missing column is a clean skip (exit 0).
+          Logic: bootstrap_artist_photos.py.
 
 Files (state directory ${XDG_STATE_HOME:-$HOME/.local/state}/cowlic/, directory 0700, files 0600, atomic writes):
   bootstrap-ranking.json   written by `rank` only (bootstrap_ranking.py)
@@ -61,6 +67,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+import bootstrap_artist_photos
 import bootstrap_covers
 import bootstrap_ranking
 import ingest
@@ -805,7 +812,70 @@ def cmd_covers(args, lock_held: bool) -> int:
             os.close(lock)
 
 
+def real_artist_backends() -> "bootstrap_artist_photos.ArtistBackends":
+    return bootstrap_artist_photos.real_backends()
+
+
+def _artists_locked(args, directory: Path) -> int:
+    """`covers --artists` (#253): the photo of artists stored without one. Same lock, 21:10 guard, caps, environment and
+    exit codes as the album mode; the logic is bootstrap_artist_photos.py, the cooldown file artist-photo-backfill.json."""
+    ap = bootstrap_artist_photos
+    if not args.count:
+        problem = overlap_problem(local_now(), args.max_minutes)
+        if problem:
+            refuse(problem)
+            return EXIT_GUARD
+    problem = cover_env(D1_ENV if args.count else COVERS_ENV)
+    if problem:
+        refuse(problem)
+        return EXIT_USAGE
+    try:
+        state = ap.ArtistPhotoState.load(directory / ap.STATE_FILE)
+    except bootstrap_covers.CoverStateError as e:
+        refuse(f"state file unusable: {ap.STATE_FILE}: {e}; move it aside by hand to start empty")
+        return EXIT_USAGE
+    query = cover_query()
+    try:
+        if args.count:
+            for line in ap.count_lines(query, state, today(), args.retry_days, args.retry_failed_days):
+                print(line)
+            return EXIT_OK
+        todo, skipped = ap.read_todo(query)
+    except (ingest.IngestError, OSError) as e:
+        ingest.log(f"ERROR artist photos: cannot read D1: {type(e).__name__}: {ingest.redact(str(e), secrets_now())}")
+        _write_result(args, EXIT_FAILED, None, None, None)
+        return EXIT_FAILED
+    if todo is None:
+        ingest.log("artist photos: nothing done, the artists.image_file_id column does not exist (migration 0003 not applied)")
+        _write_result(args, EXIT_OK, "done", None, None)
+        return EXIT_OK
+    try:
+        backends = real_artist_backends()
+    except (ingest.IngestError, OSError, ImportError) as e:
+        ingest.log(f"ERROR artist photos: cannot start: {type(e).__name__}: {ingest.redact(str(e), secrets_now())}")
+        _write_result(args, EXIT_FAILED, None, None, None)
+        return EXIT_FAILED
+    ingest.log(f"artist photos: {len(todo)} artist(s) without an image to work ({skipped['bad']} unreadable row(s) skipped), "
+               f"--max-new {args.max_new}, --max-minutes {args.max_minutes}, retry cooldown {args.retry_days} days")
+    limits = make_limits(args.max_new, args.max_minutes)
+    run = ap.run_backfill(todo, backends, state, limits, today, args.retry_days, args.retry_failed_days)
+    c = run.counts
+    ingest.log("artist photos: " + ", ".join(f"{k} {v}" for k, v in c.items()) + f", cooldown {run.cooldown}, "
+               f"not attempted {run.not_attempted}")
+    ingest.log(f"artist photos: {len(todo) - c['photographed'] - c['already']} artist(s) still without an image")
+    if run.interrupted:
+        sign_in_stop()
+    if run.unsaved:
+        ingest.log(f"ERROR artist photos: {ap.STATE_FILE} is not fully saved; the next run repeats what is missing")
+    code = EXIT_SIGN_IN if run.interrupted else EXIT_FAILED if run.failed else EXIT_OK
+    ingest.log(f"stop reason: {run.stop_reason}")
+    _write_result(args, code, run.stop_reason, {**c, "cooldown": run.cooldown, "not_attempted": run.not_attempted}, None)
+    return code
+
+
 def _covers_locked(args, directory: Path) -> int:
+    if args.artists:
+        return _artists_locked(args, directory)
     if not args.count:
         problem = overlap_problem(local_now(), args.max_minutes)
         if problem:
@@ -956,6 +1026,9 @@ def build_parser() -> argparse.ArgumentParser:
     covers.add_argument("--count", action="store_true",
                         help="read-only dry count (D1 reads only): albums and artists without a cover, and the cooldown; "
                              "takes no caps")
+    covers.add_argument("--artists", action="store_true",
+                        help="(#253) work the artists stored without a photo instead of the albums without a cover "
+                             "(state file artist-photo-backfill.json; same caps, lock, guard and exit codes)")
     covers.add_argument("--max-new", type=_caps(MAX_NEW_RANGE), default=None, metavar="N",
                         help="REQUIRED unless --count: stop after N albums were attempted (1..1000000)")
     covers.add_argument("--max-minutes", type=_caps(MAX_MINUTES_RANGE), default=None, metavar="M",

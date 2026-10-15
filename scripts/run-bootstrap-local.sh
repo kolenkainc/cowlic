@@ -8,6 +8,8 @@
 #   scripts/run-bootstrap-local.sh status
 #   scripts/run-bootstrap-local.sh covers --max-new N --max-minutes M [--retry-days D]   (backfill covers, #250)
 #   scripts/run-bootstrap-local.sh covers --count [--retry-days D]                       (read-only dry count)
+#   scripts/run-bootstrap-local.sh covers --artists (--max-new N --max-minutes M | --count)   (artist photos, #253: a mode
+#     flag of covers, forwarded untouched; every rule of covers below applies to it unchanged)
 #
 # - Never reads, sources or parses .env: bootstrap.py loads it itself. Never traces (set +x), never prints env values,
 #   no eval: the arguments are only matched by `case`, then forwarded verbatim as an array.

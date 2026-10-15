@@ -84,6 +84,7 @@ Files bootstrap creates (names only; no contents are described or shown here) in
 | `bootstrap.log` | the wrapper | Output of every wrapper invocation that got past the lock, rotated by size (`.1` .. `.N`) |
 | `bootstrap-last-run.json` | the wrapper | Result of the last invocation (section 5) |
 | `cover-backfill.json` | `covers` | Cooldown of albums without a match or with a mismatch: album id (a hash), result word, date; no names (section 11) |
+| `artist-photo-backfill.json` | `covers --artists` | Cooldown of artists without a match, with a mismatch or a failed attempt: artist id (a hash), result word, date; no names (section 11) |
 | `ingest.lock` | wrapper and nightly | The ONE lock shared with the 21:10 timer |
 
 Bootstrap ships LOGS ONLY to Grafana Cloud Loki (#244), see section 5: no metrics, no Influx push, no
@@ -448,6 +449,35 @@ Outcome words: `covered`, `already` (filled meanwhile), `no_match` (the matcher 
 `exit_code`, `counts` with the words above plus `cooldown` and `not_attempted`; `artists` is empty). Exit codes: 0 ok (a cap,
 time or empty-list stop is not a failure), 1 a failed album or an unsaved cooldown file, 2 usage, missing environment or an
 unusable cooldown file, 3 sign-in stop, 75 locked, 78 guard or wrapper usage.
+
+### Artist photos: `covers --artists` (#253)
+
+Artists stored before artist photos existed (#251) have `image_file_id` empty. `covers --artists` is a MODE of `covers`
+(a flag, so the wrapper, its lock, the 21:10 guard, the required caps, the shipping and the exit codes are exactly the
+ones above; the wrapper has no logic of its own for it):
+
+```sh
+scripts/run-bootstrap-local.sh covers --artists --count
+scripts/run-bootstrap-local.sh covers --artists --max-new 3 --max-minutes 5
+scripts/run-bootstrap-local.sh covers --artists --max-new 50 --max-minutes 30
+```
+
+Not run by the author (section 0). Same order: `--count`, a small session, read the log, raise the caps.
+
+- Per artist with `image_file_id IS NULL`: ONE stored track (the smallest track id), the same matcher as ingest, the same
+  artist guard as ingest (the matched first artist must fit the stored name, the Cyrillic bar, compilation pseudo-artists
+  refused), one `get_artist`, the hardened image fetch of #248/#251 and a Telegram photo, then the parameterized
+  `UPDATE artists SET image_file_id = ? WHERE id = ? AND image_file_id IS NULL` (a stored photo always wins). No audio.
+  The guard gates only the photo.
+- `--max-new` counts artists ATTEMPTED; `--retry-days` and `--retry-failed-days` work as above. The cooldown file is
+  `artist-photo-backfill.json` (`{"version": 1, "artists": {<artist id>: {"result": ..., "on": ...}}}`, ids are hashes), a
+  separate file from `cover-backfill.json`; same strict reading, same recovery (move it aside by hand).
+- `--artists --count` is read-only (D1 reads only) and prints `covers: artists without an image: N (to try: T, in cooldown:
+  C, unreadable rows: B; ...)`. While the column `artists.image_file_id` does not exist (migration 0003 not applied) both
+  the count and a session are a clean skip (`not counted yet` / a log line, exit 0, nothing written).
+- Outcome words: `photographed`, `already`, `no_match`, `artist_mismatch` (guard refusal, pseudo-artist),
+  `no_photo` (no artist id in the match, or no usable thumbnail on the artist page), `failed`. Sign-in challenge: exit 3,
+  never bypassed (#62), exactly as for albums. Run it BETWEEN other sessions (shared lock, exit 75).
 
 ### Limits of this runbook
 
