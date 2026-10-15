@@ -118,6 +118,10 @@ export function releaseConditionFailures(text) {
 
 // --- the run block, with stubs
 export function createReleaseRunner(text, { tmp }) {
+  // The stub gh APPLIES the --jq filter it is given with the real jq (preinstalled on ubuntu-24.04 and on dev machines), so
+  // the tag selection of the script is really executed. A missing jq must fail loudly, never skip or pass silently.
+  const jq = spawnSync("jq", ["--version"], { encoding: "utf8" });
+  if (jq.error || jq.status !== 0) throw new Error("jq is required by the release script tests (the stub gh runs the --jq filter with it) and was not found");
   const dir = mkdtempSync(join(tmp, "release-"));
   writeFileSync(join(dir, "release.sh"), runBlock(text, "Tag and release"));
   let n = 0;
@@ -128,7 +132,8 @@ export function createReleaseRunner(text, { tmp }) {
     vSha = sha, // the sha the version job computed the version for
     masterFail = false,
     gv = { MajorMinorPatch: "3.0.1", PreReleaseLabel: "", BranchName: "master" }, // the outputs of the job version
-    tag = "absent", // absent | same | other | annotated | error
+    tag = "absent", // absent (empty list) | lookalike (only v3.0.10 and v3.0.1-rc exist) | same | other | annotated | error
+    lookalikesFirst = false, // same, other, annotated: the prefix-lookalikes come before the exact ref in the list
     postFail = false,
     releaseExists = false,
     message = "docs: something\n",
@@ -145,6 +150,14 @@ export function createReleaseRunner(text, { tmp }) {
     const msgFile = join(w, "message.txt");
     writeFileSync(calls, "");
     writeFileSync(summary, "");
+    // The canned answer of GET git/matching-refs/tags/v3.0.1: a PREFIX listing, so it holds v3.0.10 and v3.0.1-rc as well
+    // whenever they exist (they sit on another commit). The exact ref is present only for same, other and annotated.
+    const refs = join(w, "refs.json");
+    const ref = (name, type, sha) => ({ ref: `refs/tags/${name}`, object: { type, sha } });
+    const lookalikes = [ref("v3.0.10", "commit", OTHER), ref("v3.0.1-rc", "commit", OTHER)];
+    const exact = [ref("v3.0.1", tag === "annotated" ? "tag" : "commit", tag === "other" ? OTHER : SHA)];
+    const list = tag === "absent" ? [] : tag === "lookalike" ? lookalikes : lookalikesFirst ? [...lookalikes, ...exact] : [...exact, ...lookalikes];
+    writeFileSync(refs, JSON.stringify(list));
     writeFileSync(msgFile, Buffer.isBuffer(message) ? message : Buffer.from(message, "utf8"));
     const stub = (p, body) => {
       writeFileSync(p, `#!/bin/bash\n${body}\n`);
@@ -162,19 +175,16 @@ export function createReleaseRunner(text, { tmp }) {
         'case "$2" in',
         '  */git/ref/heads/master) [ "$FAKE_MASTER_FAIL" = 1 ] && exit 1; echo "$FAKE_MASTER"; exit 0 ;;',
         "  */git/matching-refs/tags/*)",
-        '    case "$FAKE_TAG" in',
-        "      absent) exit 0 ;;", // 200 with an empty list: nothing printed
-        '      same|other) echo "commit $FAKE_TAG_SHA"; exit 0 ;;',
-        '      annotated) echo "tag $FAKE_TAG_SHA"; exit 0 ;;',
-        '      *) echo "gh: Internal Server Error (HTTP 500)" >&2; exit 1 ;;',
-        "    esac ;;",
+        '    [ "$FAKE_TAG" = error ] && { echo "gh: Internal Server Error (HTTP 500)" >&2; exit 1; }',
+        '    filter=""; while [ $# -gt 0 ]; do [ "$1" = --jq ] && filter="$2"; shift; done',
+        '    if [ -n "$filter" ]; then jq -r "$filter" "$REFS"; else cat "$REFS"; fi; exit $? ;;', // no filter: the raw JSON, like gh
         '  */commits/*) [ "$FAKE_MESSAGE_FAIL" = 1 ] && exit 1; cat "$MSGFILE"; exit 0 ;;',
         "esac",
         "exit 1",
       ].join("\n"),
     );
-    // No git, no dotnet, no jq stub on purpose: the script must need none of them (PATH has only the stub dir and
-    // /usr/bin:/bin; a git call would be recorded as a failure by the static test and would not find a repository here).
+    // No git and no dotnet on purpose: the script must need neither (PATH has only the stub dir and /usr/bin:/bin; a git
+    // call would be recorded as a failure by the static test and would not find a repository here). jq is the real one.
     const r = spawnSync("bash", ["-eo", "pipefail", join(dir, "release.sh")], {
       cwd: w,
       env: {
@@ -194,7 +204,7 @@ export function createReleaseRunner(text, { tmp }) {
         FAKE_MASTER: master,
         FAKE_MASTER_FAIL: masterFail ? "1" : "0",
         FAKE_TAG: tag,
-        FAKE_TAG_SHA: tag === "other" ? OTHER : SHA,
+        REFS: refs,
         FAKE_POST_FAIL: postFail ? "1" : "0",
         FAKE_RELEASE_EXISTS: releaseExists ? "1" : "0",
         FAKE_MESSAGE_FAIL: messageFail ? "1" : "0",
@@ -239,6 +249,10 @@ export const releaseCases = [
   ["tag already on this commit, feat: no tag call, release created", { tag: "same", message: "feat: x" }, { status: 0, post: false, release: true }],
   ["tag already on this commit, docs: nothing to do (green)", { tag: "same", message: "docs: x" }, { status: 0, post: false, release: false }],
   ["tag already on this commit and the release exists: nothing to do", { tag: "same", releaseExists: true, message: "feat: x" }, { status: 0, post: false, release: false }],
+  ["tag exists only as prefix-lookalikes (v3.0.10, v3.0.1-rc): absent, tag created", { tag: "lookalike", message: "docs: x" }, { status: 0, post: true, release: false }],
+  ["tag exists only as prefix-lookalikes, feat: tag created and release", { tag: "lookalike", message: "feat: x" }, { status: 0, post: true, release: true }],
+  ["tag on this commit with lookalikes listed first: no-op", { tag: "same", lookalikesFirst: true, message: "docs: x" }, { status: 0, post: false, release: false }],
+  ["tag on ANOTHER commit with lookalikes listed first: fail", { tag: "other", lookalikesFirst: true, message: "feat: x" }, { status: 1, post: false, release: false }],
   ["tag exists on ANOTHER commit: fail, nothing moved", { tag: "other", message: "feat: x" }, { status: 1, post: false, release: false }],
   ["tag exists as an annotated tag: fail", { tag: "annotated", message: "feat: x" }, { status: 1, post: false, release: false }],
   ["tag lookup fails with a server error: fail, no tag", { tag: "error", message: "feat: x" }, { status: 1, post: false, release: false }],
@@ -313,6 +327,9 @@ export const releaseMutations = [
   ["the breaking footer is ignored", (t) => t.replace(" || [[ \"$message\" =~ $re_footer ]]; then", "; then")],
   ["the breaking marker is ignored", (t) => t.replace(' || [[ "$subject" =~ $re_breaking ]]', "")],
   ["perf is not a release type", (t) => t.replace("^(feat|fix|perf)", "^(feat|fix)")],
+  ["the exact-ref select is a startswith prefix match", (t) => t.replace(String.raw`select(.ref == \"refs/tags/$tag\")`, String.raw`select(.ref | startswith(\"refs/tags/$tag\"))`)],
+  ["the exact-ref select is an unanchored regex match", (t) => t.replace(String.raw`select(.ref == \"refs/tags/$tag\")`, String.raw`select(.ref | test(\"refs/tags/$tag\"))`)],
+  ["the exact-ref select is removed (every listed ref is taken)", (t) => t.replace(String.raw` --jq ".[] | select(.ref == \"refs/tags/$tag\") | .object.type + \" \" + .object.sha"`, "")],
   ["the tag is created before reading the tag state (always POST)", (t) => t.replace('[ "$obj_sha" = "$EVENT_SHA" ] || fail "the tag $tag exists on another commit: tags are never moved"', 'gh api -X POST "repos/$REPO/git/refs" -f "ref=refs/tags/$tag" -f "sha=$EVENT_SHA" > /dev/null')],
   ["an existing release is recreated", (t) => t.replace('if gh release view "$tag" --repo "$REPO" > /dev/null 2>&1; then', "if false; then")],
   ["the subject is evaluated", (t) => t.replace('subject="${message%%$\'\\n\'*}"', 'subject="${message%%$\'\\n\'*}"; eval "x=$subject"')],
