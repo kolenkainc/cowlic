@@ -827,7 +827,7 @@ def _covers_locked(args, directory: Path) -> int:
     plan = None
     if args.apply_plan:  # the owner's approval is checked before anything else is read or contacted
         try:
-            plan = bootstrap_covers.load_plan(args.apply_plan)
+            plan = bootstrap_covers.load_plan(args.apply_plan, today())
         except bootstrap_covers.PlanError as e:
             refuse(f"plan file unusable: {e}")
             return EXIT_USAGE

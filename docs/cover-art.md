@@ -354,13 +354,20 @@ The default path (`covers --max-new N --max-minutes M`, no flag below) is unchan
    `(Explicit)`, `Single - Name`, `Name-Single`, `Name - Single Remix` are NOT touched). (b) When one name is Latin only and the
    other Cyrillic only, the two names are also compared after the Latin -> Cyrillic transliteration table that the artist check
    already uses (a small deterministic table, no dependency). The table is lossy (`w` and `v` give the same letter), so it is
-   never applied to two Latin names. After either step, ratio, plural, number and edition checks apply unchanged; in the
-   transliteration step the edition words are also looked for in the original Latin words. The artist check applies unchanged.
+   never applied to two Latin names. After either step every guard of the default path still applies: only the name
+   similarity (ratio >= 0.9) is computed on the transliterated text; the number and Roman-numeral check and the edition-word
+   check run on the ORIGINAL words (the transliteration turns `ii` into `ии`), with both the Latin and a Cyrillic edition-word
+   list (`ремикс`, `делюкс`, `сингл`, `живой`, `версия`, `издание`, ...) on both sides; the plural check also sees the
+   transliterated `s` as `с`. Names longer than 200 characters never match (bounds the regex work). The artist check applies
+   unchanged.
 3. **`album_search`** (`bootstrap_covers.album_level`): for an album neither rule above accepts, one `ytmusicapi` search with
    filter `albums` for `<stored artist> <stored album>` (5 hits). A hit must pass the narrow album compare, the artist check
    (Cyrillic bar), the pseudo-artist denylist (`Various Artists`, `Unknown`, ...: stored artist and every credited artist), and a
-   TRACKLIST CHECK: `get_album` of the hit must list a track whose title meets the matcher's title bar (similarity or relaxed
-   similarity >= 0.85) with the same variant markers (a live or remix track is not the stored track). At most 3 `get_album`
+   TRACKLIST CHECK: `get_album` of the hit must list a track with the same variant markers as the stored one (a live or remix
+   track is not the stored track) and a title that meets the matcher's bar (similarity or relaxed similarity >= 0.85) together
+   with a duration within +-3 s when both the stored track and the page's `duration_seconds` are known; when either duration
+   is unknown the title alone must reach the stricter title-only bar 0.93 (numbered titles such as `Track A` / `Track B` score
+   0.86). At most 3 `get_album`
    calls per album; the first hit that passes everything wins and its own thumbnail (`=w1200-h1200-l90-rj`) is the cover. A
    candidate that fails the tracklist check is rejected. Per-track thumbnails for singles are NOT used: for a single the song's
    thumbnail is mostly the art of a compilation or of another artist's release.
@@ -386,7 +393,8 @@ ingest/.venv/bin/python ingest/bootstrap.py covers --dry-run --max-new N --max-m
   `false`; a new dry run overwrites the plan and resets it.
 - The owner reviews the plan (the cover URLs can be looked at in a browser; the album ids can be resolved against D1 by the
   owner) and, if it is right, sets `"approved": true` BY HAND in the file (an editor; the value must be the JSON `true`, not
-  `"true"` or `1`). Remove an entry to leave that album out. The file must not be group or world writable.
+  `"true"` or `1`). Remove an entry to leave that album out. The file must not be group or world writable, must be owned by the user who runs the apply, and must be no
+  more than 14 days old (its `created` date); otherwise the apply refuses and a new dry run is needed.
 - The real step:
 
 ```
@@ -399,8 +407,11 @@ ingest/.venv/bin/python ingest/bootstrap.py covers --apply-plan ~/.local/state/c
   `UPDATE albums SET cover_file_id = ? WHERE id = ? AND cover_file_id IS NULL` are the same as in section 7, so a cover that
   exists wins. `--retry-days 0` is needed again only if those albums still rest in the cooldown. A YouTube sign-in challenge
   is exit 3 as everywhere.
-- `scripts/run-bootstrap-local.sh` does not know `--dry-run` and `--apply-plan` yet (it rejects unknown options); run the two
-  steps through `bootstrap.py` directly, which takes the lock itself.
+- How to run: the commands above call `bootstrap.py` directly, which takes the lock itself. `scripts/run-bootstrap-local.sh
+  covers ...` also works: it does not special-case `--dry-run` and `--apply-plan`, it forwards them (like every option except
+  `--count`, `--r*` and `--m*`) to `bootstrap.py` and, as for any `covers` session, appends `--result-json`, applies its own
+  caps check and 21:10 guard and ships the result to Grafana. The plan checks live in `bootstrap.py`, so they hold on both
+  paths. This was read from the wrapper and its test, not run.
 
 ### 12.3 Honest expectation
 

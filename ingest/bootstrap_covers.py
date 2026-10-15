@@ -437,15 +437,25 @@ class AlbumResult:
     reason: str  # "ok" or one of SECOND_REASONS
 
 
-def tracklist_has(page, title: str) -> bool:
-    """True when the album page lists a track that is the stored title: the matcher's title bar (strict similarity or the
-    relaxed one, both >= TITLE_MIN_SIMILARITY) AND the same variant markers (a live or remix track is another recording)."""
+def tracklist_has(page, title: str, duration_s: int | None = None) -> bool:
+    """True when the album page lists a track that is the stored title and the same variant markers (a live or remix
+    track is another recording). With both durations known (stored track and the page's `duration_seconds`) the matcher's
+    bars apply: title similarity >= TITLE_MIN_SIMILARITY AND the durations within +-DURATION_TOLERANCE_S. When either
+    duration is unknown (ytmusicapi may omit it) there is nothing to back the title, so the stricter title-only bar
+    TITLE_ONLY_TITLE_MIN_SIMILARITY (0.93) applies instead: refusing every such page would block the source, accepting a
+    0.86 title on its own would take numbered titles ('Track A' / 'Track B') for the same track."""
     tracks = page.get("tracks") if isinstance(page, dict) else None
+    known = isinstance(duration_s, int) and not isinstance(duration_s, bool) and duration_s > 0
     for t in tracks if isinstance(tracks, list) else []:
         name = t.get("title") if isinstance(t, dict) else None
         if not isinstance(name, str) or not name:
             continue
-        if max(match.similarity(title, name), match.relaxed_similarity(title, name)) >= match.TITLE_MIN_SIMILARITY \
+        found = t.get("duration_seconds")
+        both = known and isinstance(found, int) and not isinstance(found, bool) and found > 0
+        if both and abs(found - duration_s) > match.DURATION_TOLERANCE_S:
+            continue
+        bar = match.TITLE_MIN_SIMILARITY if both else match.TITLE_ONLY_TITLE_MIN_SIMILARITY
+        if max(match.similarity(title, name), match.relaxed_similarity(title, name)) >= bar \
                 and match.title_parts(title)[1] == match.title_parts(name)[1]:
             return True
     return False
@@ -482,7 +492,7 @@ def album_level(todo: Todo, ytm) -> AlbumResult:
             break
         fetched += 1
         page = ytm.get_album(bid)
-        if not tracklist_has(page, todo.title):
+        if not tracklist_has(page, todo.title, todo.duration_s):
             reached = max(reached, 5)
             continue
         base = match.thumbnail_base(hit) or match.thumbnail_base(page)
@@ -604,15 +614,21 @@ class Plan:
     entries: dict
 
 
-def load_plan(path: Path) -> Plan:
+PLAN_MAX_AGE_DAYS = 14
+
+
+def load_plan(path: Path, today: datetime.date | None = None) -> Plan:
     """The plan for an apply run; PlanError for anything unusable. Strict: unknown fields, a malformed entry and a plan
-    that anybody but the owner can write are refused. `approved` must be the JSON value true."""
+    that anybody but the owner can write (group/world writable, or owned by another user) are refused, and so is a plan
+    older than PLAN_MAX_AGE_DAYS (the library moves on; run a new dry run). `approved` must be the JSON value true."""
     try:
         st = path.stat()
     except OSError as e:
         raise PlanError(f"cannot be read ({type(e).__name__})") from None
     if st.st_mode & 0o022:
         raise PlanError("is group or world writable; chmod 600 it")
+    if st.st_uid != os.geteuid():
+        raise PlanError("is not owned by the current user")
     try:
         doc = _read_state_doc(path)
     except CoverStateError as e:
@@ -622,6 +638,8 @@ def load_plan(path: Path) -> Plan:
     if isinstance(doc["version"], bool) or doc["version"] != PLAN_VERSION or not isinstance(doc["approved"], bool) \
             or not _iso_date(doc["created"]):
         raise PlanError("unknown version or malformed header")
+    if today is not None and (today - datetime.date.fromisoformat(doc["created"])).days > PLAN_MAX_AGE_DAYS:
+        raise PlanError(f"is older than {PLAN_MAX_AGE_DAYS} days; run a new dry run")
     entries = doc["entries"]
     if not isinstance(entries, dict) or len(entries) > PLAN_MAX_ENTRIES:
         raise PlanError("entries is not an object of a sane size")

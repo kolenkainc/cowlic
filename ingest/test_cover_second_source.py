@@ -8,12 +8,14 @@ import os
 import stat
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import bootstrap
 import bootstrap_covers as bc
 import ingest
 import match
 from test_bootstrap_covers import Base, FakeBackends, SENTINELS, cand
+from test_ingest import FixedToday
 from test_lastfm_source import NoNetwork
 
 THUMB = "https://lh3.googleusercontent.com/FAKEALBUMTHUMB=w226-h226-l90-rj"
@@ -126,6 +128,60 @@ class NormalisationTest(NoNetwork):
         self.assertEqual(match.cover_url_from_match("Quuxnaut Album - Single", "Zorblax", m, narrow=True),
                          (None, "artist_mismatch"))
 
+    # --- the bridge keeps every guard of the default path (review round 1 of #355) ---
+    LATIN = "Veter Peremen Dalnikh Dorog"
+    CYR = match.transliterate_to_cyrillic("Veter Peremen Dalnikh Dorog")
+
+    def test_the_bare_names_are_bridged(self):
+        self.assertEqual(self.CYR, "ветер перемен далних дорог")
+        self.assertTrue(self.narrow(self.LATIN, self.CYR))
+        self.assertTrue(self.narrow(self.CYR, self.LATIN))
+
+    def test_a_number_or_roman_numeral_on_one_side_is_another_release_through_the_bridge(self):
+        for mark in ("II", "III", "IV", "V", "X", "2", "7"):
+            with self.subTest(mark=mark):
+                self.assertFalse(self.narrow(self.LATIN + " " + mark, self.CYR))
+                self.assertFalse(self.narrow(self.CYR, self.LATIN + " " + mark))
+        self.assertFalse(self.narrow(self.LATIN + " 2", self.CYR + " 3"))
+
+    def test_a_cyrillic_edition_word_is_another_release_through_the_bridge(self):
+        for word in ("ремикс", "ремиксы", "версия", "сингл", "делюкс", "живой", "концерт", "часть", "том", "издание",
+                     "юбилейное", "расширенное", "бонус", "ремастер", "демо"):
+            with self.subTest(word=word):
+                self.assertFalse(self.narrow(self.LATIN, self.CYR + " " + word))
+                self.assertFalse(self.narrow(self.CYR + " " + word, self.LATIN))
+                self.assertFalse(self.narrow(self.LATIN, self.CYR + " (" + word + ")"))
+
+    def test_a_latin_edition_word_is_another_release_through_the_bridge(self):
+        for word in ("deluxe", "live", "remix", "single", "edition", "version"):
+            with self.subTest(word=word):
+                self.assertFalse(self.narrow(self.LATIN + " " + word, self.CYR))
+                self.assertFalse(self.narrow(self.CYR, self.LATIN + " (" + word + ")"))
+
+    def test_a_plural_only_pair_is_another_release_through_the_bridge(self):
+        self.assertFalse(self.narrow(self.LATIN + "s", self.CYR))
+        self.assertFalse(self.narrow(self.LATIN, match.transliterate_to_cyrillic(self.LATIN + "s")))
+
+    def test_the_bridged_names_keep_their_digit_and_roman_equality(self):
+        self.assertTrue(self.narrow(self.LATIN + " 2", self.CYR + " 2"))
+
+    def test_the_end_anchor_of_the_format_suffix(self):
+        self.assertEqual(match.strip_format_suffix("Name - Single Plus"), "Name - Single Plus")
+        self.assertEqual(match.strip_format_suffix("Name [Explicit] Plus"), "Name [Explicit] Plus")
+        self.assertEqual(match.strip_format_suffix("Name - Single"), "Name")
+        self.assertFalse(self.narrow("Name - Single Plus", "Name Plus"))
+
+    def test_an_overlong_name_is_rejected_fast(self):
+        import time
+        long_name = "x" + " - Single" * 3000
+        start = time.monotonic()
+        self.assertFalse(self.narrow(long_name, "x"))
+        self.assertFalse(self.narrow("x", long_name))
+        self.assertEqual(match.strip_format_suffix(long_name), long_name)
+        self.assertLess(time.monotonic() - start, 0.5)
+        self.assertTrue(self.narrow("a" * match.MAX_ALBUM_NAME_LEN, "a" * match.MAX_ALBUM_NAME_LEN))
+        self.assertFalse(self.narrow("a" * (match.MAX_ALBUM_NAME_LEN + 1), "a" * (match.MAX_ALBUM_NAME_LEN + 1)))
+
 
 class TracklistTest(NoNetwork):
     def run_level(self, tracks, **kw):
@@ -187,6 +243,44 @@ class TracklistTest(NoNetwork):
         self.assertEqual(level(todo(), ytm).reason, "no_thumbnail")
         ytm = StubYtm({"Zorblax Quuxnaut Album": [hit(thumb="http://insecure.example/x=w1")]}, {BID: page("Frobnitz Song")})
         self.assertEqual(level(todo(), ytm).reason, "no_thumbnail")
+
+    LONG = "Frobnitz Quuxnaut Wibblewobble Song"
+
+    def test_a_variant_marker_difference_rejects_even_a_long_title(self):
+        # strict similarity of the pair is >= 0.85, only the variant-marker equality tells them apart
+        self.assertGreaterEqual(match.similarity(self.LONG, self.LONG + " (Live)"), 0.85)
+        self.assertFalse(bc.tracklist_has(page(self.LONG + " (Live)"), self.LONG))
+        self.assertFalse(bc.tracklist_has(page(self.LONG), self.LONG + " (Live)"))
+        self.assertTrue(bc.tracklist_has(page(self.LONG), self.LONG))
+
+    @staticmethod
+    def timed(title, seconds):
+        return {"tracks": [{"title": title, "duration_seconds": seconds}]}
+
+    def test_the_durations_must_agree_when_both_are_known(self):
+        self.assertTrue(bc.tracklist_has(self.timed("Track A", 200), "Track A", 200))
+        self.assertTrue(bc.tracklist_has(self.timed("Track A", 203), "Track A", 200))
+        self.assertTrue(bc.tracklist_has(self.timed("Track A", 197), "Track A", 200))
+        self.assertFalse(bc.tracklist_has(self.timed("Track A", 204), "Track A", 200))
+        self.assertFalse(bc.tracklist_has(self.timed("Track A", 196), "Track A", 200))
+        self.assertTrue(bc.tracklist_has({"tracks": [{"title": "Track A", "duration_seconds": 400},
+                                                     {"title": "Track A", "duration_seconds": 201}]}, "Track A", 200))
+
+    def test_a_numbered_title_of_another_track_is_not_the_stored_track(self):
+        self.assertGreaterEqual(match.similarity("Track B", "Track A"), 0.85)
+        self.assertFalse(bc.tracklist_has(page("Track B"), "Track A", 200))                  # no page duration
+        self.assertFalse(bc.tracklist_has(self.timed("Track B", 200), "Track A"))            # no stored duration
+        self.assertFalse(bc.tracklist_has(self.timed("Track B", 120), "Track A", 200))
+
+    def test_without_a_known_duration_the_title_alone_needs_the_title_only_bar(self):
+        self.assertEqual(match.TITLE_ONLY_TITLE_MIN_SIMILARITY, 0.93)
+        self.assertTrue(bc.tracklist_has(page("Frobnitz Song"), "Frobnitz Song", 200))
+        self.assertTrue(bc.tracklist_has(page("Frobnitz Song"), "Frobnitz Song"))
+        self.assertTrue(bc.tracklist_has(self.timed("Frobnitz Song", None), "Frobnitz Song", 200))
+        self.assertTrue(bc.tracklist_has(self.timed("Frobnitz Song", 0), "Frobnitz Song", 200))
+        self.assertTrue(bc.tracklist_has(page("abcdefghi"), "abcdefghij", 200))              # 0.947 passes the 0.93 bar
+        self.assertFalse(bc.tracklist_has(page("abcdefghijklmnopqrs"), "abcdefghijklmnopqrstuv", 200))  # 0.92 fails it
+        self.assertTrue(bc.tracklist_has(self.timed("abcdefghijklmnopqrs", 200), "abcdefghijklmnopqrstuv", 200))  # 0.85+ with duration
 
 
 class AlbumLevelGuardsTest(NoNetwork):
@@ -516,6 +610,29 @@ class ApplyPlanTest(SecondSourceBase):
                 self.approve(mode=mode)
                 self.assertEqual(self.apply(), 2)
                 self.assertIn("writable", self.err)
+        self.assertEqual((self.d1.writes, self.fb.uploads), ([], []))
+
+    def test_a_plan_owned_by_another_user_is_refused(self):
+        self.mixed_library()
+        self.dry()
+        self.approve()
+        with mock.patch.object(bc.os, "geteuid", return_value=os.geteuid() + 1):
+            self.assertEqual(self.apply(), 2)
+        self.assertIn("not owned", self.err)
+        self.assertEqual((self.d1.writes, self.fb.uploads), ([], []))
+
+    def test_a_plan_older_than_14_days_is_refused(self):
+        self.assertEqual(bc.PLAN_MAX_AGE_DAYS, 14)
+        self.mixed_library()
+        self.dry()
+        self.approve()
+        self.today = FixedToday("2026-10-25")  # the dry run ran on 2026-10-11: day 14 is still fine
+        self.assertEqual(self.apply(), 0)
+        self.d1.writes.clear()
+        self.fb.uploads.clear()
+        self.today = FixedToday("2026-10-26")  # day 15
+        self.assertEqual(self.apply(), 2)
+        self.assertIn("older than 14 days", self.err)
         self.assertEqual((self.d1.writes, self.fb.uploads), ([], []))
 
     def test_an_approved_plan_applies_exactly_the_planned_covers_without_any_search(self):

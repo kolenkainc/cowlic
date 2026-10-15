@@ -226,6 +226,8 @@ _CYRILLIC = re.compile(r"[\u0400-\u04FF]")
 
 def strip_format_suffix(name: str) -> str:
     """Name without trailing ' - Single' / '[Explicit]' tokens; the original when nothing would be left."""
+    if len(name) > MAX_ALBUM_NAME_LEN:
+        return name  # unbounded input makes the repeated regex quadratic; the caller rejects such a name
     out = name.strip()
     while True:
         cut = _FORMAT_SUFFIX.sub("", out)
@@ -254,16 +256,44 @@ def _script_pair(a: str, b: str) -> bool:
         or (has_latin(b) and not _CYRILLIC.search(b) and bool(_CYRILLIC.search(a)) and not has_latin(a))
 
 
+_EDITION_WORDS_CYRILLIC = {"ремикс", "ремиксы", "версия", "сингл", "делюкс", "люкс", "живой", "живое", "концерт", "часть",
+                           "том", "издание", "юбилейное", "юбилейный", "расширенное", "расширенная", "бонус", "альбом",
+                           "акустика", "акустический", "инструментальный", "демо", "кавер", "караоке", "диск", "ремастер",
+                           "ремастеринг", "специальное", "эп"}
+_EDITION_WORDS_ANY = _EDITION_WORDS | _EDITION_WORDS_CYRILLIC
+MAX_ALBUM_NAME_LEN = 200  # real album names are far shorter; bounds the regex work (a longer name never matches)
+
+
+def _bridge_guards_ok(nw: str, nf: str, tw: str, tf: str) -> bool:
+    """Script-pair guards. Number, Roman numeral and edition checks run on the ORIGINAL words (nw/nf, before the
+    transliteration, which turns 'ii' into 'ии' and a Latin edition word into an unlisted Cyrillic one), with both the
+    Latin and the Cyrillic edition lists on both sides; the plural check also looks at the transliterated words
+    (a Latin plural 's' becomes 'с')."""
+    ow, of = set(nw.split()), set(nf.split())
+    if {w for w in ow if w.isdigit() or w in _ROMAN} != {w for w in of if w.isdigit() or w in _ROMAN}:
+        return False
+    if (ow ^ of) & _EDITION_WORDS_ANY:
+        return False
+    tws, tfs = set(tw.split()), set(tf.split())
+    diff = tws ^ tfs
+    if _plural_pair(ow, of) or _plural_pair(tws, tfs) or any(w + "\u0441" in diff for w in diff):
+        return False
+    return not diff & _EDITION_WORDS_ANY
+
+
 def albums_match(wanted: str, found: str, narrow: bool = False) -> bool:
     if not narrow:
         return _same_album(normalize(wanted), normalize(found))
+    if len(wanted) > MAX_ALBUM_NAME_LEN or len(found) > MAX_ALBUM_NAME_LEN:
+        return False
     nw, nf = normalize(strip_format_suffix(wanted)), normalize(strip_format_suffix(found))
     if _same_album(nw, nf):
         return True
     if _script_pair(nw, nf):
-        # the edition words are looked for in the ORIGINAL words too: a Latin 'deluxe' must not vanish in the transliteration
-        return _same_album(transliterate_to_cyrillic(nw), transliterate_to_cyrillic(nf)) \
-            and not (set(nw.split()) ^ set(nf.split())) & _EDITION_WORDS
+        tw, tf = transliterate_to_cyrillic(nw), transliterate_to_cyrillic(nf)
+        # only the name similarity is computed on the transliterated text; every guard also sees the original words
+        return bool(tw) and bool(tf) and SequenceMatcher(None, tw, tf).ratio() >= COVER_ALBUM_MIN_SIMILARITY \
+            and _bridge_guards_ok(nw, nf, tw, tf)
     return False
 
 
