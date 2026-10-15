@@ -11,6 +11,7 @@ trap 'rm -rf "$TMP" "$OUT"' EXIT
 failures=0
 assert() { if [ "$2" = 0 ]; then echo "PASS $1"; else echo "FAIL $1"; failures=$((failures + 1)); fi; }
 has() { grep -q -- "$1" "$2" 2> /dev/null && echo 0 || echo 1; }
+hasline() { grep -qxF -- "$1" "$2" 2> /dev/null && echo 0 || echo 1; }
 hasnt() { grep -q -- "$1" "$2" 2> /dev/null && echo 1 || echo 0; }
 
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
@@ -46,6 +47,12 @@ git -C "$R" worktree add -q -b feat/diverged "$TMP/wt-div" master
 echo d > "$TMP/wt-div/d"; git -C "$TMP/wt-div" add d; git -C "$TMP/wt-div" commit -q -m div
 git -C "$R" worktree add -q --detach "$TMP/wt-gone" master
 rm -rf "$TMP/wt-gone"
+# a non-ASCII branch name (git forbids control characters, space and glob characters in refs, but not these)
+UNI="caf$(printf '\303\251')-$(printf '\342\200\256')x"
+git -C "$R" branch "$UNI" master
+# a worktree whose .git file is broken: git status / log fail in it, it must never be reported merged-clean
+git -C "$R" worktree add -q -b feat/broken "$TMP/wt-broken" master
+echo "gitdir: $TMP/does-not-exist" > "$TMP/wt-broken/.git"
 
 # --- stub gh ---
 BIN="$TMP/bin"; mkdir -p "$BIN"
@@ -68,17 +75,30 @@ ESC="$(printf '\033')"
   printf 'MERGED%sfeat/diverged%s%s%s2\n' "$T" "$T" "0000000000000000000000000000000000000002" "$T"
   printf 'OPEN%sfeat/open-pr%s%s%s3\n' "$T" "$T" "1111111111111111111111111111111111111111" "$T"
 } > "$TMP/prs"
-{
-  echo "master"; echo "feat/open-pr"; echo "feat/orphan-remote"; echo "feat/squashed"
-  printf 'bad%s[31mname\n' "$ESC"
+HOSTILE_REMOTE='rem *$(touch P3) x'
+{ # remote branches: name, tip sha
+  printf 'master%s%s\n' "$T" "9999999999999999999999999999999999999999"
+  printf 'feat/open-pr%s%s\n' "$T" "1111111111111111111111111111111111111111"
+  printf 'feat/orphan-remote%s%s\n' "$T" "2222222222222222222222222222222222222222"
+  printf 'feat/squashed%s%s\n' "$T" "$SQ_SHA"                                        # tip == merged PR head: deletable
+  printf 'feat/diverged%s%s\n' "$T" "3333333333333333333333333333333333333333"      # name reused after merge: tip differs
+  printf '%s%s%s\n' "$HOSTILE_REMOTE" "$T" "4444444444444444444444444444444444444444"
+  printf 'bad%s[31mname%s%s\n' "$ESC" "$T" "5555555555555555555555555555555555555555"
 } > "$TMP/branches"
-{
-  printf '10%s2020-01-01T00:00:00Z%s-%sold ticket with no PR %s[31mred\n' "$T" "$T" "$T" "$ESC"
-  printf '11%s2020-01-01T00:00:00Z%s3%sold ticket with open PR\n' "$T" "$T" "$T"
-  printf '12%s2020-01-01T00:00:00Z%s1%sold ticket whose PR is merged\n' "$T" "$T" "$T"
-  printf '13%s2999-01-01T00:00:00Z%s-%sfresh ticket\n' "$T" "$T" "$T"
+{ # flag (P = In progress), number, updatedAt, closing PRs, title
+  printf 'P%s10%s2020-01-01T00:00:00Z%s-%sold ticket with no PR %s[31mred\n' "$T" "$T" "$T" "$T" "$ESC"
+  printf 'P%s11%s2020-01-01T00:00:00Z%s3%sold ticket with open PR\n' "$T" "$T" "$T" "$T"
+  printf 'P%s12%s2020-01-01T00:00:00Z%s1%sold ticket whose PR is merged\n' "$T" "$T" "$T" "$T"
+  printf 'P%s13%s2999-01-01T00:00:00Z%s-%sfresh ticket\n' "$T" "$T" "$T" "$T"
+  printf -- '-%s14%s2020-01-01T00:00:00Z%s-%sold ticket not In progress\n' "$T" "$T" "$T" "$T"
 } > "$TMP/issues"
-export STUB_PRS="$TMP/prs" STUB_BRANCHES="$TMP/branches" STUB_ISSUES="$TMP/issues"
+cat > "$BIN/pgrep" <<'STUB'
+#!/bin/sh
+cat "$STUB_PGREP"
+STUB
+chmod +x "$BIN/pgrep"
+: > "$TMP/pgrep"
+export STUB_PRS="$TMP/prs" STUB_BRANCHES="$TMP/branches" STUB_ISSUES="$TMP/issues" STUB_PGREP="$TMP/pgrep"
 
 snapshot() { { git -C "$R" worktree list --porcelain; git -C "$R" for-each-ref; git -C "$R" status --porcelain; find "$TMP" -path '*/.git' -prune -o -type f -print | sort; } | sha256sum; }
 run() { rc=0; (cd "$R" && PATH="$BIN:$PATH" bash scripts/hygiene-report.sh "$@" > "$OUT/out" 2> "$OUT/err") || rc=$?; }
@@ -102,7 +122,16 @@ assert "local branch with merged PR listed" "$(has 'feat/squashed: PR merged' "$
 assert "branch whose PR merged with another tip is flagged" "$(has 'feat/diverged: PR merged but the local tip differs' "$OUT/out")"
 assert "remote branch with open PR not listed" "$(hasnt 'feat/open-pr:' "$OUT/out")"
 assert "remote branch without PR listed" "$(has 'feat/orphan-remote: no PR' "$OUT/out")"
-assert "remote branch with merged PR listed" "$(has 'feat/squashed: PR merged, branch not deleted' "$OUT/out")"
+assert "remote branch whose tip is the merged PR head: deletable note" "$(hasline '   feat/squashed: PR merged, tip is the PR head (branch not deleted)' "$OUT/out")"
+assert "remote branch reused after merge (tip differs): do not delete" "$(hasline '   feat/diverged: PR merged but the remote tip differs: DO NOT DELETE (extra commits)' "$OUT/out")"
+assert "hostile remote name (spaces, *, \$(...)) printed as one exact line" "$(hasline '   rem *$(touch P3) x: no PR' "$OUT/out")"
+assert "hostile remote name did not execute or glob" "$([ ! -e "$R/P3" ] && [ ! -e "$TMP/P3" ] && echo 0 || echo 1)"
+assert "remote name with an escape character is sanitised to one exact line" "$(hasline '   bad[31mname: no PR' "$OUT/out")"
+assert "local hostile name printed as one exact line" "$(hasline '   evil$(touch${IFS}PWNED): tip is in origin/master' "$OUT/out")"
+assert "local non-ASCII name: non-ASCII bytes stripped, exact line" "$(hasline '   caf-x: tip is in origin/master' "$OUT/out")"
+assert "broken worktree is unknown, never merged-clean" "$([ "$(has 'unknown .*wt-broken' "$OUT/out")" = 0 ] && [ "$(hasnt 'merged-clean .*wt-broken' "$OUT/out")" = 0 ] && echo 0 || echo 1)"
+assert "broken worktree explained" "$(has 'git status/log failed' "$OUT/out")"
+assert "ticket not In progress not listed" "$(hasnt '#14:' "$OUT/out")"
 assert "ticket without PR listed" "$(has '#10: last updated' "$OUT/out")"
 assert "ticket with an open PR not listed" "$(hasnt '#11:' "$OUT/out")"
 assert "ticket whose PR is merged (not open) is listed" "$(has '#12:' "$OUT/out")"
@@ -133,6 +162,32 @@ run --days 9999
 assert "--days 9999: no ticket listed" "$(hasnt '#10:' "$OUT/out")"
 run --days abc
 assert "--days abc: falls back, exit 0" "$([ "$rc" = 0 ] && [ "$(has 'age threshold 7 days' "$OUT/out")" = 0 ] && echo 0 || echo 1)"
+
+# section 4: stub pgrep; only pid, a kind label and the executable basename may be printed, never an argument
+{
+  echo "4242 /usr/bin/bash /tmp/x/scripts/run-bootstrap-local.sh run --token SECRETARG123"
+  echo "4243 /tmp/x/ingest/.venv/bin/python SECRET2 -u"
+  echo "4244 node /opt/wrangler dev --secret=ABC987"
+  echo "4245 /usr/bin/env SECRETFIRSTARG workerd serve"
+} > "$TMP/pgrep"
+run
+assert "section 4: wrapper line is exactly pid, kind and executable basename" "$(hasline '   pid 4242: bootstrap test wrapper (bash)' "$OUT/out")"
+assert "section 4: stub python and wrangler lines" "$([ "$(hasline '   pid 4243: stub ingest python (python)' "$OUT/out")" = 0 ] && [ "$(hasline '   pid 4244: wrangler dev (node)' "$OUT/out")" = 0 ] && echo 0 || echo 1)"
+assert "section 4: no argument or secret-looking text is printed" "$([ "$(hasnt 'SECRETARG123\|SECRET2\|ABC987\|SECRETFIRSTARG\|/opt/wrangler\|/tmp/x' "$OUT/out")" = 0 ] && echo 0 || echo 1)"
+assert "section 4: total counts the processes" "$(has 'total: 4 matching processes' "$OUT/out")"
+: > "$TMP/pgrep"
+
+# fail closed also when every worktree check works but the answer is empty is covered by the broken worktree above;
+# truncation: a result that reaches the limit prints a warning
+HYGIENE_LIMIT=3 run
+assert "PR list at the limit: warning" "$(has 'WARNING: the PR list hit the limit' "$OUT/out")"
+assert "issue list at the limit: warning" "$(has 'WARNING: the issue list hit the limit' "$OUT/out")"
+run
+assert "below the limit: no warning" "$(hasnt 'WARNING' "$OUT/out")"
+
+# gh is pinned to the clone: run from another directory, the report is the same
+rc=0; (cd "$OUT" && PATH="$BIN:$PATH" bash "$R/scripts/hygiene-report.sh" > "$OUT/out2" 2> "$OUT/err2") || rc=$?
+assert "run from another directory: exit 0 and the same worktree section" "$([ "$rc" = 0 ] && [ "$(has 'merged-clean .*wt-merged' "$OUT/out2")" = 0 ] && echo 0 || echo 1)"
 
 if [ "$failures" -ne 0 ]; then echo "$failures FAILED"; exit 1; fi
 echo "all passed"

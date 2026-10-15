@@ -7,8 +7,8 @@
 #
 # Read-only by construction: it deletes, kills, edits and writes NOTHING (no branch -d, no worktree remove, no fetch,
 # no issue edit, no file written; output goes to stdout/stderr only). The only network use is read-only gh calls
-# (gh pr list, gh api GET, gh api graphql with queries, no mutation). Without gh, or with an unauthenticated gh, the
-# gh-based parts print a skip line. It never reads .env*, never prints the environment, tokens or ids. Every name
+# (gh auth status, gh pr list, gh api GET, gh issue list; no mutation). Needs GNU date (-d) and timeout (Linux; macOS
+# is not supported). Without gh, or with an unauthenticated gh, the gh-based parts print a skip line. It never reads .env*, never prints the environment, tokens or ids. Every name
 # that comes from outside (branch names, PR/issue titles, process command lines) is reduced to printable ASCII and
 # cut before it is printed, and is only ever passed to commands as a quoted argument or compared as data.
 # Test: scripts/test-hygiene-report.sh
@@ -33,6 +33,8 @@ case "$DAYS" in '' | *[!0-9]* | 0*) echo "hygiene-report: --days must be a posit
 ORG="kolenkainc"
 PROJECT_NUMBER=5
 GH_TIMEOUT=90
+LIMIT="${HYGIENE_LIMIT:-1000}"  # gh list limit (the env override is for the test); a warning is printed when a result reaches it
+case "$LIMIT" in '' | *[!0-9]* | 0*) LIMIT=1000 ;; esac
 
 # Printable ASCII only (strips control characters, escape sequences and non-ASCII such as bidi overrides), cut to 160.
 san() { printf '%s' "${1:-}" | LC_ALL=C tr -cd '\040-\176' | cut -c1-160; }
@@ -51,6 +53,7 @@ if [ -z "$ROOT" ] || ! git -C "$ROOT" rev-parse --git-dir > /dev/null 2>&1; then
   echo "hygiene-report: not inside a git repository; nothing to report"
   exit 0
 fi
+cd "$ROOT" || exit 0  # gh resolves {owner}/{repo} from the current directory: pin it to this clone
 G=(git -C "$ROOT" --no-optional-locks)
 CURRENT_TOP="$("${G[@]}" rev-parse --show-toplevel 2> /dev/null || true)"
 
@@ -72,9 +75,12 @@ fi
 declare -A MERGED_SHA=() MERGED_BRANCH=() OPEN_BRANCH=() OPEN_PR_NUM=()
 PR_OK=0
 if [ "$GH_OK" = 1 ]; then
-  if pr_tsv="$(timeout "$GH_TIMEOUT" gh pr list --state all --limit 1000 --json number,state,headRefName,headRefOid \
+  if pr_tsv="$(timeout "$GH_TIMEOUT" gh pr list --state all --limit "$LIMIT" --json number,state,headRefName,headRefOid \
     --jq '.[] | [.state, .headRefName, .headRefOid, .number] | @tsv' 2> /dev/null)"; then
     PR_OK=1
+    if [ "$(printf '%s\n' "$pr_tsv" | grep -c .)" -ge "$LIMIT" ]; then
+      echo "WARNING: the PR list hit the limit of ${LIMIT}; it may be truncated and merged branches may show as 'no PR'"
+    fi
     while IFS=$'\t' read -r st br sha prnum; do
       case "$st" in
         MERGED) MERGED_SHA["$sha"]=1; MERGED_BRANCH["$br"]="$sha" ;;
@@ -97,7 +103,7 @@ is_merged_pr_head() { [ "$PR_OK" = 1 ] && [ -n "${MERGED_SHA["$1"]+x}" ]; }
 echo
 echo "## 1. git worktrees (merged-clean / stale / unmerged / dirty)"
 echo "   merged = HEAD is in origin/master (as of the last fetch) or is the head of a merged PR"
-n_wt=0; n_mc=0; n_stale=0; n_unm=0; n_dirty=0; n_other=0
+n_wt=0; n_mc=0; n_stale=0; n_unm=0; n_dirty=0; n_other=0; n_unk=0
 wt_path=""; wt_head=""; wt_branch=""; wt_flags=""; wt_idx=0
 flush_wt() {
   [ -n "$wt_path" ] || return 0
@@ -117,19 +123,30 @@ flush_wt() {
     n_other=$((n_other + 1)); n_wt=$((n_wt + 1)); wt_path=""; return 0
   fi
   n_wt=$((n_wt + 1))
-  if [ -n "$("${G[@]}" -C "$wt_path" status --porcelain --untracked-files=normal 2> /dev/null | head -n 1)" ]; then dirty=1; fi
-  cts="$("${G[@]}" -C "$wt_path" log -1 --format=%ct 2> /dev/null || true)"
+  # Fail closed: a failing git status / git log (or an empty answer) means UNKNOWN, never clean.
+  local st_out st_rc log_rc unknown=0
+  st_out="$("${G[@]}" -C "$wt_path" status --porcelain --untracked-files=normal 2> /dev/null)"; st_rc=$?
+  [ "$st_rc" -eq 0 ] || unknown=1
+  [ -z "$st_out" ] || dirty=1
+  cts="$("${G[@]}" -C "$wt_path" log -1 --format=%ct 2> /dev/null)"; log_rc=$?
+  [ "$log_rc" -eq 0 ] || unknown=1
   age="$(age_days "$cts")"
+  [ "$age" != "?" ] || unknown=1
+  [ -n "$wt_head" ] || unknown=1
   local merged=0 why=""
   if is_in_master "$wt_head"; then merged=1; why="in origin/master"
   elif is_merged_pr_head "$wt_head"; then merged=1; why="head of a merged PR"; fi
-  if [ "$wt_idx" -eq 1 ]; then
+  if [ "$unknown" = 1 ]; then
+    cls="unknown"; n_unk=$((n_unk + 1)); why="git status/log failed: look by hand, do not remove"; merged=0
+  elif [ "$wt_idx" -eq 1 ]; then
     cls="main"; n_other=$((n_other + 1))
   elif [ "$dirty" = 1 ]; then cls="dirty"; n_dirty=$((n_dirty + 1))
   elif [ "$merged" = 1 ]; then cls="merged-clean"; n_mc=$((n_mc + 1))
   elif [ "$age" != "?" ] && [ "$age" -ge "$DAYS" ]; then cls="stale"; n_stale=$((n_stale + 1))
   else cls="unmerged"; n_unm=$((n_unm + 1)); fi
-  label="clean"; [ "$dirty" = 0 ] || label="DIRTY (uncommitted work: do not remove blindly)"
+  label="clean (no tracked/untracked changes; ignored files not counted)"
+  [ "$dirty" = 0 ] || label="DIRTY (uncommitted work: do not remove blindly)"
+  [ "$unknown" = 0 ] || label="state unknown"
   printf '   %-14s %s%s\n' "$cls" "$(short_path "$wt_path")" "$tag"
   printf '                  branch=%s head=%s last-commit=%sd ago %s%s\n' "$(san "$br")" "$(san "${wt_head:0:9}")" "$age" "$label" \
     "${why:+; $why}"
@@ -145,7 +162,7 @@ if wt_out="$("${G[@]}" worktree list --porcelain 2> /dev/null)"; then
     esac
   done <<< "$wt_out"
   flush_wt
-  echo "   total: ${n_wt} worktrees: ${n_mc} merged-clean, ${n_stale} stale, ${n_unm} unmerged, ${n_dirty} dirty, ${n_other} other"
+  echo "   total: ${n_wt} worktrees: ${n_mc} merged-clean, ${n_stale} stale, ${n_unm} unmerged, ${n_dirty} dirty, ${n_unk} unknown, ${n_other} other"
 else
   echo "   skipped: git worktree list failed"
 fi
@@ -181,15 +198,15 @@ echo
 echo "## 3. remote branches without an open PR"
 remote_names=""
 src=""
-if [ "$GH_OK" = 1 ] && remote_names="$(timeout "$GH_TIMEOUT" gh api --paginate 'repos/{owner}/{repo}/branches?per_page=100' --jq '.[].name' 2> /dev/null)"; then
+if [ "$GH_OK" = 1 ] && remote_names="$(timeout "$GH_TIMEOUT" gh api --paginate 'repos/{owner}/{repo}/branches?per_page=100' --jq '.[] | [.name, .commit.sha] | @tsv' 2> /dev/null)"; then
   src="GitHub (gh api, read-only)"
 else
-  remote_names="$("${G[@]}" for-each-ref --format='%(refname:lstrip=3)' refs/remotes/origin 2> /dev/null || true)"
+  remote_names="$("${G[@]}" for-each-ref --format='%(refname:lstrip=3)%09%(objectname)' refs/remotes/origin 2> /dev/null || true)"
   src="local remote-tracking refs (last fetch; PR status unknown without gh)"
 fi
 echo "   source: ${src}"
 n_rb=0; n_rb_total=0
-while IFS= read -r name; do
+while IFS=$'\t' read -r name rsha; do
   [ -n "$name" ] || continue
   case "$name" in master | HEAD) continue ;; esac
   n_rb_total=$((n_rb_total + 1))
@@ -197,7 +214,10 @@ while IFS= read -r name; do
     [ -z "${OPEN_BRANCH["$name"]+x}" ] || continue
     case "$name" in
       gh-readonly-queue/*) note="merge queue branch (transient)" ;;
-      *) if [ -n "${MERGED_BRANCH["$name"]+x}" ]; then note="PR merged, branch not deleted"; else note="no PR"; fi ;;
+      *)
+        if is_merged_pr_head "$rsha"; then note="PR merged, tip is the PR head (branch not deleted)"
+        elif [ -n "${MERGED_BRANCH["$name"]+x}" ]; then note="PR merged but the remote tip differs: DO NOT DELETE (extra commits)"
+        else note="no PR"; fi ;;
     esac
   else
     note="PR status unknown"
@@ -215,9 +235,17 @@ n_pr=0
 if command -v pgrep > /dev/null 2>&1; then
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    # pid and the first two words only (the executable and the script path), never the arguments
-    read -r -a w <<< "$(printf '%s' "$line" | LC_ALL=C tr -cd '\040-\176')"
-    printf '   pid %s: %s\n' "$(san "${w[0]:-?}")" "$(san "${w[1]:-} ${w[2]:-}")"
+    # pid, a kind label chosen by pattern, and the BASENAME of the executable only: never any argument
+    clean="$(printf '%s' "$line" | LC_ALL=C tr -cd '\040-\176')"
+    read -r -a w <<< "$clean"
+    case "$clean" in
+      *run-bootstrap-local.sh*) kind="bootstrap test wrapper" ;;
+      */ingest/.venv/bin/python*) kind="stub ingest python" ;;
+      *workerd*) kind="workerd" ;;
+      *wrangler\ dev*) kind="wrangler dev" ;;
+      *) kind="other match" ;;
+    esac
+    printf '   pid %s: %s (%s)\n' "$(san "${w[0]:-?}")" "$kind" "$(san "${w[1]##*/}")"
     n_pr=$((n_pr + 1))
   done < <(pgrep -af -- '/tmp/.*/scripts/run-bootstrap-local\.sh|/tmp/.*/ingest/\.venv/bin/python|workerd|wrangler dev' 2> /dev/null || true)
 else
@@ -235,12 +263,14 @@ elif [ "$PR_OK" != 1 ]; then
 else
   # One read-only call; gh pages through the issues itself (limit 1000). The Status comes with each issue
   # (projectItems), which also covers items the project items listing was seen to lag behind on.
-  if board="$(timeout "$GH_TIMEOUT" gh issue list --state open --limit 1000 --json number,updatedAt,title,projectItems,closedByPullRequestsReferences \
-    --jq '.[] | select(any(.projectItems[]?; .status.name == "In progress")) | [.number, .updatedAt, ([.closedByPullRequestsReferences[]?.number | tostring] | if length == 0 then "-" else join(",") end), .title] | @tsv' 2> /dev/null)"; then
-    n_t=0; n_all=0
-    while IFS=$'\t' read -r num upd prs title; do
+  if board="$(timeout "$GH_TIMEOUT" gh issue list --state open --limit "$LIMIT" --json number,updatedAt,title,projectItems,closedByPullRequestsReferences \
+    --jq '.[] | [(if any(.projectItems[]?; .status.name == "In progress") then "P" else "-" end), .number, .updatedAt, ([.closedByPullRequestsReferences[]?.number | tostring] | if length == 0 then "-" else join(",") end), .title] | @tsv' 2> /dev/null)"; then
+    n_t=0; n_all=0; n_issues=0
+    while IFS=$'\t' read -r flag num upd prs title; do
       [ -n "$num" ] || continue
       case "$num" in *[!0-9]*) continue ;; esac
+      n_issues=$((n_issues + 1))
+      [ "$flag" = P ] || continue
       n_all=$((n_all + 1))
       has_open=0
       IFS=',' read -r -a pr_arr <<< "$prs"
@@ -255,6 +285,7 @@ else
       n_t=$((n_t + 1))
       printf '   #%s: last updated %sd ago: %s\n' "$num" "$d" "$(san "$title")"
     done <<< "$board"
+    if [ "$n_issues" -ge "$LIMIT" ]; then echo "   WARNING: the issue list hit the limit of ${LIMIT}; the result may be truncated"; fi
     echo "   total: ${n_t} tickets (of ${n_all} In progress; age = days since the issue was last updated; only PRs linked as closing the issue count, a PR that says Refs does not)"
   else
     echo "   skipped: the issue query failed (see docs/hygiene.md for the command)"
