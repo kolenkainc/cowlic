@@ -2,10 +2,12 @@
 # `release` tags every master commit with v + the validated MajorMinorPatch output of `version`). Docs: docs/releasing.md
 workflow: GitHubFlow/v1
 
-# Intermittent use only: remove this line in the PR that follows the first v3.0.0 tag (docs/releasing.md). The release
-# job creates that tag on the first master commit after it exists; the line is expected to be harmless afterwards
-# (docs/releasing.md records that at the tag v3.0.0 a docs commit computes 3.0.1); the owner removes it when convenient.
-next-version: v3.0.0
+# FLOOR (verified on GitVersion 6.8.2, docs/releasing.md): the calculated version is raised to this value when it is
+# lower. Raised to v4.0.0 so that the first master commit whose release run completes, normally the squash commit
+# of the PR that starts Release 4 (merged alone), is tagged v4.0.0 (a tag only, no GitHub Release: the title is not
+# breaking; a later feat/fix/perf commit taking the tag would also get a Release). With the tag v4.0.0 present the
+# line did not change results (docs 4.0.1, feat 4.1.0, measured). Raise it again for Release 5 (v5.0.0).
+next-version: v4.0.0
 
 # Explicit on purpose: the tag `release-2` (pre-GitVersion) is not a version and must stay ignored.
 tag-prefix: 'v'
