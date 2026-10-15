@@ -156,9 +156,11 @@ Current state [V]:
 - Artist entries (`getArtists`, `getIndexes`, `getArtist`, `search3`) have `id, name, albumCount` only: no `coverArt`.
 - `stubs.ts`: `getArtistInfo` and `getArtistInfo2` return an empty `artistInfo`/`artistInfo2` object, no image URLs;
   `getUser` has `coverArtRole: false`.
-- `upsert_statements` upserts the album with `cover_file_id = COALESCE(excluded.cover_file_id, albums.cover_file_id)`, and
+- `upsert_statements` upserts the album with `cover_file_id = COALESCE(albums.cover_file_id, excluded.cover_file_id)` (stored value first: a stored cover is never replaced by the SQL itself, #271), and
   `process_track` keeps a run-local `covers` dict `album_id -> file_id` loaded once at start from D1 [V `ingest.py:2092`].
   `Deps` has `upload_cover(song, dir)` that works from `song["cover_url"]`.
+  The SQL alone protects a stored cover, the dict only saves the upload. A wrong cover is replaced by a manual D1 update
+  (`UPDATE albums SET cover_file_id = ? WHERE id = ?`) by the owner; a dedicated replace tool is not needed (#271).
 
 ### (a) Album covers only (no schema or Worker change)
 

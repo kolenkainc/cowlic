@@ -1780,5 +1780,39 @@ class CrossSourceTest(unittest.TestCase):
         self.assertIsNone(calls[0][1])
 
 
+class AlbumCoverUpsertTest(unittest.TestCase):
+    """#271: the album statement itself keeps a stored cover; the in-run `covers` dict is not the only protection.
+    Runs the real statements against sqlite built from the real migration 0001 (no artists.image_file_id column)."""
+
+    def setUp(self):
+        import sqlite3
+        self.con = sqlite3.connect(":memory:")
+        self.addCleanup(self.con.close)
+        self.con.executescript((Path(__file__).resolve().parent.parent / "worker" / "migrations" / "0001_init.sql").read_text())
+
+    def run_with(self, *covers):
+        for c in covers:
+            for sql, params in ingest.upsert_statements(SONG, 1, "f", 1, c):
+                self.con.execute(sql, params)
+        return self.con.execute("SELECT cover_file_id FROM albums").fetchall()
+
+    def test_null_then_cover_fills(self):
+        self.assertEqual(self.run_with(None, "C1"), [("C1",)])
+
+    def test_stored_cover_is_not_replaced_by_a_new_one(self):
+        self.assertEqual(self.run_with("C1", "C2"), [("C1",)])
+
+    def test_stored_cover_survives_a_null(self):
+        self.assertEqual(self.run_with("C1", None), [("C1",)])
+
+    def test_both_null_stays_null(self):
+        self.assertEqual(self.run_with(None, None), [(None,)])
+
+    def test_statement_text_is_stored_first(self):
+        sql = ingest.upsert_statements(SONG, 1, "f", 1, "C")[1][0]
+        self.assertIn("COALESCE(albums.cover_file_id, excluded.cover_file_id)", sql)
+        self.assertNotIn("COALESCE(excluded.cover_file_id", sql)
+
+
 if __name__ == "__main__":
     unittest.main()

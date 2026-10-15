@@ -538,7 +538,7 @@ def too_big(size_bytes: int) -> bool:
 
 def upsert_statements(song: dict, size_bytes: int, tg_file_id: str, tg_message_id: int,
                       cover_file_id: str | None, artist_image_file_id: str | None = None) -> list[tuple[str, list]]:
-    """Parameterized SQL for one track. Existing cover_file_id is kept when no new cover is given. The artist statement
+    """Parameterized SQL for one track. A stored cover_file_id always wins (COALESCE stored-first, #271): a new cover only fills a NULL. The artist statement
     mentions image_file_id ONLY when there is an image to write (#251): without one it is the statement it always was, so
     a database without the column (migration 0003 not applied) never sees the name."""
     artist, album = primary_artist(song), song.get("album_name") or UNKNOWN_ALBUM
@@ -553,7 +553,7 @@ def upsert_statements(song: dict, size_bytes: int, tg_file_id: str, tg_message_i
         artist_stmt,
         ("INSERT INTO albums (id, artist_id, name, year, cover_file_id) VALUES (?, ?, ?, ?, ?) "
          "ON CONFLICT(id) DO UPDATE SET name = excluded.name, year = excluded.year, "
-         "cover_file_id = COALESCE(excluded.cover_file_id, albums.cover_file_id)",
+         "cover_file_id = COALESCE(albums.cover_file_id, excluded.cover_file_id)",
          [al, ar, album, song.get("year") or None, cover_file_id]),
         ("INSERT INTO tracks (id, spotify_id, album_id, title, track_no, disc_no, duration_s, suffix, "
          "content_type, size_bytes, tg_file_id, tg_message_id) "
