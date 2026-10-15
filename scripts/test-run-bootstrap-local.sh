@@ -406,6 +406,17 @@ new_case cov-g-near; COWLIC_BOOTSTRAP_NOW_EPOCH="$(epoch '2026-10-11 21:10:30')"
 assert "covers: within 60 s after 21:10 that day's run still counts" "$(is "$rc" 78)"
 new_case cov-opt; run covers --max-new 3 --max-minutes 5 --retry-days 0
 assert "covers: other options are forwarded untouched" "$([ "$rc" = 0 ] && grep -qx -e '--retry-days' "$STUB_ARGS" && echo 0 || echo 1)"
+# 10d. covers --artists (#253): a mode flag of covers, so every rule of covers applies unchanged (no wrapper logic of its own)
+new_case cov-art; run covers --artists --max-new 5 --max-minutes 10
+assert "covers --artists: forwarded verbatim then --result-json, shipped" "$([ "$rc" = 0 ] && [ "$(cat "$STUB_ARGS")" = "$(printf '%s\n' covers --artists --max-new 5 --max-minutes 10 --result-json "$S/cowlic/.bootstrap-result.json")" ] && [ -s "$STUB_SHIP_CALLS" ] && echo 0 || echo 1)"
+new_case cov-art-g; COWLIC_BOOTSTRAP_NOW_EPOCH="$(epoch '2026-10-11 12:00:00')" run covers --artists --max-new 1 --max-minutes 600
+assert "covers --artists: the 21:10 guard applies" "$([ "$rc" = 78 ] && [ "$(nothing_started)" = 0 ] && echo 0 || echo 1)"
+new_case cov-art-count; COWLIC_BOOTSTRAP_NOW_EPOCH="$(epoch '2026-10-11 21:09:30')" run covers --artists --count
+assert "covers --artists --count: no guard, no --result-json, ships nothing" "$([ "$rc" = 0 ] && [ "$(cat "$STUB_ARGS")" = "$(printf '%s\n' covers --artists --count)" ] && [ ! -e "$STUB_SHIP_CALLS" ] && echo 0 || echo 1)"
+reject "covers --artists without caps" covers --artists
+reject "covers --artists --count with --max-new" covers --artists --count --max-new 5
+new_case cov-art-rc3; STUB_RC=3; export STUB_RC; run covers --artists --max-new 1 --max-minutes 1; unset STUB_RC
+assert "covers --artists: exit 3 passed through, sign-in recorded" "$([ "$rc" = 3 ] && python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["stop_reason"]=="sign-in"' "$S/cowlic/bootstrap-last-run.json" > /dev/null 2>&1 && echo 0 || echo 1)"
 
 # 11. mutation checks: break one rule at a time in a copy of the wrapper; the scenario that guards the rule must fail
 # on the mutant and pass on the original. A scenario prints 0 when the wrapper behaves correctly.
