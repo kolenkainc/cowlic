@@ -314,11 +314,12 @@ export const SHIP_STEPS = [
   ["Summary (migration failed)", "acec1b7d5f778fbe1c02674eed7b403f452647fffeaa0aa87b0ff7c4784d31c2"],
   // ---- the deploy half starts here
   ["Mask the Worker URL", "c8f09d5c3572bef7b1ce6f95543117c2edd8237a53174703d0c92e3e868255ba"],
+  ["Read previous active version", "418c6b33cc459867959713e489180afcfdaf8a72e31fdcc9764d088c3c86fae8"],
   ["Deploy", "f630aa601eae9f6834fb7cc28ad4dbbb6e658611d5244508172d129fec2ca6af"],
   ["Read the deployed version id", "de5233864aec802f8c157c4c5aae9d070489d049beda83988b5d0e38890f3e38"],
   ["Health check", "f2e5399f3fdfeabc739c0ef0bef98c508b18d4b269aa670368e8d25d80415e51"],
   ["Summary", "e27a444b6ac8a8c35e2cd87a940501dc2a5416860447ffb3da463c25fbf788c4"],
-  ["Summary (failure after deploy)", "87510a57606193668fdd0ab1a4d4057f2e857dab2d67f2e1c062a62abad071e8"],
+  ["Summary (failure after deploy)", "e0a167e401c19cf91ccce93a4a3ee0a838d99e3acba59ff1721195fbb9a3afbe"],
 ];
 // The only steps of ship that may run after a failure (`always()`): they write the job summary and nothing else.
 export const SHIP_ALWAYS = ["Summary (migration failed)", "Summary (failure after deploy)"];
