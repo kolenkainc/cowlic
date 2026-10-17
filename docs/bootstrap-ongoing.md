@@ -402,6 +402,8 @@ owner does not accept storing the ranking, there is no ranking file for the nigh
 is then the D1 artists (the only other set that exists without a Last.fm call); with no ranking AND no D1 artists
 the phase logs one line and does nothing. [P]
 
+Implementation correction (#238): a stored album row can come from a single successful track and is not proof of a complete release. Unevaluated releases with a matching stored album title are fetched within the existing release budget, then deduplicated against stored tracks. Only fully handled releases enter `evaluated`; capped releases remain due, and failed tracks retain the normal recheck interval and cooldown. Matching stored titles also bypass the age filter so that a newer stored album cannot hide a partial older one.
+
 The check compares releases against D1 album names per artist, so the phase needs one more read-only,
 parameterless D1 query once per run (artist name, album name, year of every album, in the pattern of
 `STORED_ROWS_SQL` [V]); `albums` has `artist_id`, `name`, `year INTEGER` [V, `worker/migrations/0001_init.sql`].

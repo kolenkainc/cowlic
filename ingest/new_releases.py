@@ -2,8 +2,8 @@
 
 Pure module, nothing here is wired into ingest.py (that is #172). For one artist it lists the newest releases on
 YouTube Music (`get_artist_albums(order="Recency")`, FIRST page only, albums and singles, unauthenticated), takes
-the SET DIFFERENCE against the album names D1 holds for that artist (`match.normalize` on both sides), fetches the
-tracks of every missing release (`get_album`), and returns ingest records for the tracks that `dedupe.drop_stored`
+the SET DIFFERENCE against the evaluated release keys, fetches the tracks of each unevaluated release (`get_album`),
+and returns ingest records for the tracks that `dedupe.drop_stored`
 says are not stored yet. No since, no watermark, no lookback_days: the source gives a year only.
 
 The source is injected (`MusicSource`, ytmusicapi.YTMusic fits it); tests use a fake and never go online.
@@ -438,15 +438,16 @@ def parse_releases(raw, kind: str) -> list[Release]:
 class Missing:
     candidates: list[Release]
     listed: int
-    in_library: int = 0     # normalised title found among the stored albums
+    in_library: int = 0     # title found among stored albums; does not prove all tracks are stored
     evaluated: int = 0      # key in the evaluated set
     skipped_old: int = 0    # clearly older than the newest stored album year
 
 
 def find_missing(releases: list[Release], stored_albums: Iterable[tuple], evaluated: Iterable[str],
                  year_margin: int = YEAR_MARGIN) -> Missing:
-    """The SET DIFFERENCE on (artist, normalised title). `stored_albums` are (album name, year or None) of THIS
-    artist in D1. A release is missing when its normalised title is not among them and its key is not evaluated.
+    """The SET DIFFERENCE on evaluated release keys. `stored_albums` are (album name, year or None) of THIS
+    artist in D1. An album row can represent a partial upload: only an evaluated key proves completion.
+    An unevaluated stored album is re-read and deduplicated at track level, even if a newer album is now stored.
     The year is a skip filter only (older than the newest stored year minus the margin: skipped); a release without
     a year is always a candidate. Dated candidates come first, newest first; undated ones follow."""
     names: set[str] = set()
@@ -461,11 +462,12 @@ def find_missing(releases: list[Release], stored_albums: Iterable[tuple], evalua
     done = set(evaluated)
     res = Missing([], len(releases))
     for rel in releases:
-        if normalize(rel.title) in names:
+        stored = normalize(rel.title) in names
+        if stored:
             res.in_library += 1
-        elif rel.key in done:
+        if rel.key in done:
             res.evaluated += 1
-        elif rel.year is not None and newest is not None and rel.year < newest - year_margin:
+        elif not stored and rel.year is not None and newest is not None and rel.year < newest - year_margin:
             res.skipped_old += 1
         else:
             res.candidates.append(rel)

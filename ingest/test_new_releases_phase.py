@@ -229,8 +229,7 @@ class Caps(Base):
         self.assertNotIn("checked_at", cut)
         self.assertEqual(cut.get("evaluated", []), [])
         # the next night checks the cut artist again (first, it is the oldest due one) and goes on with the others.
-        # Limit (#238): this fake D1 forgets uploads; with a real one a release of which only some tracks landed is
-        # "in library" afterwards and its remaining tracks are NOT retried.
+        # This legacy fixture forgets uploads; PartialReleases below also covers a remembering D1.
         code, r, _ = self.run_main(f"- {URL}\n{SECTION}  max_new: 3\n")
         self.assertEqual(self.entry(artist_names(15)[1])["checked_at"], day(0))
         self.assertEqual(r["new_releases"]["checked"], 2)  # artist 1 again (2 tracks), then artist 2 (cut at 3)
@@ -286,6 +285,68 @@ class Caps(Base):
         self.assertEqual((pl3.parent.attempted, pl3.exhausted()), (1, "cap"))
 
 
+class PartialReleases(Base):
+    def setUp(self):
+        super().setUp()
+        self.rows = []
+        self.pending_song = None
+        base = self.deps
+
+        def deps():
+            original = base()
+
+            def upload(song, path):
+                self.pending_song = song
+                return original.upload_audio(song, path)
+
+            def persist(statements):
+                song = self.pending_song
+                self.rows.append((song["name"], song["artists"][0], song["duration"]))
+                self.stored_albums.append({"artist": song["album_artist"], "album": song["album_name"],
+                                           "year": song["year"]})
+                return []
+            return dataclasses.replace(original, upload_audio=upload, d1_batch=persist)
+        self.deps = deps
+
+    def test_capped_album_resumes_only_its_missing_track_and_then_is_evaluated(self):
+        names = artist_names(1)
+        sources = f"- {URL}\n{SECTION}  max_new: 1\n"
+        code, result, _ = self.run_main(sources, names=names, stored=self.rows)
+        self.assertEqual((code, result["new_releases"]["added"]), (0, 1))
+        self.assertEqual(len(self.stored_albums), 1)
+        self.assertEqual(self.entry(names[0])["evaluated"], [])
+        code, result, _ = self.run_main(sources, names=names, stored=self.rows)
+        self.assertEqual((code, result["new_releases"]["added"]), (0, 1))
+        self.assertEqual(self.uploaded, tracks_of(0))
+        self.assertEqual(self.entry(names[0])["evaluated"], [new_releases.release_key("Zyxel Album 00", 2026)])
+        # The third due check does not fetch or upload the completed release again.
+        entry = self.entry(names[0])
+        entry["checked_at"] = day(-7)
+        self.write_nr_state({names[0]: entry})
+        code, result, _ = self.run_main(sources, names=names, stored=self.rows)
+        self.assertEqual((code, result["new_releases"]["added"]), (0, 0))
+        self.assertNotIn("get_album", self.ytm.calls)
+        self.assertEqual(self.uploaded, tracks_of(0))
+
+    def test_failed_track_is_retried_after_cooldown_despite_the_album_row(self):
+        names = artist_names(1)
+        sources = f"- {URL}\n{SECTION}"
+        self.deps_fail = {tracks_of(0)[1]: ingest.IngestError("synthetic failure")}
+        code, result, _ = self.run_main(sources, names=names, stored=self.rows)
+        self.assertEqual((code, result["new_releases"]["added"]), (1, 1))
+        self.assertEqual(self.entry(names[0])["evaluated"], [])
+        self.deps_fail.clear()
+        # A due check seven days later also exceeds the engine's three-day failed-track cooldown.
+        load = ingest.RunState.load
+        later = lambda: TODAY + datetime.timedelta(days=7)
+        with mock.patch.object(ingest.RunState, "load",
+                               side_effect=lambda *a, **kw: load(*a, **kw, today=later)):
+            code, result, _ = self.run_main(sources, names=names, stored=self.rows)
+        self.assertEqual((code, result["new_releases"]["added"]), (0, 1))
+        self.assertEqual(self.uploaded, tracks_of(0))
+        self.assertEqual(len(self.entry(names[0])["evaluated"]), 1)
+
+
 class RequestBudget(Base):
     def test_first_night_and_second_night_requests_and_pacing(self):
         names = artist_names(1)
@@ -297,8 +358,8 @@ class RequestBudget(Base):
         self.write_nr_state({names[0]: {"browse_id": "UC0", "checked_at": day(-7), "evaluated": []}})
         self.stored_albums = [{"artist": names[0], "album": "Zyxel Album 00", "year": 2026}]
         self.run_main(f"- {URL}\n{SECTION}", names=names)
-        # the second night: no search (browse id cached), the release is in the library: no get_album
-        self.assertEqual(self.ytm.calls, ["get_artist", "get_artist_albums", "get_artist_albums"])
+        # The album row alone is not completion evidence: re-read its tracks, with no extra search.
+        self.assertEqual(self.ytm.calls, ["get_artist", "get_artist_albums", "get_artist_albums", "get_album"])
 
     def test_one_extra_read_only_parameterless_album_query_once_per_run(self):
         self.run_main(f"- {URL}\n{SECTION}")
@@ -312,7 +373,7 @@ class RequestBudget(Base):
                               {"artist": "Somebody Else", "album": "Zyxel Album 01", "year": 2026}]
         code, r, _ = self.run_main(f"- {URL}\n{SECTION}", names=names)
         self.assertEqual((r["new_releases"]["checked"], r["new_releases"]["with_new"], r["new_releases"]["added"]),
-                         (2, 1, 2))  # artist 0 has its album, artist 1 does not (the other artist's album is not its)
+                         (2, 2, 4))  # Neither album row proves that all of its tracks are stored.
 
     def test_source_refusal_ends_the_phase_without_retry(self):
         err = type("YTMusicServerError", (Exception,), {})("HTTP 429 Too Many Requests")

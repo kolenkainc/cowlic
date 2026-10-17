@@ -161,10 +161,19 @@ class SetDifference(NoNetwork):
         yt = "Hail to the Thief (Live Recordings 2003-2009)"
         d1 = "Hail to the Thief: Live Recordings 2003–2009"
         self.assertEqual(normalize(yt), normalize(d1))
-        src = FakeSource(albums=[card(yt, "2025", "MPREh")])
-        res, state, _ = run(src, albums=[(d1, 2025)])
-        self.assertEqual((res.records, res.missing, res.in_library), ([], 0, 1))
-        self.assertNotIn("get_album", src.names())
+        src = FakeSource(albums=[card(yt, "2025", "MPREh")],
+                         details={"MPREh": {"title": yt, "tracks": [track("Alpha")]}})
+        res, state, _ = run(src, rows=[("Alpha", BAND, 200)], albums=[(d1, 2025)])
+        self.assertEqual((res.records, res.missing, res.in_library), ([], 1, 1))
+        self.assertIn("get_album", src.names())
+        self.assertEqual(state["artists"][nr.artist_key(BAND)]["evaluated"], [nr.release_key(yt, 2025)])
+
+    def test_unevaluated_partial_album_is_retried_even_with_a_newer_stored_album(self):
+        src = FakeSource(albums=[card("Partial", "2023", "MPREp")],
+                         details={"MPREp": {"title": "Partial", "tracks": [track("Alpha"), track("Beta")]}})
+        res, _, _ = run(src, rows=[("Alpha", BAND, 200)], albums=[("Partial", 2023), ("Newer", 2026)])
+        self.assertEqual([r["name"] for r in res.records], ["Beta"])
+        self.assertEqual((res.skipped_old, res.in_library), (0, 1))
 
     def test_evaluated_release_is_not_refetched(self):
         key = nr.release_key("New Album", 2026)
