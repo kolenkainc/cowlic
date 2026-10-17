@@ -1,34 +1,34 @@
-# Архитектура
+# Architecture
 
-## 1. Цели и не-цели
+## 1. Goals and non-goals
 
-**Цели**
-- Слушать собственную библиотеку с телефона в машине через Symfonium.
-- Ноль серверов и ноль ежемесячных платежей.
-- Офлайн-кеш делает Symfonium, поэтому стриминг нужен только при первой загрузке трека.
+**Goals**
+- Listen to a personal library from a phone in the car through Symfonium.
+- No servers and no monthly payments.
+- Symfonium handles offline caching, so streaming is needed only for the first download of a track.
 
-**Не-цели (для POC)**
-- Мультипользовательность, веб-UI, scrobbling, подкасты, видео.
-- Полное покрытие Subsonic API: нужен только минимум, который требует Symfonium.
+**Non-goals (for the POC)**
+- Multiple users, a web UI, scrobbling, podcasts and video.
+- Complete Subsonic API coverage: only the subset Symfonium needs is required.
 
-## 2. Компоненты
+## 2. Components
 
 ### 2.1 Ingest (owner's machine, scheduled local run)
 Ingest runs on the owner's own machine (cron or a systemd timer) from the same `ingest/ingest.py`, over the normal home connection. GitHub Actions no longer runs ingest: YouTube answers every download from GitHub-hosted runners with "Sign in to confirm you're not a bot" (observed in run 38056689770, see #15), so the workflow was removed. The bot check is not bypassed (no account cookies, proxies, PO-token tricks or client rotation). The machine needs ffmpeg, Deno and the Python dependencies, and reads its configuration from the local gitignored `.env`. Observability is logs only (no notifications, decision #72): a redacted rotating log and `last-run.json`, see [local-ingest.md](local-ingest.md). The steps below are unchanged.
-- Список плейлистов/альбомов лежит в репозитории (`sources.yml`). Необязательная секция `followed_artists:` (с версии Release 2, #121) добавляет все треки артистов, на которых подписан владелец: список подписок читается пользовательским токеном (только `user-follow-read`, никаких плейлистов не создаётся и не меняется), треки каждого артиста перечисляются через Client Credentials (`ingest/artist_tracks.py`), дубликаты записей между релизами схлопываются (`ingest/dedupe.py`), затем те же самые шаги для каждого трека. Прогресс по артистам хранится в локальном файле состояния (артист, просканированный до конца, пересматривается не чаще раза в `rescan_days`, по умолчанию 7), на артистов действуют те же лимит `--max-new`, пауза/backoff и остановка на первом запросе входа YouTube. Без этой секции в `sources.yml` поведение прежнее. Формат и запуск: [local-ingest.md](local-ingest.md). Для цели B Release 2 (самые прослушиваемые артисты за 5 лет, #102) источником артистов служит Last.fm (секция `lastfm_artists:`, #152, измерение качества сопоставления: `ingest/lastfm_report.py`, #153); путь через `followed_artists` для цели B не нужен.
-- Artist source from Last.fm (Release 3): a one-time manual bootstrap fills the library from the owner's top artists, the nightly run only tops up missing releases (the nightly new-release phase code is merged under Release 3 but OFF; only its follow-ups #173, #175, #178 and #238 are in Release 4, and enabling the phase waits for #238). Design and contracts: [bootstrap-ongoing.md](bootstrap-ongoing.md).
-- `spotdl` берёт метаданные из Spotify, аудио ищет на YouTube Music и вшивает теги и обложку.
-- Скрипт сравнивает `spotify_id` с D1 и обрабатывает только новые треки.
-- Аудио уходит в приватный Telegram-канал через Bot API (`sendDocument`/`sendAudio`).
-- Из ответа берём `file_id`, `file_unique_id` и `message_id`, затем делаем upsert в D1.
-- Обложки хранятся так же: отдельным сообщением, их `file_id` лежит в таблице альбомов.
+- Playlist/album sources live in the repository (`sources.yml`, already implemented). The optional `followed_artists:` section (Release 2, #121) adds tracks by artists the owner follows: a user token reads the followed-artists list (only `user-follow-read`; no playlist is created or modified), `ingest/artist_tracks.py` enumerates their tracks using Client Credentials, and `ingest/dedupe.py` collapses duplicate recordings across releases before the same per-track pipeline runs. Artist progress lives in a local state file: a fully scanned artist is revisited no more often than `rescan_days` (default 7). The same `--max-new` cap, pacing/backoff and stop on the first YouTube sign-in challenge apply. Omitting the section preserves the original behavior. Format and commands: [local-ingest.md](local-ingest.md). For Release 2 goal B (top artists over five years, #102), artists come from Last.fm (`lastfm_artists:`, #152; match-quality measurements in `ingest/lastfm_report.py`, #153); goal B does not need `followed_artists`.
+- Artist source from Last.fm (Release 3): a one-time manual bootstrap fills the library from the owner's top artists, the nightly run only tops up missing releases (the nightly new-release phase code is merged under Release 3 but OFF; its Release 4 retry fix #238 and metrics #173 are merged, while enabling it still needs the owner step #175 and verification #178). Design and contracts: [bootstrap-ongoing.md](bootstrap-ongoing.md).
+- `spotdl` reads Spotify metadata; the ingest pipeline matches audio on YouTube Music, then downloads it and embeds tags and artwork.
+- The script compares `spotify_id` against D1 and processes only new tracks.
+- Audio is uploaded to a private Telegram channel through the Bot API (`sendDocument`/`sendAudio`).
+- Read `file_id`, `file_unique_id` and `message_id` from the response, then upsert the metadata into D1.
+- Artwork is stored the same way, in a separate message; its `file_id` is kept in the albums table.
 
-### 2.2 Хранилище метаданных (Cloudflare D1)
-Схема (минимум для POC):
+### 2.2 Metadata storage (Cloudflare D1)
+Schema (the POC minimum):
 
 ```sql
 CREATE TABLE artists (
-  id TEXT PRIMARY KEY,            -- стабильный хеш от имени
+  id TEXT PRIMARY KEY,            -- stable hash of the name
   name TEXT NOT NULL
 );
 CREATE TABLE albums (
@@ -39,8 +39,8 @@ CREATE TABLE albums (
   cover_file_id TEXT
 );
 CREATE TABLE tracks (
-  id TEXT PRIMARY KEY,            -- наш id, отдаётся в Subsonic
-  spotify_id TEXT UNIQUE,         -- ключ идемпотентности для ingest
+  id TEXT PRIMARY KEY,            -- our id, exposed through Subsonic
+  spotify_id TEXT UNIQUE,         -- ingest idempotency key
   album_id TEXT NOT NULL REFERENCES albums(id),
   title TEXT NOT NULL,
   track_no INTEGER,
@@ -50,62 +50,62 @@ CREATE TABLE tracks (
   content_type TEXT NOT NULL,
   size_bytes INTEGER NOT NULL,
   tg_file_id TEXT NOT NULL,
-  tg_message_id INTEGER NOT NULL  -- чтобы можно было перезалить/удалить
+  tg_message_id INTEGER NOT NULL  -- for re-uploading or deleting
 );
 CREATE INDEX idx_tracks_album ON tracks(album_id);
 ```
 
-Плейлисты (`playlists`, `playlist_tracks`) добавляются после POC.
+Playlists (`playlists`, `playlist_tracks`) are planned after the POC.
 
 ### 2.3 API (Cloudflare Worker)
-Реализует подмножество (Open)Subsonic REST, формат ответа JSON (`f=json`) и XML по умолчанию.
+Implements a subset of (Open)Subsonic REST, with JSON responses (`f=json`) and XML by default.
 
-| Эндпоинт | Зачем |
+| Endpoint | Purpose |
 |---|---|
-| `ping`, `getLicense` | проверка подключения |
-| `getOpenSubsonicExtensions` | Symfonium определяет OpenSubsonic-сервер |
-| `getMusicFolders` | корневая папка (одна, заглушка) |
-| `getArtists`, `getArtist`, `getAlbum`, `getSong` | навигация по библиотеке |
-| `getAlbumList2` | главная, недавние, по алфавиту |
-| `search3` | поиск |
-| `stream`, `download` | отдача аудио |
-| `getCoverArt` | обложки |
+| `ping`, `getLicense` | connection checks |
+| `getOpenSubsonicExtensions` | lets Symfonium identify an OpenSubsonic server |
+| `getMusicFolders` | root folder (one, a stub) |
+| `getArtists`, `getArtist`, `getAlbum`, `getSong` | library navigation |
+| `getAlbumList2` | home screen, recent albums, alphabetical order |
+| `search3` | search |
+| `stream`, `download` | audio delivery |
+| `getCoverArt` | artwork |
 
-Реальный список нужно подтвердить логами Worker при первом подключении Symfonium (см. POC-план, шаг 3).
+The initial Symfonium connection was verified in #4 (POC plan, step 3). Worker logs help identify any further endpoints the client needs.
 
-**Аутентификация.** Subsonic-токен: `t = md5(password + salt)`, где `s = salt`. MD5 здесь навязан протоколом, а не нашим выбором. Мера защиты: только HTTPS (Cloudflare) и длинный случайный пароль, который хранится как Worker secret. Если Symfonium поддерживает `apiKey` из OpenSubsonic, предпочесть его.
+**Authentication.** Subsonic token: `t = md5(password + salt)`, with `s = salt`. MD5 is imposed by the protocol. Protection: HTTPS only (Cloudflare) and a long random password stored as a Worker secret. OpenSubsonic `apiKey` authentication would be preferable if supported by both the server and Symfonium; it is not implemented here.
 
 **CORS (#283).** The Worker allows CORS for an exact-match allowlist of origins (initially only `https://feishin.vercel.app`, the Feishin web player); the list is the `ALLOWED_ORIGINS` constant in `worker/src/cors.ts`, there are no wildcards, and a preflight is answered before authentication. Warning: using the Feishin web player means typing the Subsonic password into a third-party hosted web app (feishin.vercel.app); prefer a self-hosted Feishin, or a dedicated low-privilege password if the project later supports one. A merge to master auto-deploys the Worker, so a change of the list goes live through the deploy workflow.
 
-### 2.4 Стриминг: прокси вместо 302 (отличие от исходной схемы)
-Исходная идея была отдавать 302 на CDN Telegram. Так делать нельзя: Telegram не даёт отдельного CDN-URL. Ссылка имеет вид `https://api.telegram.org/file/bot<BOT_TOKEN>/<file_path>`, то есть **содержит токен бота**. Редирект передал бы токен клиенту, а он дал бы полный доступ к боту и каналу.
+### 2.4 Streaming: a proxy instead of a 302 redirect (a change from the original design)
+The original idea was a 302 redirect to the Telegram CDN. This would expose credentials: Telegram provides no separate CDN URL. The URL is `https://api.telegram.org/file/bot<BOT_TOKEN>/<file_path>`, which **contains the bot token**. A redirect would give the client that token and full access to the bot and channel.
 
-Схема стриминга:
-1. Worker получает `GET /rest/stream?id=…`, проверяет авторизацию.
-2. Из D1 берёт `tg_file_id`.
-3. Вызывает `getFile` и получает `file_path`. Результат кешируется в Cache API на ~50 минут, потому что ссылка живёт минимум час.
-4. Делает `fetch` на файл и проксирует тело ответа клиенту, пробрасывая заголовки `Range`, `Content-Range`, `Content-Length` и `Accept-Ranges`. Без поддержки Range перемотка в Symfonium работать не будет.
+Streaming flow:
+1. The Worker receives `GET /rest/stream?id=…` and authenticates the request.
+2. It reads `tg_file_id` from D1.
+3. It calls `getFile` to obtain `file_path`. The result is cached in the Cache API for about 50 minutes because the link remains valid for at least an hour.
+4. It fetches the file and proxies the response body to the client, forwarding `Range`, `Content-Range`, `Content-Length` and `Accept-Ranges`. Seeking in Symfonium requires Range support.
 
-Worker только передаёт поток и не буферизует его, поэтому лимит CPU не мешает. Эти байты считаются запросами Worker, а не трафиком (egress на Cloudflare не тарифицируется).
+The Worker forwards the stream without buffering the whole file, keeping CPU work small. Streaming uses Worker requests; Cloudflare does not charge separate egress fees.
 
-## 3. Ограничения и риски
+## 3. Limits and risks
 
-| # | Риск | Влияние | Решение |
+| # | Risk | Impact | Mitigation |
 |---|---|---|---|
-| 1 | Bot API: `getFile` отдаёт файлы **до 20 МБ** (загрузка до 50 МБ) | FLAC и длинные миксы не скачаются | Для POC: mp3/opus/m4a ≤ 20 МБ, ingest пропускает или перекодирует крупные. Потом: свой Local Bot API server снимает лимит, но это уже сервер |
-| 2 | `spotdl` на раннерах GitHub часто блокируется/ограничивается YouTube (IP дата-центров), и ломается при изменениях YouTube | Ночной job падает | Observed: YouTube blocks GitHub-hosted runners ("Sign in to confirm you're not a bot", run 38056689770, #15). Mitigation: ingest runs on the owner's machine (decision in #62) and the GitHub workflow is removed. The bot check is not bypassed. A self-hosted runner was rejected: on a public repo it would run code of anyone able to trigger workflows on the owner's machine |
-| 3 | Лимиты Spotify API на метаданные (rate limit) | Ingest замедляется | Малые батчи, ретраи с backoff, кеш метаданных |
-| 4 | Telegram: `file_id` привязан к боту, при смене бота ломается | Потеря доступа к файлам | Хранить `message_id` и канал. Файлы можно переполучить, перепересылая из канала |
-| 5 | Лимиты бесплатных тарифов: Worker ~100k запросов/день, D1 ~5M чтений строк/день | Для одного пользователя с большим запасом | Мониторить. Кеш Symfonium снижает нагрузку |
-| 6 | Юридическое и ToS: получение аудио с YouTube через spotdl, хранение в Telegram | Нарушение условий сервисов, риск бана бота/аккаунта | Только личное использование, приватный канал, без публичного доступа. Решение принимает владелец проекта |
-| 7 | Безопасность: бот-токен и пароль Subsonic | Утечка = доступ к библиотеке | Секреты только в локальном `.env` и Worker secrets, не логировать, не отдавать клиенту |
-| 8 | Одно измерение здоровья: тихие поломки ночного запуска | Библиотека перестаёт обновляться | Shipped: ingest runs locally via `scripts/run-ingest-local.sh`, not as a CI job. No notifications of any kind, by owner decision (#72): nothing is sent on success or failure. Observability is the redacted rotating log and `last-run.json` (timestamp, counts, exit code, failure class; #31), both on the owner's machine, see [local-ingest.md](local-ingest.md). A YouTube sign-in failure is logged clearly with a distinct exit code and is not retried or bypassed (#66). Consequence: a silent failure (including a missed run because the machine was off) shows only in `last-run.json` and the log, so the owner has to look. Future, not implemented: the systemd timer at 21:10 local time is installed by the owner (#74) and a scheduled run is verified in #32 |
+| 1 | Bot API: `getFile` downloads files **up to 20 MB** (uploads up to 50 MB) | FLAC and long mixes cannot be downloaded | POC: mp3/opus/m4a up to 20 MB; ingest currently skips larger files. Transcoding is planned in #41. A Local Bot API server removes the limit but needs a server |
+| 2 | YouTube blocks or throttles `spotdl` on GitHub runners (data-center IPs); YouTube changes can break it | The nightly run fails | Observed: YouTube blocks GitHub-hosted runners ("Sign in to confirm you're not a bot", run 38056689770, #15). Mitigation: ingest runs on the owner's machine (decision in #62) and the GitHub workflow is removed. The bot check is not bypassed. A self-hosted runner was rejected: on a public repo it would run code of anyone able to trigger workflows on the owner's machine |
+| 3 | Spotify metadata API rate limits | Ingest slows down | Small batches, retries with backoff, metadata caching |
+| 4 | Telegram `file_id` belongs to a bot and breaks when the bot changes | File access is lost | Keep `message_id` and the channel; forwarding messages from the channel can recover the files |
+| 5 | Free-tier quotas: Worker about 100k requests/day, D1 about 5M rows read/day | Ample headroom for one user | Monitor usage; Symfonium caching reduces requests |
+| 6 | Legal and service terms: obtaining YouTube audio with spotdl and storing it in Telegram | Service-term violations and bot/account bans are possible | Personal use only, private channel, no public access; the project owner makes the decision |
+| 7 | Security: bot token and Subsonic password | A leak gives access to the library | Secrets stay in local `.env` and Worker secrets; never log them or return them to clients |
+| 8 | Limited health visibility: silent failures of the nightly run | The library stops updating | Ingest runs locally via `scripts/run-ingest-local.sh`. No notifications (#72): visibility comes from the redacted rotating log and `last-run.json` (timestamp, counts, exit code, failure class; #31), see [local-ingest.md](local-ingest.md). A YouTube sign-in challenge has a distinct exit code and is never retried or bypassed (#66). The owner must inspect missed or failed runs. The 21:10 local systemd timer is installed (#74); verification that a scheduled run adds a new track remains open in #32 |
 
-## 4. Конфигурация и секреты
+## 4. Configuration and secrets
 
 The Worker deploy and D1 migrations are meant to run from GitHub Actions on a merge to master touching `worker/**` (the jobs `plan` and `ship` of `.github/workflows/ci.yml`: `ship` runs the migrations and then the deploy in one job, #312; merged in PRs #263 and #266 as `worker-deploy.yml` with the jobs `migrate` and `deploy` and folded into `ci.yml` by #290; see [worker-deploy-runbook.md](worker-deploy-runbook.md) section 2), with the owner's Cloudflare token kept as a GitHub ENVIRONMENT secret (environments `production` and `production-destructive`; design in [worker-cicd.md](worker-cicd.md)). Migration 0002 was applied by hand (#122), and 0003 may be too (#261); after the pipeline's first run a hand-applied migration is only the documented fallback. The statements below about GitHub and secrets are about ingest and the Worker's own secrets.
 
-Single-source rule: every secret and config value is edited only in the local gitignored `.env` (template: `.env.example`) on the owner's machine. Ingest reads it directly. The three Worker secrets (`TG_BOT_TOKEN`, `SUBSONIC_USER`, `SUBSONIC_PASSWORD`) are set once by hand with `wrangler secret put` (see below); there is no sync script. Ingest uses no GitHub secrets and the Worker's own secrets are never given to GitHub: the ingest workflow is gone, but the old environment `ingest` still holds seven secrets until owner ticket #75 (nothing uses them, none may be added). The only GitHub secrets the repository needs are the environment secrets of the Worker deploy (`CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `D1_DATABASE_ID`, `WORKER_URL` in `production`; the first three in `production-destructive`). Three organisation secrets remain visible to the repository by the owner's decision of 2026-10-11 (#264): `CLOUDFLARE_ACCOUNT_ID` (not a credential), `NPM_TOKEN`, `SENTRY_AUTH_TOKEN`. Never edit values in the Cloudflare UI.
+Single-source rule: every secret and config value is edited only in the local gitignored `.env` (template: `.env.example`) on the owner's machine. Ingest reads it directly. The three Worker secrets (`TG_BOT_TOKEN`, `SUBSONIC_USER`, `SUBSONIC_PASSWORD`) are set once by hand with `wrangler secret put` (see below); there is no sync script. Ingest uses no GitHub secrets and the Worker's own secrets are never given to GitHub: the ingest workflow is gone, and the old environment `ingest` was removed in #75 (none may be added). The only GitHub secrets the repository needs are the environment secrets of the Worker deploy (`CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `D1_DATABASE_ID`, `WORKER_URL` in `production`; the first three in `production-destructive`). Three organisation secrets remain visible to the repository by the owner's decision of 2026-10-11 (#264): `CLOUDFLARE_ACCOUNT_ID` (not a credential), `NPM_TOKEN`, `SENTRY_AUTH_TOKEN`. Never edit values in the Cloudflare UI.
 
 | `.env` key | Where it lives | Purpose |
 |---|---|---|
@@ -118,7 +118,7 @@ Single-source rule: every secret and config value is edited only in the local gi
 | `SUBSONIC_USER`, `SUBSONIC_PASSWORD` | local `.env`, Worker secrets | Client login |
 | `CLOUDFLARE_API_TOKEN` (optional) | local `.env`, and the GitHub environment secrets `production` and `production-destructive` | Broad personal token for local wrangler/ad-hoc work and the Worker deploy workflow. Ingest never reads it and hides it from the spotdl subprocess. Rotate it in all places, see worker-cicd.md section 3 rule 10. |
 
-The ingest values are not copied anywhere. The GitHub environment secrets of the former workflow (`TG_BOT_TOKEN`, `TG_CHANNEL_ID`, `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `D1_DATABASE_ID` in the environment `ingest`) are unnecessary and can be removed by the owner together with the environment (ticket #75).
+The ingest values are not copied anywhere. The former GitHub `ingest` environment and its seven secrets were removed in #75. The Worker deployment environments remain separate and must not be removed.
 
 Worker secrets, one-time setup. First create `worker/wrangler.local.toml` (gitignored; a fresh clone does not have it): copy `worker/wrangler.toml` to `worker/wrangler.local.toml` and put the real `database_id` (Cloudflare dashboard or `npx wrangler d1 list`) in the copy only, never in `wrangler.toml`, never committed. Then from `worker/` run `npx wrangler secret put NAME -c wrangler.local.toml` for each of `TG_BOT_TOKEN`, `SUBSONIC_USER` and `SUBSONIC_PASSWORD` and type the value at the prompt (never as a command argument, in shell history or in a file). Check with `npx wrangler secret list -c wrangler.local.toml`. Prerequisite: `npm ci` done in `worker/`.
 
@@ -128,24 +128,24 @@ Rotation: rotate the secret at its provider first (BotFather, Spotify dashboard,
 
 Narrow Cloudflare token (`INGEST_CLOUDFLARE_API_TOKEN`): Cloudflare dashboard -> My Profile -> API Tokens -> Create Token -> Create Custom Token. Permission: Account -> D1 -> Edit. Account resources: Include -> the single account that owns the database. No zone permissions, no other account permissions. Put it in `.env` as `INGEST_CLOUDFLARE_API_TOKEN`; it must not be the broad personal token.
 
-## 5. Структура репозитория (предложение)
+## 5. Repository layout
 
 ```
 cowlic/
 ├─ worker/              # Cloudflare Worker (TypeScript, wrangler)
-│  ├─ src/              # роутер, subsonic-ответы, auth, telegram-прокси
-│  ├─ migrations/       # SQL-миграции D1
+│  ├─ src/              # router, Subsonic responses, auth, Telegram proxy
+│  ├─ migrations/       # D1 SQL migrations
 │  └─ wrangler.toml
-├─ ingest/              # Python: spotdl + загрузка в TG + запись в D1
-├─ sources.yml          # плейлисты для синхронизации
+├─ ingest/              # Python: spotdl + Telegram upload + D1 writes
+├─ sources.yml          # playlists to sync
 └─ docs/
 ```
 
-## 6. Решения для POC
-- **Формат:** только mp3. Битрейт задаётся в spotdl (`--bitrate`), для укладки в лимит 20 МБ подойдёт 192-256k (трек на 8 минут при 256k ≈ 15 МБ). Ingest пропускает файлы > 20 МБ.
-- **Пользователь:** один. Единственная пара `SUBSONIC_USER`/`SUBSONIC_PASSWORD`, без таблицы пользователей.
-- **Источник списка треков:** плейлисты Spotify, перечисленные в `sources.yml`. Доступ через Client ID/Secret (Client Credentials flow), это даёт **только публичные плейлисты и альбомы**. Лайки (Liked Songs) и приватные плейлисты требуют OAuth с пользовательским токеном и в POC не входят. Обходной путь: сделать нужный плейлист публичным. Release 2 добавляет второй источник: артисты, на которых подписан владелец (секция `followed_artists` в `sources.yml`, пользовательский токен только на чтение списка подписок, см. раздел 2.1). Плейлисты при этом не создаются.
+## 6. POC decisions
+- **Format:** mp3 only. Set the bitrate in spotdl (`--bitrate`); 192–256k fits most tracks under 20 MB (an eight-minute track at 256k is about 15 MB). Ingest skips files larger than 20 MB.
+- **User:** one, with a single `SUBSONIC_USER`/`SUBSONIC_PASSWORD` pair and no users table.
+- **Track-list source:** Spotify playlists in `sources.yml`, read using Client ID/Secret (Client Credentials flow), giving access to **public playlists and albums only**. Liked Songs and private playlists need user OAuth and are outside the POC; the alternative is to make the required playlist public. Release 2 adds followed artists (`followed_artists` in `sources.yml`, user token limited to reading follows; section 2.1). No playlist is created.
 
-## 7. Открытые вопросы
-- Нужны ли лайки и приватные плейлисты после POC (тогда добавляем OAuth с refresh token в GH Secrets)?
-- Подтвердить на шаге 4, что текущие правила Spotify API для новых приложений разрешают чтение треков плейлиста через Client Credentials.
+## 7. Decisions and remaining questions
+- Liked Songs and private playlists remain outside the POC scope (#36). If added later, they need user OAuth; the refresh token must stay local, following the no-GitHub-ingest-secrets decision (#62, #75). Followed artists already use local OAuth with only `user-follow-read` (#121).
+- **Answered for the POC:** public-playlist metadata was read successfully through the local pipeline (#14, #71, #73). This is observed behavior for the project, not a guarantee that Spotify permits every new application or endpoint; later Spotify artist-API restrictions motivated the Last.fm source (#102).

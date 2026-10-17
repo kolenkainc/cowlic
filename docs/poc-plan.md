@@ -1,58 +1,68 @@
-# План POC / MVP
+# POC / MVP plan
 
-Решения: только mp3, один пользователь, источник это публичные плейлисты Spotify (Client ID/Secret). Подробности в `architecture.md` §6.
+Decisions: mp3 only, one user, public Spotify playlists as the source (Client ID/Secret). Details: `architecture.md` section 6.
 
-Принцип: сначала проверяем самые рискованные места по отдельности, а автоматизацию добавляем в конце. Каждый шаг заканчивается проверяемым результатом.
+Principle: verify the riskiest parts separately first and add automation last. Every step ends with an observable result. Steps 1–3 are complete (#2, #3, #4); local ingest and timer installation also shipped (#71, #73, #74). The remaining scheduled-new-track check is #32. This plan records the original sequence; current operations are in [docs/local-ingest.md](local-ingest.md).
 
-## Шаг 1. Telegram как хранилище (риск #1) — выполнено (#2)
-1. Создать бота через @BotFather и приватный канал, добавить бота админом.
-2. Скриптом отправить 2-3 вручную подготовленных mp3 через `sendAudio` и сохранить `file_id`, `message_id`.
-3. Вызвать `getFile`, скачать файл по ссылке и проверить, что байты совпадают.
-4. Замерить размеры типичных треков (mp3 320, opus) относительно лимита 20 МБ.
+## Step 1. Telegram as storage (risk #1) — complete (#2)
 
-**Готово, когда:** файл успешно скачивается через `getFile` по `file_id`, лимиты размера понятны.
+1. Create a bot through @BotFather and a private channel; make the bot an administrator.
+2. Upload two or three manually prepared mp3 files through `sendAudio`, saving `file_id` and `message_id`.
+3. Call `getFile`, download the file from its URL and compare the bytes.
+4. Measure typical track sizes (mp3 320, opus) against the 20 MB limit.
 
-## Шаг 2. Worker + D1 + прокси-стриминг — выполнено (#3)
-1. `wrangler init`, создать D1, применить миграцию из `architecture.md` §2.2.
-2. Вручную вставить в D1 1 артиста, 1 альбом, 2-3 трека с реальными `file_id`.
-3. Реализовать `ping`, `getLicense`, `getOpenSubsonicExtensions`, `getMusicFolders`, `getArtists`, `getArtist`, `getAlbum`, `getSong`, `stream`, `getCoverArt`.
-4. Проверить авторизацию (token+salt) и корректность Range в `stream`.
+**Done when:** the file downloads through `getFile` using `file_id`, and the size limits are understood.
 
-**Готово, когда:** `curl`, указывающий на `/rest/stream` с заголовком `Range: bytes=0-1023`, возвращает 206 и правильные заголовки. Плеер на ПК (например, Feishin или `mpv`) играет трек по URL.
+## Step 2. Worker + D1 + proxy streaming — complete (#3)
 
-## Шаг 3. Symfonium — выполнено (#4)
-1. Добавить сервер как OpenSubsonic в Symfonium.
-2. Логировать в Worker запросы клиента (только путь и метод, без параметров аутентификации), чтобы уточнить реально нужный набор эндпоинтов.
-3. Проверить: библиотека видна, трек играет, перемотка работает, кеш/офлайн работает, воспроизведение по BT продолжается при блокировке экрана.
-4. Добавить недостающие эндпоинты: `getAlbumList2`, `search3` и др.
+1. Run `wrangler init`, create D1 and apply the migration from `architecture.md` section 2.2.
+2. Manually insert one artist, one album and two or three tracks with real `file_id` values into D1.
+3. Implement `ping`, `getLicense`, `getOpenSubsonicExtensions`, `getMusicFolders`, `getArtists`, `getArtist`, `getAlbum`, `getSong`, `stream` and `getCoverArt`.
+4. Verify token+salt authentication and correct Range behavior in `stream`.
 
-**Готово, когда:** на телефоне вручную добавленные треки играются и кешируются.
+**Done when:** a request to `/rest/stream` with `Range: bytes=0-1023` returns HTTP 206 and the correct headers. A desktop player (for example Feishin or `mpv`) plays the track URL.
 
-## Шаг 4. Ingest: spotdl на машине владельца (риск #2)
-Статус плана Б: выбран. Проверка на GitHub Actions (#15, #58) показала, что YouTube отдаёт GitHub-хостовому раннеру проверку на бота. Решение владельца (#62): ingest запускается по расписанию на собственной машине владельца. Обход проверки не делаем: никаких cookies, прокси, PO-token и ротации клиентов, и никакие cookies нигде не хранятся. Зонтичный тикет: #5.
-0. Секреты хранить только в `.env` (в `.gitignore`), в чат и репозиторий не вставлять. Локально проверить, что Client ID/Secret читают публичный плейлист (сделано, #14).
-1. Проверка с домашнего IP существующим `ingest.py` (владелец, #71): отвечает на вопрос, не блокирует ли YouTube и домашнее соединение. Если блокирует, запасной вариант это ingest из локальных аудиофайлов (Release 1, #69).
-2. Код ingest: `sources.yml` и запуск по нескольким плейлистам (#29), для нового трека загрузка в TG, затем upsert в D1 (идемпотентно по `spotify_id`, #14), файлы больше 20 МБ пропускаются с предупреждением. Если YouTube просит войти в аккаунт, запуск падает с понятным сообщением в логе и отдельным кодом возврата, без уведомлений, повторов и обхода (#66).
-3. Обёртка `scripts/run-ingest-local.sh` (окружение, venv, лог с вычищенными секретами и ротацией, код возврата, блокировка от параллельного запуска, #64) и проверка локальных предпосылок: ffmpeg, deno >= 2.3.0, venv (#65). Первый ручной запуск обёртки (владелец, #73).
+## Step 3. Symfonium — complete (#4)
 
-**Готово, когда:** локальный запуск добавляет новые треки в D1, повторный запуск ничего не дублирует, треки появляются в Symfonium (#71, #73).
+1. Add the server as OpenSubsonic in Symfonium.
+2. Log client requests in the Worker (only method and path, never authentication parameters) to identify the endpoints actually needed.
+3. Verify library browsing, playback, seeking, caching/offline playback, and Bluetooth playback with the screen locked.
+4. Add missing endpoints, including `getAlbumList2` and `search3`.
 
-## Шаг 5. Расписание и наблюдаемость (локально)
-Зонтичный тикет: #6.
-1. Таймер systemd (альтернатива: cron) на машине владельца с догоняющим запуском пропущенного (`Persistent=true`) и блокировкой против параллельных запусков (#30). Выбор машины и времени, а также доступность машины: решение владельца (#72): ноутбук владельца, ежедневно в 21:10 по местному времени машины. Установка таймера: владелец (#74).
-2. Наблюдаемость только через логи, без уведомлений любого рода (решение владельца, #72): лог с вычищенными секретами и ротацией и файл статуса последнего запуска `last-run.json` (время, плейлисты, счётчики, код возврата, класс ошибки; #31, сделано), см. [docs/local-ingest.md](local-ingest.md). Сигнала о том, что запуска не было вовсе (машина выключена), нет: #70 закрыт как won't do, об этом говорит только `last-run.json`.
-3. Руководство по эксплуатации: установка, таймер systemd, вариант с cron, позиция «без обхода» (#67). Проверка, что ingest использует узкий токен Cloudflare и лишних секретов нет (#68).
-4. Судьба старого GitHub-workflow ingest и секретов окружения `ingest` (#63, удаление секретов: владелец, #75).
+**Done when:** manually added tracks play and can be cached on the phone.
 
-**Готово, когда:** три ночи подряд запуск на машине владельца отрабатывает без ручного вмешательства (#32).
+## Step 4. Ingest: spotdl on the owner's machine (risk #2) — implemented and manually verified (#71, #73)
 
-## Вне POC (бэклог)
-Кандидаты Release 1 (scope решает владелец в #36):
-- Плейлисты и избранное (`star`, `getPlaylists`), `scrobble` (#37, #38, #39).
-- Удаление треков, исчезнувших из источника (#40).
-- Ingest из локальных аудиофайлов (#69). Оповещение, если запуска не было (#70), не делаем: закрыт как won't do, уведомлений нет (#72).
-- Файлы > 20 МБ: перекодирование в меньший битрейт и понятный отчёт (#41); FLAC и локальный Bot API server вне объёма.
-- Несколько пользователей.
+Plan B was selected. The GitHub Actions probe (#15, #58) showed that YouTube challenges downloads from GitHub-hosted runners. Owner decision (#62): ingest runs on a schedule on the owner's own machine. Never bypass the challenge: no cookies, proxies, PO tokens or client rotation; no cookies are stored anywhere. Umbrella: #5.
 
-## Критерий успеха POC
-В машине по Bluetooth играет трек, который ночью автоматически попал в библиотеку из Spotify-плейлиста, без единого сервера, который мы хостим: запуск по расписанию идёт на собственной машине владельца (#34).
+0. Keep secrets in the gitignored `.env`, never in chat or the repository. Verify locally that Client ID/Secret can read a public playlist (complete, #14).
+1. Probe the home connection using the existing `ingest.py` (owner, #71; complete). If YouTube also blocks that connection, local-audio-file ingest is the fallback (#69, outside the POC).
+2. Ingest code: `sources.yml` and multiple playlists (#29); upload each new track to Telegram, then upsert D1 (idempotent by `spotify_id`, #14). Skip files larger than 20 MB with a warning. A YouTube sign-in challenge stops the run with a clear log line and a distinct exit code, without notifications, retries or bypasses (#66).
+3. Wrapper `scripts/run-ingest-local.sh`: environment, venv, redacted rotating log, exit status and shared lock (#64). Check local prerequisites: ffmpeg, Deno >= 2.3.0 and the venv (#65). The first manual wrapper run is owner check #73 (complete).
+
+**Done when:** a local run adds tracks to D1, a repeat adds no duplicates, and the tracks appear in Symfonium (#71, #73).
+
+## Step 5. Scheduling and observability (local) — installed; scheduled-new-track verification remains open (#32)
+
+Historical umbrella: #6. Current local-ingest work: #5.
+
+1. A systemd timer (cron alternative) on the owner's machine catches up missed runs (`Persistent=true`), with a lock preventing overlap (#30). Owner decision (#72): the owner's laptop, daily at 21:10 in the machine's local time. Timer installation is complete (#74).
+2. Logs only, no notifications of any kind (owner decision, #72): a redacted rotating log and `last-run.json` (time, playlists, counts, exit code, failure class; #31, complete), see [docs/local-ingest.md](local-ingest.md). There is no separate missed-run notification when the machine is off: #70 was closed as not planned; inspect `last-run.json`.
+3. Runbook: installation, systemd timer, cron alternative and the no-bypass rule (#67). Narrow Cloudflare token verification and secret hygiene: #68.
+4. The GitHub ingest workflow was removed (#63); the owner removed its obsolete `ingest` environment and secrets (#75).
+
+**Current done condition:** one scheduled run adds a new track that appears in Symfonium (#32). This replaced the original three-night target; #32 remains open, so that evidence is still required.
+
+## Outside the POC (backlog)
+
+Scope is tracked on the board; the historical Release 1 scope decision is #36.
+
+- Playlists and favorites (`star`, `getPlaylists`) and `scrobble` (#37, #38, #39).
+- Remove tracks that disappear from a source (#40).
+- Ingest local audio files (#69). Missed-run notifications (#70) are not planned; no notifications (#72).
+- Files larger than 20 MB: transcode at a lower bitrate and report clearly (#41); FLAC and a Local Bot API server are outside this scope.
+- Multiple users.
+
+## POC success criterion
+
+A track ingested overnight from a Spotify playlist plays over Bluetooth in the car, without a server we host: the scheduled ingest runs on the owner's own machine (#34, complete). The narrower scheduled-new-track evidence is still tracked separately in #32.
