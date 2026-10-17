@@ -658,10 +658,12 @@ class Config(unittest.TestCase):
             code = ingest.main()
         self.assertEqual((code, json.loads(res.read_text())["failure_class"]), (1, "config"))
 
-    def test_the_repo_sources_yml_has_no_enabled_new_releases_section(self):
+    def test_the_repo_sources_yml_enables_the_accepted_bounded_nightly_check(self):
         text = (Path(__file__).resolve().parent.parent / "sources.yml").read_text(encoding="utf-8")
         cfg = ingest.parse_source_config(text).new_releases
-        self.assertTrue(cfg is None or not cfg.enabled)
+        self.assertIsNotNone(cfg)
+        self.assertTrue(cfg.enabled)
+        self.assertEqual((cfg.max_artists, cfg.recheck_days, cfg.max_new), (10, 7, 20))
         self.assertNotIn("lastfm_artists:", text)  # the nightly wrapper refuses that key (PR #232)
 
     def test_no_lookback_days_anywhere_in_the_phase_code(self):

@@ -295,8 +295,8 @@ The end state is the `status` line `done: N artists, M tracks` (with `, K parked
    artists as a known gap (a spelling gap is not fixed by `exclude`).
 2. No more sessions are needed. The nightly 21:10 run takes over: it stays lean (unit caps, no ranking, no backfill,
    section 8). The nightly new-release check (#172, merged) runs EVERY night after the playlists, bounded by its own
-   caps, and reads only the stored ranking file; nobody starts it by hand. It is OFF in the committed `sources.yml`
-   (no `new_releases:` section) and stays off until #238 (a partly landed release is not retried) is fixed.
+   caps, and reads only the stored ranking file; nobody starts it by hand. It is enabled in committed `sources.yml`
+   after the partial-release retry fix (#238) and metrics (#173); #175 verifies the installed unit and first night.
 3. Do NOT run `rank --refresh` as part of "finishing"; it replaces the ranking and makes new artists `pending`. Do it
    only on purpose, with the same steps again (`status`, `plan`, a small `run`).
 
