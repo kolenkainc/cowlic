@@ -362,6 +362,7 @@ first live push, #108):
 | `cowlic_ingest_exit_code` | the wrapper exit code |
 | `cowlic_ingest_duration_seconds` | finished minus started |
 | `cowlic_ingest_added`, `_skipped`, `_no_match`, `_too_big`, `_failed`, `_not_attempted` | the run's counts (absent when ingest produced no result) |
+| `cowlic_ingest_new_releases_checked`, `_with_new`, `_added`, `_failed` | integer counts from `result.new_releases`; absent when the phase is disabled or the object is missing; also included as `new_releases_<field>` in `run_summary` |
 | `cowlic_ingest_failure_partial`, `_config`, `_youtube_sign_in`, `_crash` | 1 for the failure class of the run, else 0 (all 0 means `none`) |
 
 Find them in Grafana (Explore, Prometheus data source of your stack):
@@ -398,6 +399,7 @@ Panels:
   a plain range query would draw it only for its 5 minute lookback, so some runs would be missing at a coarse
   step.
 - `Tracks per run`: added, skipped, no match, too big, failed and not attempted, one point per run.
+- `New releases per run`: tracks added and artists with new tracks (`with_new`), next to `Tracks per run`. No points are sent for runs without `result.new_releases`.
 - `Run duration` and `Success (1) / failure (0) per run`: one point per run.
 - `Failure class of each run`: state timeline of `cowlic_ingest_failure_partial`, `_config`, `_youtube_sign_in`,
   `_crash`.

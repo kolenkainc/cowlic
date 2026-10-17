@@ -499,6 +499,65 @@ class SliceTests(Base):
         self.assertTrue(text.endswith("line-0099\n"))
 
 
+class NewReleaseMetrics(Base):
+    def parse(self, releases):
+        doc = {**LAST_RUN, "result": {**LAST_RUN["result"], "new_releases": releases}}
+        self.lr.write_text(json.dumps(doc))
+        return sg.parse_last_run(str(self.lr))
+
+    def test_old_summary_and_metric_body_are_byte_identical(self):
+        run = sg.parse_last_run(str(self.lr))
+        self.assertEqual(sg.summary_line(run),
+                         "run_summary exit_code=0 failure_class=none added=2 skipped=1 no_match=0 "
+                         "too_big=0 failed=0 not_attempted=0 duration_s=159")
+        self.assertEqual(sg.metrics_line(run, "test-host"),
+                         "cowlic_ingest,job=cowlic-ingest,host=test-host "
+                         "last_run_timestamp_seconds=1791659560i,success=1i,exit_code=0i,duration_seconds=159i,"
+                         "added=2i,skipped=1i,no_match=0i,too_big=0i,failed=0i,not_attempted=0i,"
+                         "failure_partial=0i,failure_config=0i,failure_youtube_sign_in=0i,failure_crash=0i\n")
+
+    def test_only_allowlisted_integer_counts_reach_both_bodies(self):
+        values = {"checked": 10, "with_new": 3, "added": 5, "failed": 0}
+        run = self.parse({**values, "status": CANARY_TOKEN, "artist": CANARY_USER,
+                          "unknown": CANARY_LINE_SECRET})
+        self.assertEqual(run["new_releases"], values)
+        line = sg.summary_line(run)
+        _, tags, fields = parse_influx(sg.metrics_line(run, "test-host").encode())
+        self.assertEqual(tags, {"job": "cowlic-ingest", "host": "test-host"})
+        self.assertEqual(set(fields), FIELD_NAMES | {f"new_releases_{k}" for k in values})
+        for key, value in values.items():
+            self.assertIn(f"new_releases_{key}={value}", line)
+            self.assertEqual(fields[f"new_releases_{key}"], f"{value}i")
+        for canary in (CANARY_TOKEN, CANARY_USER, CANARY_LINE_SECRET):
+            self.assertNotIn(canary, line + sg.metrics_line(run, "test-host"))
+
+    def test_malformed_counts_and_objects_are_rejected(self):
+        for key in ("checked", "with_new", "added", "failed"):
+            for value in (-1, 10**9 + 1, True, 1.5, "1 injection=2", None, float("nan"), float("inf")):
+                with self.subTest(key=key, value=value), self.assertRaises(sg.ShipError):
+                    self.parse({key: value})
+        for obj in (None, [], "bad", 0):
+            with self.subTest(obj=obj), self.assertRaises(sg.ShipError):
+                self.parse(obj)
+
+    def test_missing_fields_are_absent_and_bounds_are_accepted(self):
+        run = self.parse({"checked": 0, "failed": 10**9})
+        self.assertEqual(run["new_releases"], {"checked": 0, "failed": 10**9})
+        self.assertNotIn("new_releases_added", sg.metrics_line(run, "test-host"))
+
+    def test_dashboard_has_two_series_next_to_tracks_and_no_embedded_instance(self):
+        doc = json.loads((Path(__file__).resolve().parents[1] / "deploy/grafana/cowlic-ingest-dashboard.json").read_text())
+        tracks = next(p for p in doc["panels"] if p["title"] == "Tracks per run")
+        panel = next(p for p in doc["panels"] if p["title"] == "New releases per run")
+        self.assertEqual(panel["gridPos"]["y"], tracks["gridPos"]["y"])
+        self.assertEqual({t["legendFormat"] for t in panel["targets"]}, {"added", "with_new"})
+        for target in panel["targets"]:
+            self.assertEqual(target["datasource"]["uid"], "${DS_PROMETHEUS}")
+            self.assertIn("cowlic_ingest_new_releases_" + target["legendFormat"], target["expr"])
+        self.assertIsNone(doc.get("id"))
+        self.assertNotIn(CANARY_TOKEN, json.dumps(doc))
+
+
 class LastRunTests(Base):
     def parse(self, raw: str):
         self.lr.write_text(raw)
