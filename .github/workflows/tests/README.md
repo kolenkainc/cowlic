@@ -13,7 +13,7 @@ Wrangler configuration and deployment tooling are explicit inputs to production-
 
 Worker tests stay in `worker/`: `pnpm install --frozen-lockfile --ignore-scripts`, `pnpm test`, `pnpm exec tsc --noEmit`. Its Vitest projects are only unit and smoke.
 CI preserves the required `tests` job and existing `Test Report (Vitest)` name, adding `Test Report (Workflows)`.
-The runners have separate XML reports and minimum-count/skip guards (Worker 315; workflow 495).
+The runners have separate XML reports and minimum-count/skip guards (Worker 315; workflow 522).
 Failure, zero collection and `.only` fail Vitest; missing/non-numeric report counts, skips or counts below the floor
 fail the required job. The counts are deliberately pinned, never calculated from the current discovery result.
 
@@ -40,5 +40,5 @@ fallback, release idempotence and stale-head protection. Do not lower a floor or
 make a failure disappear: identify the changed invariant first.
 
 The pnpm migration (#383) shares the root lockfile and retains all 150 pre-migration dependency versions/integrities.
-Package manifests and runners remain independent. Current workflow count is 521: workspace path-filter cases,
-bootstrap guards and the extra ship bootstrap step extend the 503-check baseline above. See [workspace setup](../../../docs/js-workspace.md).
+Package manifests and runners remain independent. Current workflow count is 530: workspace path-filter cases,
+bootstrap guards, preview tooling path filters and the extra ship bootstrap step extend the 503-check baseline above. See [workspace setup](../../../docs/js-workspace.md).

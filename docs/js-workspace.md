@@ -87,3 +87,5 @@ an empty placeholder suite.
 Root `package.json`, `pnpm-lock.yaml` and `pnpm-workspace.yaml` already trigger checks and Worker deploy planning:
 any can affect Worker tools or resolution. Deploy comparison remains against the last successful deployment's BASE,
 so a newer docs-only commit cannot hide an earlier dependency change.
+
+Preview Worker/D1 provisioning and snapshot commands: [preview-worker.md](preview-worker.md).

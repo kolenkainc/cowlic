@@ -1,0 +1,22 @@
+name = "cowlic-preview"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+workers_dev = true
+preview_urls = false
+routes = []
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+redact_query_string = true
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = false
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cowlic-preview"
+database_id = "SET_BY_PRIVATE_PREVIEW_TOOL"
+migrations_dir = "migrations"
