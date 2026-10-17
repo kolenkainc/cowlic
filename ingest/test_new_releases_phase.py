@@ -546,6 +546,23 @@ class DryRun(Base):
 
 
 class NoNamesInTheShippedLog(Base):
+    def test_quiet_failure_context_is_useful_without_provider_text_and_keeps_counts(self):
+        for error, context in (
+            ("Telegram API error 429: Too Many Requests: retry after 25", "phase=telegram http_status=429 retry_after_seconds=25"),
+            ("Telegram API error 403: Zyxel SECRET https://private.invalid/token", "phase=telegram http_status=403"),
+            ("D1 API error 500", "phase=d1 http_status=500"),
+            ("yt-dlp failed with exit code 1: Zyxel SECRET https://private.invalid/token", "phase=download"),
+        ):
+            with self.subTest(context=context):
+                self.nr_state.unlink(missing_ok=True)
+                self.state_file.unlink(missing_ok=True)
+                self.deps_fail = {"Zyxel Song 00a": ingest.IngestError(error)}
+                code, result, out = self.run_main(f"- {URL}\n{SECTION}", names=artist_names(1))
+                self.assertEqual((code, result["counts"]["failed"]), (1, 1))
+                self.assertIn(f"IngestError [{context}]", out)
+                for private in ("Zyxel", "SECRET", "private.invalid", "Too Many Requests"):
+                    self.assertNotIn(private, out)
+
     def test_no_artist_release_or_track_name_in_stdout_or_result(self):
         self.deps_fail = {"Zyxel Song 01a": ingest.IngestError("spotdl output: Zyxel Quartet 01 - Zyxel Song 01a")}
         self.stored_albums = [{"artist": "Zyxel Quartet 02", "album": "Zyxel Album 02", "year": 2026}]
@@ -572,6 +589,21 @@ class NoNamesInTheShippedLog(Base):
 
 
 class Quiet(NoNetwork):
+    def test_unrecognized_or_hostile_failure_text_never_becomes_diagnostic_fields(self):
+        for error in (
+            ingest.IngestError("PRIVATE Telegram API error 429: Too Many Requests: retry after 25"),
+            ingest.IngestError("Telegram API error 4290: PRIVATE"),
+            ingest.IngestError("Telegram API error 999: PRIVATE"),
+            ingest.IngestError("cover is not a JPEG PRIVATE"),
+            ingest.IngestError("PRIVATE" * 2000),
+            ValueError("Telegram API error 429: PRIVATE"),
+        ):
+            with self.subTest(error_type=type(error).__name__):
+                self.assertEqual(ingest.safe_failure_context(error), "")
+        text = ingest.safe_failure_context(ingest.IngestError(
+            "Telegram API error 429: Too Many Requests: retry after 25\nPRIVATE"))
+        self.assertEqual(text, " [phase=telegram http_status=429]")
+
     def test_run_quiet_names_tracks_by_id_and_reports_outcomes(self):
         out = io.StringIO()
         d = Base.deps(SimpleNamespace(log=[], uploaded=[], deps_fail={}))

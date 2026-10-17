@@ -663,6 +663,6 @@ def apply_planned(plan: Plan) -> Callable[[Todo, CoverBackends], str]:
         try:
             return _store_cover(todo, plan.entries[todo.album_id]["cover_url"], backends)
         except Exception as e:  # noqa: BLE001 - one album's failure
-            ingest.log(f"WARN covers: apply failed ({type(e).__name__})")
+            ingest.log(f"WARN covers: apply failed ({type(e).__name__}){ingest.safe_failure_context(e)}")
             return "failed"
     return apply

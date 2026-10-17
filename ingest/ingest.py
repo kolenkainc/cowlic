@@ -63,6 +63,35 @@ class IngestError(Exception):
     """Per-track failure with a message that is safe to print (no tokens, no URLs with tokens)."""
 
 
+def safe_failure_context(error: Exception) -> str:
+    """Only fixed categories/numeric fields from known local error formats, never provider text."""
+    if not isinstance(error, IngestError):
+        return ""
+    text = str(error)
+    if len(text) > 8192:
+        return ""
+    api = re.match(r"^(Telegram|D1) API error ([1-5][0-9]{2})(?=:|$)", text)
+    if api:
+        phase = "telegram" if api[1] == "Telegram" else "d1"
+        fields = f"phase={phase} http_status={api[2]}"
+        retry = re.fullmatch(r"Telegram API error 429: Too Many Requests: retry after ([1-9][0-9]{0,5})", text)
+        if retry:
+            fields += f" retry_after_seconds={int(retry[1])}"
+        return f" [{fields}]"
+    if text.startswith("D1 query failed:"):
+        return " [phase=d1]"
+    if text.startswith(("yt-dlp failed with exit code ", "yt-dlp timed out after ",
+                        "spotdl download failed with exit code ", "expected exactly one mp3 after download")):
+        return " [phase=download]"
+    if text in {"cover download too slow", "cover too large", "cover url must be https",
+                "cover url has an invalid port", "cover host is not allowed",
+                "cover is not image/jpeg", "cover is not a JPEG"}:
+        return " [phase=cover]"
+    if text.startswith("could not write the ID3 tags (") or text == "the mutagen package is not installed (ImportError)":
+        return " [phase=tagging]"
+    return ""
+
+
 class YouTubeSignInRequired(IngestError):
     """YouTube answered with its bot check ("Sign in to confirm you're not a bot"). Not a per-track failure: it ends
     the whole run (no retry, no bypass), see run() and main(). run()/run_playlists() log the counts and attach
@@ -1388,7 +1417,7 @@ def run(songs: list[dict], deps: Deps, existing: set, covers: dict, work: Path, 
             e.counts, e.tracks_not_attempted = counts, len(unique) - i - 1
             raise  # ends the run, not just this track
         except (IngestError, OSError, KeyError, ValueError, IndexError, TypeError) as e:
-            detail = f": {e}" if isinstance(e, IngestError) and not quiet else ""
+            detail = safe_failure_context(e) if quiet else f": {e}" if isinstance(e, IngestError) else ""
             log(f"ERROR {label}: {type(e).__name__}{detail}")
             counts["failed"] += 1
             if outcomes is not None:

@@ -948,6 +948,13 @@ the playlists are not affected. The shipped `ingest.log` gets counts and hashed 
 `new_releases` object (counts only: `due`, `checked`, `with_new`, `added`, `skipped`, `failed`, `not_started`, and a
 `status` word); its track counts are also part of `counts`.
 
+Quiet track failures and approved-cover failures include bounded context for recognized local error formats (#390):
+for example, `IngestError [phase=telegram http_status=429 retry_after_seconds=25]`. Categories are fixed
+(`telegram`, `d1`, `download`, `cover`, `tagging`); API status is a validated numeric code, and retry-after is shown
+only for the exact recognized Telegram response format. Raw provider descriptions, URLs and names are not included;
+unrecognized errors remain class-only. This adds diagnostic evidence without changing retries, cooldowns, caps or
+sign-in stopping. A reported retry-after does not mean the operation was automatically retried or completed.
+
 ## Album covers from YouTube Music (#248)
 
 A track without a Spotify cover URL (Last.fm and new-release tracks) gets the album cover from the YouTube Music
