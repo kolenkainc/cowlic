@@ -371,7 +371,16 @@ jobs:
 
       - name: Preview tooling tests
         working-directory: .
-        run: python3 scripts/test-preview-worker.py
+        run: |
+          python3 - <<'PY'
+          import runpy, unittest
+          module = runpy.run_path("scripts/test-preview-worker.py", run_name="preview_tests")
+          suite = unittest.defaultTestLoader.loadTestsFromTestCase(module["PreviewTests"])
+          if suite.countTestCases() < 14:
+              raise SystemExit("preview tests missing: expected at least 14")
+          result = unittest.TextTestRunner().run(suite)
+          raise SystemExit(0 if result.wasSuccessful() and not result.skipped and not result.expectedFailures else 1)
+          PY
 
       - name: Workflow tests
         id: workflow_tests

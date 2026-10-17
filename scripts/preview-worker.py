@@ -69,6 +69,10 @@ def quote(name):
     return '"' + name.replace('"', '""') + '"'
 
 
+def interrupted(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
 def fingerprint(path):
     require(path.stat().st_size <= MAX_DUMP, "snapshot exceeds local cap")
     deadline = time.monotonic() + 30
@@ -184,7 +188,10 @@ class Preview:
             try:
                 process.communicate(data, timeout=self.timeout(maximum))
             except BaseException:
-                os.killpg(process.pid, signal.SIGKILL)
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # The child already exited; it still must be reaped below.
                 process.wait()
                 raise
         require(process.returncode == 0, "Wrangler command failed; diagnostics remain private")
@@ -239,8 +246,10 @@ class Preview:
         save(self.manifest_path, self.manifest)
         with tempfile.TemporaryDirectory(dir=self.directory) as temporary:
             original, copied = Path(temporary) / "source.sql", Path(temporary) / "copied.sql"
+            export_started = datetime.now(timezone.utc).isoformat()
             self.command(["d1", "export", self.source_name, "--remote", "--output", str(original),
                           "-c", str(ROOT / "worker/wrangler.local.toml")], maximum=300)
+            captured_at = datetime.now(timezone.utc).isoformat()
             expected = fingerprint(original)
             tables = self.query("SELECT name FROM sqlite_master WHERE type='table'")
             names = [r["name"] for r in tables if not r["name"].startswith(("sqlite_", "_cf_"))]
@@ -262,7 +271,8 @@ class Preview:
             require(fingerprint(copied) == expected, "preview snapshot or migration ledger differs from captured source")
             os.replace(original, self.directory / "snapshot.sql")
         self.isolation_probe()
-        self.manifest.update(snapshot_verified=True, snapshot_at=datetime.now(timezone.utc).isoformat(), snapshot=expected)
+        self.manifest.update(snapshot_verified=True, snapshot_export_started_at=export_started,
+                             snapshot_at=captured_at, verified_at=datetime.now(timezone.utc).isoformat(), snapshot=expected)
         save(self.manifest_path, self.manifest)
         print(f"preview-worker: copied tables={len(expected)} rows={sum(t['rows'] for t in expected.values())}")
 
@@ -283,9 +293,12 @@ class Preview:
         dirty = subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=all", "--", "worker", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"], cwd=ROOT)
         require(not dirty, "commit the candidate Worker inputs before preview deployment")
         self.manifest["ready"] = False
+        self.manifest["deployed_commit"] = None
         save(self.manifest_path, self.manifest)
+        candidate = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
         self.command(["d1", "migrations", "apply", NAME, "--remote", "-c", str(self.config)])
-        self.command(["deploy", "-c", str(self.config)], token=self.token, maximum=180)
+        self.command(["deploy", "-c", str(self.config), "--tag", candidate[:7], "--message", f"preview candidate {candidate}"],
+                     token=self.token, maximum=180)
         access = load(self.directory / "access.json")
         bot = os.environ.get("TG_BOT_TOKEN", "")
         require(bot, "local Telegram read credential missing")
@@ -295,14 +308,19 @@ class Preview:
         require(re.fullmatch(r"[a-z0-9-]+", subdomain), "unexpected workers.dev subdomain")
         access["url"] = f"https://{NAME}.{subdomain}.workers.dev"
         save(self.directory / "access.json", access)
+        self.manifest["deployed_commit"] = candidate
+        save(self.manifest_path, self.manifest)
         self.check()
-        self.manifest.update(ready=True, tested_commit=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip())
+        self.manifest.update(ready=True, tested_commit=candidate)
         save(self.manifest_path, self.manifest)
         print("preview-worker: ready; connection details are in private access.json")
 
     def check(self):
         self.verify_source()
         self.guard()
+        require(self.manifest.get("snapshot_verified") is True and
+                re.fullmatch(r"[a-f0-9]{40}", self.manifest.get("deployed_commit") or ""),
+                "deploy a verified snapshot before confirming readiness")
         access = load(self.directory / "access.json")
         subdomain = self.api("workers/subdomain")["subdomain"]
         require(re.fullmatch(r"[a-z0-9-]+", subdomain) and access.get("url") == f"https://{NAME}.{subdomain}.workers.dev",
@@ -318,8 +336,16 @@ class Preview:
             try:
                 with urllib.request.build_opener(NoRedirect()).open(req, timeout=self.timeout(30)) as response:
                     return response.status, response.headers, response.read(2 * 1024 * 1024)
-            except urllib.error.URLError:
-                raise PreviewError("preview HTTP check failed") from None
+            except urllib.error.HTTPError as error:
+                headers = error.headers
+                layer = "cloudflare" if "cf-ray" in headers or "cloudflare" in headers.get("server", "").lower() else "unknown"
+                if "x-mitmproxy-blocked-reason" in headers or "envoy" in headers.get("server", "").lower():
+                    layer = "gateway"
+                reason = headers.get("x-mitmproxy-blocked-reason", "")
+                known_reason = reason if reason in ("ROBOTS_DENIED", "DOMAIN_NOT_ALLOWED", "INTERNAL") else "unspecified"
+                raise PreviewError(f"preview HTTP check failed: {method} HTTP {error.code} layer={layer} reason={known_reason}") from None
+            except urllib.error.URLError as error:
+                raise PreviewError(f"preview HTTP check failed: {method} transport {type(error.reason).__name__}") from None
 
         def api(method, params=None, authenticate=True):
             status, _headers, body = request(method, params, authenticate=authenticate)
@@ -346,11 +372,21 @@ class Preview:
                     headers.get("Content-Range") == f"bytes {start}-{start+127}/{song['size_bytes']}", "preview stream/seek check failed")
         print("preview-worker: authenticated library/cover/stream/seek checks passed")
 
+    def status(self):
+        self.verify_source()
+        self.guard()
+        endpoint = self.api(f"workers/scripts/{NAME}/subdomain")
+        print("preview-worker: " + json.dumps({"ready": self.manifest.get("ready") is True,
+              "snapshot_verified": self.manifest.get("snapshot_verified") is True,
+              "endpoint_enabled": endpoint.get("enabled"), "version_preview_urls": endpoint.get("previews_enabled")}))
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("init", "refresh", "deploy", "check"))
+    parser.add_argument("action", choices=("init", "refresh", "deploy", "check", "status"))
     args = parser.parse_args()
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, interrupted)
     os.umask(0o077)
     base = Path(os.environ.get("COWLIC_STATE_DIR") or str(Path(os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")) / "cowlic"))
     try:
@@ -362,7 +398,7 @@ def main():
         with os.fdopen(fd, "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             manifest_path = directory / "manifest.json"
-            if manifest_path.exists():
+            if args.action != "status" and manifest_path.exists():
                 previous = load(manifest_path)
                 previous["ready"] = False
                 save(manifest_path, previous)
@@ -370,6 +406,7 @@ def main():
             getattr(preview, args.action)()
             if args.action == "check":
                 preview.manifest["ready"] = True
+                preview.manifest["tested_commit"] = preview.manifest["deployed_commit"]
                 save(preview.manifest_path, preview.manifest)
         return 0
     except PreviewError as error:
