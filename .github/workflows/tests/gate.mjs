@@ -55,34 +55,7 @@ function planOracle(c) {
   return gateOracle(c);
 }
 
-// Named combinations: [name, context, expected]
-export const planCases = [
-  ["push to master, worker changed, lint and tests green", { changes: "success", wc: "true", lint: "success", tests: "success" }, true],
-  ["push to master, docs only (lint and tests skipped): the documented case", { changes: "success", wc: "false", lint: "skipped", tests: "skipped" }, true],
-  ["manual dispatch from master, worker_changed true, green", { changes: "success", wc: "true", lint: "success", tests: "success", event: "workflow_dispatch" }, true],
-  ["worker changed but lint was skipped", { changes: "success", wc: "true", lint: "skipped", tests: "success" }, false],
-  ["worker changed but tests were skipped", { changes: "success", wc: "true", lint: "success", tests: "skipped" }, false],
-  ["worker changed, both skipped (the skip hole)", { changes: "success", wc: "true", lint: "skipped", tests: "skipped" }, false],
-  ["worker_changed missing and both skipped (the skip hole)", { changes: "success", wc: "", lint: "skipped", tests: "skipped" }, false],
-  ["worker_changed invalid and both green", { changes: "success", wc: "maybe", lint: "success", tests: "success" }, false],
-  ["lint failed", { changes: "success", wc: "true", lint: "failure", tests: "success" }, false],
-  ["tests failed", { changes: "success", wc: "true", lint: "success", tests: "failure" }, false],
-  ["tests cancelled", { changes: "success", wc: "true", lint: "success", tests: "cancelled" }, false],
-  ["docs only but lint failed", { changes: "success", wc: "false", lint: "failure", tests: "skipped" }, false],
-  ["docs only but tests cancelled", { changes: "success", wc: "false", lint: "skipped", tests: "cancelled" }, false],
-  ["changes failed", { changes: "failure", wc: "true", lint: "skipped", tests: "skipped" }, false],
-  ["changes failed, docs-looking outputs", { changes: "failure", wc: "false", lint: "skipped", tests: "skipped" }, false],
-  ["changes cancelled", { changes: "cancelled", wc: "false", lint: "skipped", tests: "skipped" }, false],
-  ["changes skipped", { changes: "skipped", wc: "", lint: "skipped", tests: "skipped" }, false],
-  ["the run was cancelled", { cancelled: true, changes: "success", wc: "true", lint: "success", tests: "success" }, false],
-  ["pull_request", { changes: "success", wc: "true", lint: "success", tests: "success", event: "pull_request" }, false],
-  ["merge_group", { changes: "success", wc: "true", lint: "success", tests: "success", event: "merge_group" }, false],
-  ["another ref (dispatch from a branch)", { changes: "success", wc: "true", lint: "success", tests: "success", event: "workflow_dispatch", ref: "refs/heads/feat/x" }, false],
-  ["a fork", { changes: "success", wc: "true", lint: "success", tests: "success", repo: "someone/cowlic" }, false],
-];
-
-// Failure strings of the plan condition: the named cases, the exhaustive comparison with the oracle, and the property
-// "no combination starts a deploy unless changes succeeded and lint and tests passed in that run, except docs-only".
+// Compare the actual condition with the independent oracle over every context below.
 export function planConditionFailures(text) {
   const f = [];
   let cond;
@@ -91,9 +64,6 @@ export function planConditionFailures(text) {
     cond = (c) => raw(planContext(c));
   } catch (e) {
     return [`plan condition: ${e.message}`];
-  }
-  for (const [name, ctx, want] of planCases) {
-    if (cond(ctx) !== want) f.push(`${name}: expected ${want}`);
   }
   let n = 0;
   for (const cancelled of [false, true])

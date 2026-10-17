@@ -3,7 +3,8 @@
 Serverless self-hosted Spotify alternative: scheduled local ingest on the owner's machine (spotdl) -> Telegram channel as blob storage -> Cloudflare D1 metadata -> Cloudflare Worker implementing (Open)Subsonic API -> Symfonium client. Design: docs/architecture.md, plan: docs/poc-plan.md.
 
 ## Layout
-- `worker/` TypeScript Cloudflare Worker with Hono 4.13.12 (`hono/tiny`) routing and middleware. Typecheck: `npx tsc --noEmit`. Tests: `npm test` (Vitest: stub unit tests, workflow checks, and a smoke run on a throwaway real local D1; this is what CI runs, no secrets, see `docs/worker-cicd.md` 12.1). Owner-only smoke with the real seed and real Telegram (the stream checks): `node scripts/smoke.mjs wrangler.local.toml`. Deploy: `npx wrangler deploy -c wrangler.local.toml`.
+- `worker/` TypeScript Cloudflare Worker with Hono 4.13.12 (`hono/tiny`) routing and middleware. Typecheck: `npx tsc --noEmit`. Tests: `npm test` (Vitest: stub unit tests and a smoke run on a throwaway real local D1; this is what CI runs, no secrets, see `docs/worker-cicd.md` 12.1). Owner-only smoke with the real seed and real Telegram (the stream checks): `node scripts/smoke.mjs wrangler.local.toml`. Deploy: `npx wrangler deploy -c wrangler.local.toml`.
+- `.github/workflows/tests/` Independent workflow-test package: run `npm ci --ignore-scripts` and `npm test` there (Node + bash + git, no Worker dependency install).
 - `ingest/` Python. venv in `ingest/.venv` (spotdl, ytmusicapi). Tests: `.venv/bin/python -m unittest`. `tg_check.py` verifies Telegram storage, `match.py` matches Spotify tracks to YouTube Music by title + duration.
 - `.claude/agents/ticket-worker.md` agent that executes board tickets.
 

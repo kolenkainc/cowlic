@@ -42,8 +42,8 @@ HEAD/GET streaming. Each test gets a new app with its own request state.
 - The other `unit` files test library logic, authentication matrices, CORS, logs and Telegram using controlled fakes.
 - The `smoke` project runs the real Worker in workerd with a real local D1, migrated/legacy synthetic schemas and a
   local Telegram stub. It checks platform behavior that Node unit tests cannot establish.
-- Workflow tests currently run as the separate Vitest `workflow` project through worker/package.json. Their own
-  package and reduction of duplicate checks are the separate Release 4 ticket #381.
+- Workflow tests have their own package under `.github/workflows/tests/`: install with `npm ci --ignore-scripts`
+  and run `npm test` there. They do not run through Worker configuration; see its [README](../.github/workflows/tests/README.md).
 
 No test requires production credentials or real library data. Real authenticated client playback is the owner's
 separate acceptance in #380; it is not inferred from these tests or the unauthenticated deployment health check.

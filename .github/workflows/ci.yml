@@ -359,13 +359,60 @@ jobs:
             exit 1
           fi
 
-      # #285: Vitest runs everything under worker/test in three projects: unit (paging, log-leak, CORS with stubbed D1
-      # and Telegram), workflow (the run blocks of the deploy jobs of this file, hostile titles, mutations, and the static checks
-      # of this file; needs bash) and smoke (the Worker on a REAL local D1 via wrangler, migrated and legacy schema;
-      # fake credentials, no secrets). Two reporters: default to stdout and junit to a file under RUNNER_TEMP (read by
-      # the report step below). The exit code of vitest is the verdict of THIS step: a failing test, zero collected
-      # tests (passWithNoTests false) and a committed .only (allowOnly false) all fail it. No PR context: works on
-      # merge_group too.
+      # Independent package: no Worker dependencies, no install scripts, no secrets.
+      - name: Install workflow test dependencies
+        working-directory: .github/workflows/tests
+        run: npm ci --ignore-scripts
+
+      - name: Workflow tests
+        id: workflow_tests
+        working-directory: .github/workflows/tests
+        run: |
+          npm test -- --reporter=default --reporter=junit --outputFile.junit="$RUNNER_TEMP/workflow-tests.xml"
+
+      # Same pinned action and options as "Test Report" above, its own check run (the minimum below is per runner).
+      - name: Test Report (Workflows)
+        id: workflow_report
+        if: ${{ !cancelled() && (steps.workflow_tests.outcome == 'success' || steps.workflow_tests.outcome == 'failure') }}
+        continue-on-error: ${{ github.event.pull_request.head.repo.fork == true }}
+        uses: mikepenz/action-junit-report@a9170d5795813c01ab4901ffb045b52bab4ab09d # v6.5.0
+        with:
+          report_paths: ${{ runner.temp }}/workflow-tests.xml
+          check_name: Test Report (Workflows)
+          fail_on_failure: true
+          fail_on_parse_error: true
+          require_tests: true
+          comment: false
+
+      # Vitest has no switch against skipped tests and no minimum count, so both are checked here on the numeric
+      # outputs of the report step (no text parsing): skipped must be 0 (a skipped test is a silently dropped check)
+      # and passed must reach MIN_TESTS (measured in #381; see .github/workflows/tests/README.md).
+      # NOT dynamic: raise it deliberately when tests are added,
+      # lower it deliberately when tests are removed on purpose.
+      - name: Minimum test count (Workflows)
+        if: ${{ steps.workflow_tests.outcome == 'success' }}
+        env:
+          MIN_TESTS: "495"
+          PASSED: ${{ steps.workflow_report.outputs.passed }}
+          SKIPPED: ${{ steps.workflow_report.outputs.skipped }}
+        run: |
+          for value in "$PASSED" "$SKIPPED"; do
+            case "$value" in
+              "" | *[!0-9]*) echo "passed/skipped count missing or not a number"; exit 1 ;;
+            esac
+          done
+          echo "passed=$PASSED skipped=$SKIPPED (floor $MIN_TESTS)"
+          if [ "$SKIPPED" -ne 0 ]; then
+            echo "skipped tests are not allowed: remove the test or fix it"
+            exit 1
+          fi
+          if [ "$PASSED" -lt "$MIN_TESTS" ]; then
+            echo "too few passed tests: a test file registers nothing or tests were lost"
+            exit 1
+          fi
+
+      # Application tests only: unit + real local D1/workerd smoke, fake credentials.
+      # Zero collection and committed .only fail Vitest; skips/counts are checked below.
       - name: Vitest tests
         id: vitest
         run: |
@@ -387,19 +434,21 @@ jobs:
 
       # Vitest has no switch against skipped tests and no minimum count, so both are checked here on the numeric
       # outputs of the report step (no text parsing): skipped must be 0 (a skipped test is a silently dropped check)
-      # and passed must reach MIN_TESTS, a pinned number just below the real count (854 on 2026-10-17: 199 unit, 550
-      # workflow, 105 smoke) so a few removals do not trip it but a lost file or area does. NOT dynamic: raise it deliberately when tests are added,
+      # and passed must reach MIN_TESTS (320 on 2026-10-17: 215 unit, 105 smoke).
+      # NOT dynamic: raise it deliberately when tests are added,
       # lower it deliberately when tests are removed on purpose.
       - name: Minimum test count (Vitest)
         if: ${{ steps.vitest.outcome == 'success' }}
         env:
-          MIN_TESTS: "848"
+          MIN_TESTS: "315"
           PASSED: ${{ steps.vitest_report.outputs.passed }}
           SKIPPED: ${{ steps.vitest_report.outputs.skipped }}
         run: |
-          case "$PASSED$SKIPPED" in
-            "" | *[!0-9]*) echo "passed/skipped count missing or not a number: '$PASSED' '$SKIPPED'"; exit 1 ;;
-          esac
+          for value in "$PASSED" "$SKIPPED"; do
+            case "$value" in
+              "" | *[!0-9]*) echo "passed/skipped count missing or not a number"; exit 1 ;;
+            esac
+          done
           echo "passed=$PASSED skipped=$SKIPPED (floor $MIN_TESTS)"
           if [ "$SKIPPED" -ne 0 ]; then
             echo "skipped tests are not allowed: remove the test or fix it"
