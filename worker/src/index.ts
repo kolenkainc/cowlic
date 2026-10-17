@@ -1,67 +1,95 @@
+import { Hono } from "hono/tiny";
+import type { Context } from "hono";
 import { authenticate } from "./auth";
-import { preflight, withCors as addCors } from "./cors";
+import { preflight, withCors } from "./cors";
 import type { Env } from "./env";
-import { HANDLERS, type EndpointContext } from "./handlers";
+import { HANDLERS } from "./handlers";
 import { logEvent, routeName } from "./log";
 import { fail } from "./subsonic";
 import { stubResponse } from "./stubs";
 
-interface Context extends EndpointContext {
-  method: string | null;
+type AppEnv = { Bindings: Env; Variables: {
+  request: Request;
   route: string;
-}
-type Handler = (context: Context) => Promise<Response>;
+  params: URLSearchParams;
+  errorLogged: boolean;
+} };
 
-const route: Handler = async context => {
-  const name = context.method!; // withAuth validates the path before dispatch
+// PatternRouter permits a trailing slash by default. The inner end anchor preserves our exact old path contract.
+// Auth and dispatch use the SAME pattern, so malformed paths remain 404 without reaching auth or a handler.
+const SUBSONIC_PATH = "/rest/:name{[A-Za-z0-9]+(?:\\.view)?$}";
+// Hono's default getPath decodes percent escapes. The previous router matched the raw URL pathname instead.
+const app = new Hono<AppEnv>({ getPath: request => new URL(request.url).pathname });
+const headRequests = new WeakMap<Request, Request>();
+
+function logUnhandled(c: Context<AppEnv>, error: unknown): void {
+  if (!c.get("errorLogged")) {
+    c.set("errorLogged", true);
+    logEvent("unhandled_error", { route: c.get("route"), error });
+  }
+}
+
+app.onError((error, c) => {
+  // Never use Hono's default console.error: messages may contain credentials. Composition can rethrow through
+  // several middleware levels, so log once per request, preserving the original error object.
+  logUnhandled(c, error);
+  throw error;
+});
+app.notFound(() => new Response("Not found", { status: 404 }));
+
+app.use("*", async (c, next) => {
+  const request = headRequests.get(c.req.raw) ?? c.req.raw;
+  c.set("request", request);
+  c.set("route", routeName(new URL(request.url).pathname));
+  c.set("errorLogged", false);
+  try {
+    const early = preflight(request);
+    if (!early) await next();
+    const response = withCors(request, early ?? c.res);
+    c.res = response;
+    logEvent("request", { route: c.get("route"), status: response.status });
+    return response;
+  } catch (error) {
+    // Hono's error handler only receives Error instances. Preserve logging/rethrow for other thrown values too.
+    logUnhandled(c, error);
+    throw error;
+  }
+});
+
+// Register authentication before the sole endpoint route, including unknown method names.
+app.use(SUBSONIC_PATH, async (c, next) => {
+  const request = c.get("request");
+  const params = new URLSearchParams(new URL(request.url).search);
+  if (request.method === "POST") {
+    new URLSearchParams(await request.clone().text()).forEach((v, k) => params.set(k, v));
+  }
+  c.set("params", params);
+  if (!(await authenticate(params, c.env))) {
+    logEvent("auth_failed", { route: c.get("route"), status: 200, code: 40 });
+    return fail(params, 40, "Wrong username or password");
+  }
+  await next();
+});
+
+app.all(SUBSONIC_PATH, c => {
+  const name = c.req.param("name")!.replace(/\.view$/, "");
+  const params = c.get("params");
   return Object.prototype.hasOwnProperty.call(HANDLERS, name)
-    ? HANDLERS[name](context)
-    : stubResponse(name, context.params) ?? fail(context.params, 0, `Not implemented: ${name}`);
-};
-
-function withAuth(next: Handler): Handler {
-  return async context => {
-    if (context.method === null) return new Response("Not found", { status: 404 });
-    // Form body values override query values, as before.
-    if (context.request.method === "POST") {
-      new URLSearchParams(await context.request.clone().text()).forEach((v, k) => context.params.set(k, v));
-    }
-    if (!(await authenticate(context.params, context.env))) {
-      logEvent("auth_failed", { route: context.route, status: 200, code: 40 });
-      return fail(context.params, 40, "Wrong username or password");
-    }
-    return next(context);
-  };
-}
-
-function withCors(next: Handler): Handler {
-  return async context => addCors(context.request, preflight(context.request) ?? await next(context));
-}
-
-function withLogging(next: Handler): Handler {
-  return async context => {
-    try {
-      const res = await next(context);
-      logEvent("request", { route: context.route, status: res.status });
-      return res;
-    } catch (e) {
-      logEvent("unhandled_error", { route: context.route, error: e });
-      throw e;
-    }
-  };
-}
-
-const handle = withLogging(withCors(withAuth(route)));
+    ? HANDLERS[name]({ request: c.get("request"), env: c.env, params,
+      upstreamError: () => logEvent("upstream_error", { route: c.get("route"), status: 502, code: 0 }) })
+    : stubResponse(name, params) ?? fail(params, 0, `Not implemented: ${name}`);
+});
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-    const route = routeName(url.pathname);
-    return handle({
-      request, env, route,
-      method: url.pathname.match(/^\/rest\/([A-Za-z0-9]+)(?:\.view)?$/)?.[1] ?? null,
-      params: new URLSearchParams(url.search),
-      upstreamError: () => logEvent("upstream_error", { route, status: 502, code: 0 }),
-    });
+    // Hono strips HEAD bodies even in direct fetch calls. Previously only the HTTP runtime stripped them.
+    // Dispatch internally as GET while application handlers (including Telegram) see the original HEAD request.
+    const routed = request.method === "HEAD" ? new Request(request, { method: "GET" }) : request;
+    if (routed !== request) headRequests.set(routed, request);
+    try {
+      return await app.fetch(routed, env);
+    } finally {
+      headRequests.delete(routed);
+    }
   },
 };

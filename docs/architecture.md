@@ -59,6 +59,10 @@ Playlists (`playlists`, `playlist_tracks`) are planned after the POC.
 
 ### 2.3 API (Cloudflare Worker)
 Implements a subset of (Open)Subsonic REST, with JSON responses (`f=json`) and XML by default.
+Routing and middleware use exactly pinned Hono 4.13.12 (`hono/tiny`); Subsonic serialization, authentication,
+the handler registry and Telegram proxy retain their own implementations. Authentication is registered before
+dispatch on the same strict path pattern, and malformed paths remain plain 404 responses. No Hono middleware
+package is used. The pre-migration response fixture checks status, headers and body bytes, including HEAD and Range.
 
 | Endpoint | Purpose |
 |---|---|
