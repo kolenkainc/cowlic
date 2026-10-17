@@ -29,6 +29,7 @@ import random
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -930,7 +931,12 @@ def process_track(song: dict, deps: Deps, existing: set, covers: dict, work: Pat
         return "dry_run"
     tdir = work / sid
     tdir.mkdir(exist_ok=True)
+    video_id = getattr(m, "video_id", None)
+    if notes is not None and isinstance(video_id, str) and VIDEO_ID.fullmatch(video_id):
+        notes["download_video_id"] = video_id
     mp3 = deps.download(song, m, tdir)
+    if notes is not None:
+        notes.pop("download_video_id", None)
     size = mp3.stat().st_size
     if too_big(size):
         return "too_big"
@@ -1225,6 +1231,58 @@ def default_state_path() -> Path:
     return Path(base) / "cowlic" / "ingest-state.json"
 
 
+def save_download_failure(state_path: Path, sid: str, video_id: str, error: Exception) -> bool:
+    """Keep at most ten private, redacted downloader reports; never replace the original failure."""
+    temporary = None
+    try:
+        if not SONG_ID.fullmatch(sid) or not VIDEO_ID.fullmatch(video_id):
+            raise ValueError()
+        directory = state_path.parent / "download-failures"
+        if directory.resolve().is_relative_to(Path(__file__).resolve().parents[1]):
+            raise ValueError()  # A custom state file must not put library diagnostics inside the public checkout.
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ValueError()
+        path = directory / ("download-" + hashlib.sha256(sid.encode()).hexdigest() + ".json")
+        if path.is_symlink() or (path.exists() and (not path.is_file() or path.stat().st_uid != os.getuid()
+                                                  or path.stat().st_mode & 0o077)):
+            raise ValueError()
+        secrets = [os.environ[k] for k in SPOTDL_HIDDEN_ENV | tg_check.ENV_FROM_FILE if os.environ.get(k)]
+        detail = "\n".join(clean_lines(str(error), secrets))[-8192:]
+        report = {"version": 1, "occurred_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                  "song_id": sid, "video_id": video_id, "error_class": type(error).__name__[:80],
+                  "context": safe_failure_context(error), "detail": detail}
+        data = json.dumps(report, ensure_ascii=False).encode("utf-8") + b"\n"
+        if len(data) > 65536:
+            raise ValueError()
+        older = []
+        for previous in directory.iterdir():
+            if previous == path or not re.fullmatch(r"download-[a-f0-9]{64}\.json", previous.name):
+                continue
+            entry = previous.lstat()
+            if stat.S_ISREG(entry.st_mode) and entry.st_uid == os.getuid() and not entry.st_mode & 0o077:
+                older.append((entry.st_mtime_ns, previous))
+        for _, previous in sorted(older)[:-9]:
+            previous.unlink()
+        fd, temporary = tempfile.mkstemp(prefix=".pending-", dir=directory)
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, path)
+        return True
+    except Exception as diagnostic_error:  # Best-effort evidence must not mask the original track failure.
+        log(f"WARN private download diagnostic unavailable ({type(diagnostic_error).__name__})")
+        return False
+    finally:
+        if temporary is not None:
+            try:
+                Path(temporary).unlink(missing_ok=True)
+            except OSError:
+                log("WARN private download diagnostic temporary cleanup failed")
+
+
 def utc_today() -> datetime.date:
     return datetime.datetime.now(datetime.timezone.utc).date()
 
@@ -1417,6 +1475,8 @@ def run(songs: list[dict], deps: Deps, existing: set, covers: dict, work: Path, 
             e.counts, e.tracks_not_attempted = counts, len(unique) - i - 1
             raise  # ends the run, not just this track
         except (IngestError, OSError, KeyError, ValueError, IndexError, TypeError) as e:
+            if quiet and state and state.path and notes.get("download_video_id") and not dry:
+                save_download_failure(state.path, sid, notes["download_video_id"], e)
             detail = safe_failure_context(e) if quiet else f": {e}" if isinstance(e, IngestError) else ""
             log(f"ERROR {label}: {type(e).__name__}{detail}")
             counts["failed"] += 1

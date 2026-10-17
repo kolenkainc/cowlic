@@ -955,6 +955,23 @@ only for the exact recognized Telegram response format. Raw provider description
 unrecognized errors remain class-only. This adds diagnostic evidence without changing retries, cooldowns, caps or
 sign-in stopping. A reported retry-after does not mean the operation was automatically retried or completed.
 
+If a quiet track fails inside the downloader, ingest also keeps a **private** report next to its configured state
+file, under `download-failures/`. It records the exact matched video ID, song ID, UTC time, error class/context and
+up to 8192 characters of cleaned downloader detail. Known environment secrets, signed query strings and IPs are
+redacted using the existing output sanitizer. The directory is 0700 and reports are 0600; at most ten reports
+are retained, with the newest failure replacing an earlier report for the same song. Reports cannot be stored inside
+the public checkout; symlinks and an insecure destination are refused. A failed diagnostic write logs only its error
+class and leaves the original failure/cooldown unchanged. A successful download, later upload failure or sign-in
+stop does not produce such a report. No report is shipped to Grafana or added to CI artifacts. Reports may still
+contain private titles/URLs: inspect them locally and never paste or attach them publicly.
+
+Investigation of #175 on 2026-10-17 resolved the one failed record from the manual run using eight paced source
+requests and existing read-only D1 helpers. One isolated download with the service's PATH and existing downloader
+flags then produced a 13,002,835-byte MP3, which was removed with its private scratch directory. No ingest state,
+Telegram object or D1 row changed. The earlier stderr and exact earlier match were not retained, so this successful
+reproduction does not establish the original error's cause. The private report fixes that evidence gap for future
+failures; it does not change retry policy or imply a successful full ingest run.
+
 ## Album covers from YouTube Music (#248)
 
 A track without a Spotify cover URL (Last.fm and new-release tracks) gets the album cover from the YouTube Music
