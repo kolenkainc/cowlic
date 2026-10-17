@@ -187,6 +187,37 @@ Version choice notes:
 - We need custom steps (runner-local config, Time Travel bookmark, lint gate, health check) that the action does not provide anyway.
 - `npm ci` (the lockfile) would run install scripts of wrangler's dependencies; in the token jobs it is `npm ci --ignore-scripts` and that step has no secrets in its environment (section 4.2).
 
+### Runtime dependency: Hono (#234)
+
+Owner-approved option B in [#349](https://github.com/kolenkainc/cowlic/issues/349#issuecomment-6232548947), following
+the [#338 design](https://github.com/kolenkainc/cowlic/issues/338#issuecomment-6198532244). Rechecked 2026-10-17:
+
+| Check | Result |
+| --- | --- |
+| Exact version | `hono` **4.13.12**, published 2026-09-30 09:43 UTC (17 days old); package and lockfile pinned, no upgrade |
+| License / maintainer | MIT; npm lists one maintainer account, `yusukebe` |
+| Runtime / peer dependencies | None (`npm view` metadata and `npm ls hono --all`) |
+| Install lifecycle scripts | No preinstall/install/postinstall/prepare; installation uses `--ignore-scripts` |
+| Package provenance | npm metadata supplies SLSA provenance and registry signature; not an independent line-by-line audit |
+| Integrity | `sha512-6E2QDAc9Ick9Sq77ZrGS/dk2WUYni91aufTw6LJKpV7w8kW5/GxVUc650FOADOmlwg3K+f7Pun6XlV+pYmW6gw==` |
+| Package size | 571 files, 1,287,796 unpacked bytes; final bundled size is recorded in the implementation PR |
+| Current advisories | GitHub advisory query `ecosystem=npm&affects=hono@4.13.12` returned zero; npm installation audit reported zero vulnerabilities |
+| Used surface | Only `hono/tiny` at runtime; `hono` Context import is type-only. No logger, CORS, JWT, JSX, body/query parser or adapter import |
+
+Sources: [npm version metadata](https://www.npmjs.com/package/hono/v/4.13.12),
+[GitHub security advisories](https://github.com/honojs/hono/security/advisories), and the installed package manifest.
+The earlier 43 historical advisories in #338 describe maintenance cost, not 43 vulnerabilities in this pin. Current
+audit results are a dated observation, not a promise about future findings. Keep the exact pin and require a fresh
+audit for any bump; re-audit before adopting Hono 5. The runtime executes with Worker bindings/secrets, so a compromised
+release remains a supply-chain risk despite zero transitive dependencies and disabled install scripts.
+
+Compatibility details: PatternRouter's optional trailing slash and Hono's decoded default pathname are constrained
+to the previous strict raw-path contract. Authentication and dispatch share one pattern instead of the design's
+broader `/rest/*` sketch, preserving 404-before-auth for malformed paths. A small HEAD adapter routes internally as
+GET while passing the original HEAD Request to every application handler; this preserves direct-fetch body bytes
+and Telegram's upstream HEAD, while the HTTP runtime still removes HEAD bodies. Errors are logged by class once and
+rethrow unchanged; Hono's default error logger is replaced. The pre-change golden fixture must pass without updates.
+
 ## 7. Cloudflare token: the existing owner token
 
 Owner decision (2026-10-11): no separate scoped token is created; the pipeline uses the owner's existing Cloudflare API token, stored as the environment secret `CLOUDFLARE_API_TOKEN` (section 3, rules 1, 2, 9, 10). Consequences for this document:
