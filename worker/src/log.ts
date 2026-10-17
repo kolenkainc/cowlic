@@ -1,4 +1,4 @@
-import { STUB_ENDPOINTS } from "./stubs";
+import { HANDLERS } from "./handlers";
 
 // Structured console logs (Workers Logs, see docs/worker-deploy-runbook.md "Logs").
 //
@@ -11,11 +11,7 @@ import { STUB_ENDPOINTS } from "./stubs";
 //   errorClass  class name of a caught exception (restricted to [A-Za-z0-9_], at most 40 characters)
 // Never pass the exception message (it may embed query values).
 
-const IMPLEMENTED = [
-  "ping", "getLicense", "getOpenSubsonicExtensions", "getMusicFolders", "getArtists", "getIndexes", "getArtist",
-  "getAlbum", "getSong", "getAlbumList2", "search3", "getCoverArt", "stream", "download",
-];
-const ROUTES: ReadonlySet<string> = new Set([...IMPLEMENTED, ...STUB_ENDPOINTS]);
+export const ROUTES: ReadonlySet<string> = new Set(Object.keys(HANDLERS));
 
 /** Route name for logs: a known Subsonic method, "other" for any other /rest/ name, "not_rest" outside /rest/. */
 export function routeName(pathname: string): string {
