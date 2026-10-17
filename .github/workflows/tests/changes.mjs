@@ -8,7 +8,7 @@ import { runBlock } from "./lib.mjs";
 
 const GIT_ENV = { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
 const F40 = "f".repeat(40);
-const CHANGE_FILES = { worker: "worker/a.txt", docs: "docs/d.txt", ci: ".github/workflows/ci.yml", deploy: ".github/workflows/worker-deploy.yml", workflowTests: ".github/workflows/tests/probe.mjs", rootPackage: "package.json", rootLock: "pnpm-lock.yaml", rootWorkspace: "pnpm-workspace.yaml" };
+const CHANGE_FILES = { worker: "worker/a.txt", docs: "docs/d.txt", ci: ".github/workflows/ci.yml", deploy: ".github/workflows/worker-deploy.yml", workflowTests: ".github/workflows/tests/probe.mjs", rootPackage: "package.json", rootLock: "pnpm-lock.yaml", rootWorkspace: "pnpm-workspace.yaml", previewTool: "scripts/preview-worker.py", previewTests: "scripts/test-preview-worker.py" };
 
 export function createChangesRunner(text, { tmp }) {
   const dir = mkdtempSync(join(tmp, "chg-"));
@@ -74,7 +74,7 @@ export function createChangesRunner(text, { tmp }) {
 const A_ = ({ A }) => A;
 const H_ = ({ H }) => H;
 export const changesCases = [
-  ...["rootPackage", "rootLock", "rootWorkspace"].flatMap((change) => [
+  ...["rootPackage", "rootLock", "rootWorkspace", "previewTool", "previewTests"].flatMap((change) => [
     [`pull_request: ${change} runs checks`, { event: "pull_request", change }, "A", "true"],
     [`push: ${change} runs checks`, { event: "push", change, before: A_ }, "A", "true"],
     [`merge_group: ${change} runs checks`, { event: "merge_group", change, mgBase: A_, mgHead: H_ }, "A", "true"],
@@ -124,6 +124,7 @@ export function changesCaseFailures(runner, [name, opts, wantBase, wantChanged])
 }
 
 export const changesMutations = [
+  ["preview tooling excluded from checks", (t) => t.replace(" ':(top)scripts/preview-worker.py' ':(top)scripts/test-preview-worker.py'", "")],
   ["root workspace inputs excluded from checks", (t) => t.replace(" ':(top)package.json' ':(top)pnpm-lock.yaml' ':(top)pnpm-workspace.yaml'", "")],
   ["the change pathspec excludes the moved workflow tests", (t) => t.replace("':(top).github'", "':(top).github/workflows/ci.yml'")],
   ["the git diff failed branch writes worker_changed=false", (t) => t.replace('echo "git diff failed: treating worker as changed"\n            echo "worker_changed=true"', 'echo "git diff failed: treating worker as changed"\n            echo "worker_changed=false"')],
@@ -182,6 +183,8 @@ export function createScopeRunner(text, { tmp }) {
 
 // [name, options, expected deploy output, expects a "nothing to deploy" summary]
 export const scopeCases = [
+  ...["previewTool", "previewTests"].map((change) =>
+    [`push: ${change} alone does not deploy production`, { event: "push", change, base: A_ }, "false", true]),
   ...["rootPackage", "rootLock", "rootWorkspace"].map((change) =>
     [`push: ${change} changed since BASE deploys`, { event: "push", change, base: A_ }, "true", false]),
   ["push: worker/ changed since BASE deploys", { event: "push", change: "worker", base: A_ }, "true", false],

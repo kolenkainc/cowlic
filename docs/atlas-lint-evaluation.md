@@ -1,6 +1,8 @@
 # Atlas as a D1 migration lint: adoption screen (#265)
 
-Research date: 2026-10-17. Recommendation: **keep the current lint pending the licensed comparison**. The initial screen used no binary or account. After the owner selected B in #369, a pinned standard image was downloaded into scratch storage and the offline entitlement gate was exercised. No Atlas account, pipeline or repository dependency changed. `[V]` means observed locally or verified in the linked primary source on that date; `[R]` means unverified. This is not a completed analyzer benchmark.
+Research date: 2026-10-17. Outcome: **keep the current lint; licensed evaluation cancelled by the owner**. The initial screen used no binary or account. After the owner selected B in #369, a pinned standard image was downloaded into scratch storage and the offline entitlement gate was exercised. No Atlas account, pipeline or repository dependency changed. `[V]` means observed locally or verified in the linked primary source on that date; `[R]` means unverified. This is not a completed analyzer benchmark.
+
+Owner decision later on 2026-10-17: do not pay for Atlas or complete a login. #265 and #378 are closed as not planned; the replacement is [preview Worker/D1 rehearsal](preview-worker.md), #385. The investigation below records the earlier findings, not a current request to obtain a grant.
 
 ## The decisive constraint
 
@@ -97,18 +99,10 @@ telemetry, while separately documenting identified/license telemetry and errors.
 proof of zero traffic. All analysis is configured with network disabled; no `--web`, registry push or cloud schema
 upload is used. [R] Whether this account's grant permits the complete offline comparison is still untested.
 
-## Concrete owner step before the licensed comparison
+## Final owner decision
 
-[V, pricing documentation] [Current pricing](https://atlasgo.io/pricing), checked 2026-10-17, starts Pro CLI at
-$9 per developer/month and separately lists pipeline usage pricing; a free trial is offered. No account/trial,
-payment or subscription was activated. The authorized preparation has **zero vendor spend**; option B is not
-interpreted as a purchase or an instruction to send the owner token to an agent.
-
-Use an existing entitled account or explicitly select a zero-cost trial on the vendor's terms. From your own local
-terminal, the prepared `/tmp/cowlic-atlas-eval/run-atlas.sh login --grant-only` uses an interactive login with network
-enabled only for that login command. Keep the grant in the private scratch home; do not paste tokens, grant contents
-or device codes in the public ticket. Report only that login completed and its non-secret expiry/entitlement status.
-The coordinator can then re-run the same cases with network disabled, add synthetic populated/large-table samples,
-and report actual findings, time and policy differences. If no zero-cost entitlement is available, record the
-missing entitlement and decide a budget separately; do not silently start a subscription. This is the only remaining
-account step, not a second go/no-go question about the already-approved evaluation.
+The owner stopped the licensed evaluation after learning about the Pro requirement and requested a separate preview
+Worker/D1 seeded from production instead (#385). No Atlas account, trial, subscription or token was activated.
+The earlier #369 option B and the prepared grant-only login are superseded; no owner login action remains.
+The ten Pro-gated attempts are not analyzer results. Keep the current lint and add preview execution as separate
+runtime evidence; preview success does not replace destructive-change policy or immutable migration history checks.
