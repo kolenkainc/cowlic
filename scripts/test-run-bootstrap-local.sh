@@ -48,6 +48,31 @@ case "${2:-}" in
     esac
     # the stub SHIPPER (logs-only calls): records its arguments; a --final call also copies what a real push would
     # carry (the log from --offset on) into STUB_SHIPPED, so the test can look at the shipped bytes
+    if [ "${STUB_PROBE:-}" = 1 ]; then
+      [ "$(readlink /proc/self/fd/0)" = /dev/null ] || echo stdin >> "$STUB_SHIP_CALLS.probe"
+      echo SHIP_STDERR_SENTINEL >&2
+      off=""; lg=""; cursor=""; prev=""
+      for a in "$@"; do
+        [ "$prev" = --offset ] && off="$a"
+        [ "$prev" = --log ] && lg="$a"
+        [ "$prev" = --offset-file ] && cursor="$a"
+        prev="$a"
+      done
+      [ ! -e "$cursor" ] || echo stale-cursor >> "$STUB_SHIP_CALLS.probe"
+      if [ "$off" -gt 0 ] && [ "$(dd if="$lg" bs=1 skip="$((off - 1))" count=1 2>/dev/null | od -An -tx1 | tr -d ' ')" != 0a ]; then
+        echo torn-offset >> "$STUB_SHIP_CALLS.probe"
+      fi
+      case " $* " in *" --final "*)
+        [ -s "$STUB_LAST_RUN" ] || echo early-final >> "$STUB_SHIP_CALLS.probe" ;;
+      esac
+    fi
+    if [ "${STUB_LIVE_FD:-}" = 1 ]; then
+      case " $* " in *" --final "*) ;; *)
+        parent="$(ps -o ppid= -p "$PPID" | tr -d ' ')"
+      group="$(ps -o pgid= -p "$parent" | tr -d ' ')"
+        [ ! -e "/proc/$group/fd/9" ] || echo leaked >> "$STUB_SHIP_CALLS.livefd9" ;;
+      esac
+    fi
     echo "$*" >> "$STUB_SHIP_CALLS"
     echo "lock-held=${COWLIC_LOCK_HELD-unset}" >> "$STUB_SHIP_CALLS.env"
     [ ! -e /proc/self/fd/9 ] || echo leaked >> "$STUB_SHIP_CALLS.fd9"
@@ -65,6 +90,10 @@ case "${2:-}" in
       ok) echo "grafana: loki push ok (HTTP 204)"; exit 0 ;;
       fail) echo "grafana: boom"; exit 1 ;;
       kill) kill -9 $$ ;;
+      livehang)
+        case " $* " in *" --final "*) echo "grafana: loki push ok (HTTP 204)"; exit 0 ;; esac
+        echo $$ > "$STUB_SHIP_CALLS.pid"
+        exec sleep "$STUB_LIVE_SLEEP" ;;
       hang) sleep 12; exit 0 ;;
     esac ;;
   */bootstrap.py)
@@ -455,6 +484,37 @@ sc_ship_timeout() {
   COWLIC_SHIP_TIMEOUT=1 STUB_SHIP=hang STUB_RC=5 run run --max-new 1 --max-minutes 1
   [ "$rc" = 5 ] && [ $((SECONDS - t)) -lt 8 ] && echo 0 || echo 1
 }
+sc_ship_guards() {
+  new_case "m-ship-guards-$RANDOM"
+  mkdir -p "$S/cowlic"
+  printf 'old line\nunfinished' > "$S/cowlic/bootstrap.log"
+  printf '999999' > "$S/cowlic/.bootstrap-ship.offset"
+  export STUB_PROBE=1 STUB_LAST_RUN="$S/cowlic/bootstrap-last-run.json"
+  run run --max-new 1 --max-minutes 1 <<< 'STDIN_SENTINEL'
+  unset STUB_PROBE STUB_LAST_RUN
+  [ "$rc" = 0 ] && [ ! -e "$STUB_SHIP_CALLS.probe" ] && ! grep -q SHIP_STDERR_SENTINEL "$C/out" && echo 0 || echo 1
+}
+
+sc_live_fd() {
+  new_case "m-live-fd-$RANDOM"
+  export STUB_SLEEP=3 STUB_LIVE_FD=1 COWLIC_BOOTSTRAP_SHIP_INTERVAL=1
+  run run --max-new 1 --max-minutes 1
+  unset STUB_SLEEP STUB_LIVE_FD COWLIC_BOOTSTRAP_SHIP_INTERVAL
+  [ ! -e "$STUB_SHIP_CALLS.livefd9" ] && [ "$(grep -vc -- --final "$STUB_SHIP_CALLS" || true)" -ge 1 ] && echo 0 || echo 1
+}
+
+sc_inflight() {
+  new_case "m-inflight-$RANDOM"
+  local marker="24123.$RANDOM" begun="$SECONDS"
+  export STUB_SLEEP=3 STUB_SHIP=livehang STUB_LIVE_SLEEP="$marker" COWLIC_BOOTSTRAP_SHIP_INTERVAL=1
+  run run --max-new 1 --max-minutes 1
+  unset STUB_SLEEP STUB_SHIP STUB_LIVE_SLEEP COWLIC_BOOTSTRAP_SHIP_INTERVAL
+  local stray
+  stray="$(pgrep -f -- "sleep $marker" || true)"
+  pkill -f -- "sleep $marker" 2>/dev/null || true
+  [ "$rc" = 0 ] && [ -e "$STUB_SHIP_CALLS.pid" ] && [ -z "$stray" ] && [ $((SECONDS - begun)) -lt 12 ] && echo 0 || echo 1
+}
+
 sc_only_run_plan() { new_case "m-orp-$RANDOM"; run status; run rank; [ ! -e "$STUB_SHIP_CALLS" ] && echo 0 || echo 1; }
 sc_live() {
   new_case "m-live-$RANDOM"; STUB_SLEEP=4 COWLIC_BOOTSTRAP_SHIP_INTERVAL=1 run run --max-new 1 --max-minutes 1
@@ -477,7 +537,14 @@ sc_watchdog() {
   sleeper_case "m-wd-$RANDOM"
   XDG_STATE_HOME="$S" bash "$R/scripts/run-bootstrap-local.sh" run --max-new 1 --max-minutes 1 > "$C/out" 2>&1 &
   local w=$!; sleep 1.5; kill -9 "$w"; wait "$w" 2> /dev/null || true; sleep 3.5
-  local stray; stray="$(pgrep -f -- "sleep $MARK" || true)"; pkill -f -- "sleep $MARK" 2> /dev/null || true
+  local stray; stray="$(pgrep -f -- "sleep $MARK" || true)"
+  # The mutant watchdog is also a job of the copied wrapper; kill its entire group, including sleep 100000.
+  local job
+  for job in $(pgrep -f -- "$R/scripts/run-bootstrap-local.sh" || true); do
+    kill -KILL -- "-$job" 2> /dev/null || true
+  done
+  pkill -f -- "sleep $MARK" 2> /dev/null || true
+  rm -rf "$C"
   [ -z "$stray" ] && echo 0 || echo 1
 }
 sc_cov_guard() { new_case "m-cg-$RANDOM"; run covers --max-new 1 --max-minutes 600; [ "$rc" = 78 ] && [ ! -e "$STUB_ARGS" ] && echo 0 || echo 1; }
@@ -527,10 +594,17 @@ mutation "shipping under the nightly job label" sc_logsonly 's/^SHIP_JOB="cowlic
 mutation "shipping from offset 0 (earlier sessions)" sc_shipped_clean 's/--offset "\$LOG_OFFSET"/--offset 0/'
 mutation "shipped bytes not redacted" sc_shipped_clean 's#| "\$VENV_PY" -u "\$SHIP" --filter 9>&- \\#| cat \\#'
 mutation "shipper failure changes the exit code" sc_ship_rc 's/out="\$(ship_call --final)" || out=""/out="$(ship_call --final)" || exit 9/'
+mutation "in-flight shipper cleanup removed" sc_inflight '/^  trap .*ship_pid.*EXIT$/d'
+mutation "live loop holds the lock descriptor" sc_live_fd 's/) < \/dev\/null > \/dev\/null 9>\&- \&/) < \/dev\/null > \/dev\/null \&/'
+mutation "torn-line repair removed" sc_ship_guards 's/printf '\''\\n'\'' >> "\$LOG"/true/'
+mutation "final push before last-run" sc_ship_guards 's/write_last_run "\$rc"; rm -f "\$RESULT"; ship_final/ship_final; write_last_run "$rc"; rm -f "$RESULT"/'
+mutation "shipper stdin inherited" sc_ship_guards 's/"\$@" < \/dev\/null 9>\&- 2> \/dev\/null/"$@" < \/dev\/stdin 9>\&- 2> \/dev\/null/'
+mutation "shipper stderr inherited" sc_ship_guards 's/"\$@" < \/dev\/null 9>\&- 2> \/dev\/null/"$@" < \/dev\/null 9>\&-/'
+mutation "old cursor survives start" sc_ship_guards '/^    rm -f "\$OFFSET_FILE"$/d'
 mutation "shipper without timeout" sc_ship_timeout 's/timeout -k 2 "\$SHIP_TIMEOUT_S" //'
 mutation "shipping for every subcommand" sc_only_run_plan '/^# The live shipper/,/^esac/ s/^  1)$/  *)/'
 mutation "no live loop" sc_live 's/^      warned=0$/      exit 0/'
-mutation "live loop outlives the wrapper" sc_tick_orphan 's#kill -0 "\$WRAPPER_PID" 2> /dev/null || exit 0#true#'
+mutation "live loop loses both parent-death guards" sc_tick_orphan 's#kill -0 "\$WRAPPER_PID" 2> /dev/null || exit 0#true#; /^  \[ -z "\$TICK_PID" \] || kill -TERM/d'
 mutation "no watchdog" sc_watchdog 's/^  while kill -0 "\$WRAPPER_PID".*$/  sleep 100000/'
 mutation "covers is not guarded against 21:10" sc_cov_guard 's/^case "\$SUB" in run | plan) LONG=1 ;; covers) \[ "\$COUNT" = 1 \] || LONG=1 ;; esac/case "$SUB" in run | plan) LONG=1 ;; esac/'
 mutation "covers caps not required" sc_cov_caps 's/usage_fail "covers requires --max-new and --max-minutes (or --count)"/true/'
