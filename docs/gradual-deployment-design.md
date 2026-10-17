@@ -15,14 +15,14 @@ Research date: 2026-10-17. `[V]` is verified in the linked primary source or ins
 All commands below are illustrative placeholders. Use the installed exact CLI and an environment-specific config. Never paste real IDs or private URLs into public tickets.
 
 ```sh
-npx wrangler versions upload -c wrangler.local.toml --tag="<short-sha>" --message="<audited-message>"
-npx wrangler versions deploy "<old-uuid>@100" "<new-uuid>@0" --yes -c wrangler.local.toml
+pnpm exec wrangler versions upload -c wrangler.local.toml --tag="<short-sha>" --message="<audited-message>"
+pnpm exec wrangler versions deploy "<old-uuid>@100" "<new-uuid>@0" --yes -c wrangler.local.toml
 # Only after the response identity equals new-uuid and required checks pass:
-npx wrangler versions deploy "<old-uuid>@90" "<new-uuid>@10" --yes -c wrangler.local.toml
+pnpm exec wrangler versions deploy "<old-uuid>@90" "<new-uuid>@10" --yes -c wrangler.local.toml
 # After an explicit promotion decision:
-npx wrangler versions deploy "<new-uuid>@100" --yes -c wrangler.local.toml
+pnpm exec wrangler versions deploy "<new-uuid>@100" --yes -c wrangler.local.toml
 # On failure, restore Worker traffic:
-npx wrangler versions deploy "<old-uuid>@100" --yes -c wrangler.local.toml
+pnpm exec wrangler versions deploy "<old-uuid>@100" --yes -c wrangler.local.toml
 ```
 
 [R, design] Upload from a current master SHA in the existing protected environment only. Capture the single previously active 100% version (#267), upload and parse the new UUID, then assign old=100/new=0 before the override check. A never-deployed upload is not selectable by the override header. Validate both IDs and the complete deployment response. Retain authentication rejection checks; successful authenticated library/cover/range playback checks remain owner-run until a credentials-safe verification method is approved. Agents do not receive the owner's password.

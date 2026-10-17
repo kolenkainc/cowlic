@@ -1,0 +1,11 @@
+{
+  "name": "cowlic",
+  "private": true,
+  "packageManager": "pnpm@10.34.7",
+  "scripts": {
+    "test": "pnpm -r --fail-if-no-match test",
+    "test:worker": "pnpm --filter cowlic-worker --fail-if-no-match test",
+    "test:workflows": "pnpm --filter cowlic-workflow-tests --fail-if-no-match test",
+    "typecheck": "pnpm --filter cowlic-worker --fail-if-no-match typecheck"
+  }
+}

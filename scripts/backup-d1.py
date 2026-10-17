@@ -58,7 +58,7 @@ def backup(state_dir, keep):
         pending = Path(name)
         try:
             process = subprocess.Popen(
-                ["npx", "--no-install", "wrangler", "d1", "export", "cowlic", "--remote", "--skip-confirmation", "--output", str(pending),
+                ["pnpm", "exec", "wrangler", "d1", "export", "cowlic", "--remote", "--skip-confirmation", "--output", str(pending),
                  "-c", "wrangler.local.toml"], cwd=ROOT / "worker", env=env,
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
             try:

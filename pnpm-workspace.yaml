@@ -1,0 +1,11 @@
+packages:
+  - worker
+  - .github/workflows/tests
+
+# Package boundaries remain strict; tools must be declared in their own package.
+hoist: false
+autoInstallPeers: false
+ignoreScripts: true
+verifyDepsBeforeRun: error
+packageManagerStrictVersion: true
+managePackageManagerVersions: false

@@ -18,8 +18,8 @@ function run(payload, exit = 0, source = text) {
   const bin = join(tmp, "bin");
   mkdirSync(bin);
   writeFileSync(join(tmp, "payload"), payload);
-  writeFileSync(join(bin, "npx"), '#!/bin/bash\ncat "$RUNNER_TEMP/payload"\necho "SYNTHETIC-RAW-ERROR" >&2\nexit "$STUB_EXIT"\n');
-  chmodSync(join(bin, "npx"), 0o700);
+  writeFileSync(join(bin, "pnpm"), '#!/bin/bash\ncat "$RUNNER_TEMP/payload"\necho "SYNTHETIC-RAW-ERROR" >&2\nexit "$STUB_EXIT"\n');
+  chmodSync(join(bin, "pnpm"), 0o700);
   writeFileSync(join(tmp, "out"), "");
   writeFileSync(join(tmp, "summary"), "");
   const res = spawnSync("bash", ["-eo", "pipefail", "-c", runBlock(source, "Read previous active version")], {
@@ -78,7 +78,7 @@ describe("previous active Worker version (#267)", () => {
     });
     expect(result.status).toBe(0);
     const output = readFileSync(summary, "utf8");
-    expect(output).toContain(`npx wrangler rollback ${previous === CURRENT ? CURRENT + " " : ""}--message "health check failed" -c wrangler.local.toml`);
+    expect(output).toContain(`pnpm exec wrangler rollback ${previous === CURRENT ? CURRENT + " " : ""}--message "health check failed" -c wrangler.local.toml`);
     expect(output).not.toContain("::error::synthetic");
   });
 });
