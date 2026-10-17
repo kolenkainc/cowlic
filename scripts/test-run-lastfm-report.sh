@@ -156,6 +156,37 @@ after="$(wc -l < "$C/ship_calls" 2> /dev/null || echo 0)"
 assert "kill -9: no push after the wrapper died (beyond the one in flight)" "$([ "$after" -le $((before + 1)) ] && echo 0 || echo 1)"
 unset COWLIC_REPORT_SHIP_INTERVAL
 
+
+# In-flight timeout groups must end on a normal final flush and after a wrapper killed without traps.
+for flight_mode in normal killed; do
+  new_case "flight-$flight_mode"
+  live_marker="25123.$RANDOM"
+  report_marker="26123.$RANDOM"
+  report_sleep=3
+  [ "$flight_mode" != killed ] || report_sleep="$report_marker"
+  cat > "$R/ingest/.venv/bin/python" <<PY
+#!/bin/sh
+case "\$*" in
+  *ship_grafana.py*--filter*) exec cat ;;
+  *ship_grafana.py*--final*) exit 0 ;;
+  *ship_grafana.py*) echo \$\$ > "$C/live.pid"; exec sleep "$live_marker" ;;
+  *lastfm_report.py*) echo started; exec sleep "$report_sleep" ;;
+esac
+PY
+  export COWLIC_REPORT_SHIP_INTERVAL=1
+  XDG_STATE_HOME="$S" bash "$R/scripts/run-lastfm-report.sh" --lastfm-user x > "$C/out" 2>&1 &
+  wp=$!
+  for attempt in 1 2 3 4 5; do [ -e "$C/live.pid" ] && break; sleep 1; done
+  if [ "$flight_mode" = killed ]; then kill -9 "$wp"; fi
+  wait "$wp" 2>/dev/null || true
+  sleep 2
+  stray="$(pgrep -f -- "sleep $live_marker" || true)"
+  pkill -f -- "sleep $live_marker" 2>/dev/null || true
+  pkill -f -- "sleep $report_marker" 2>/dev/null || true
+  assert "in-flight shipper ($flight_mode): its process group is stopped" "$([ -e "$C/live.pid" ] && [ -z "$stray" ] && echo 0 || echo 1)"
+  unset COWLIC_REPORT_SHIP_INTERVAL
+done
+
 # 8. a log left by a run killed mid-line: the new run starts a fresh log at offset 0 (the old one moves to .1)
 new_case partial; mkdir -p "$S/cowlic"; printf 'old line\nunfinished without newline' > "$S/cowlic/lastfm-report.log"
 run --lastfm-user "$USERNAME_SECRET"

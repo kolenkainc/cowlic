@@ -252,7 +252,7 @@ series, nothing from `bootstrap-last-run.json`.
   (`COWLIC_SHIP_TIMEOUT`), no retry loop, an unreachable Loki or a bad token never changes the exit code, the lock, the
   guard or the signal handling of the wrapper. The last status line (`grafana: loki push ok (HTTP 204)`, or the failure
   class) is appended to `bootstrap.log` after the `finished:` line. A locked (75), refused (78) or usage-failed
-  invocation ships nothing.
+  invocation ships nothing. The shared ingest lock stays held through the final flush, up to about 32 seconds after `finished:` (the 30-second push timeout plus the two-second kill grace).
 - **Watch a session.** Grafana, Explore, the Loki data source of your stack, time range the last 15 minutes while it runs:
 
 ```logql

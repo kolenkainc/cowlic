@@ -966,8 +966,8 @@ Log and summary (counts and ids only, never names):
 
 - `cover skipped for <song id>: <class>` with class `no_album`, `no_match_album`, `album_mismatch` or `artist_mismatch`.
   Logged per track, not per album (several tracks of one album each log it). A match without a thumbnail is silent.
-- The per-playlist and final summary lines get `, N covers from the match` (counted after a successful upload) and
-  `, N without a cover` (tracks the guard refused), each only when non-zero. They are not part of the result JSON.
+- The per-playlist and per-phase summary lines get `, N covers from the match` (counted after a successful upload) and
+  `, N without a cover` (tracks the guard refused), each only when non-zero. The final `done:` line does not include these segments. They are not part of the result JSON.
 
 ## Artist photos from YouTube Music (#251)
 
