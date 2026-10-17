@@ -8,7 +8,7 @@ import { runBlock } from "./lib.mjs";
 
 const GIT_ENV = { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
 const F40 = "f".repeat(40);
-const CHANGE_FILES = { worker: "worker/a.txt", docs: "docs/d.txt", ci: ".github/workflows/ci.yml", deploy: ".github/workflows/worker-deploy.yml" };
+const CHANGE_FILES = { worker: "worker/a.txt", docs: "docs/d.txt", ci: ".github/workflows/ci.yml", deploy: ".github/workflows/worker-deploy.yml", workflowTests: ".github/workflows/tests/probe.mjs" };
 
 export function createChangesRunner(text, { tmp }) {
   const dir = mkdtempSync(join(tmp, "chg-"));
@@ -74,6 +74,9 @@ export function createChangesRunner(text, { tmp }) {
 const A_ = ({ A }) => A;
 const H_ = ({ H }) => H;
 export const changesCases = [
+  ["pull_request: moved workflow test changed", { event: "pull_request", change: "workflowTests" }, "A", "true"],
+  ["push: moved workflow test changed", { event: "push", change: "workflowTests", before: A_ }, "A", "true"],
+  ["merge_group: moved workflow test changed", { event: "merge_group", change: "workflowTests", mgBase: A_, mgHead: H_ }, "A", "true"],
   ["pull_request: worker file changed", { event: "pull_request", change: "worker" }, "A", "true"],
   ["pull_request: docs only", { event: "pull_request", change: "docs" }, "A", "false"],
   ["pull_request: nothing changed", { event: "pull_request" }, "A", "false"],
@@ -81,7 +84,7 @@ export const changesCases = [
   ["workflow_dispatch: docs only still runs everything (base is the parent)", { event: "workflow_dispatch", change: "docs" }, "A", "true"],
   ["workflow_dispatch: nothing changed still runs everything", { event: "workflow_dispatch" }, "A", "true"],
   ["push: only ci.yml changed still runs lint and tests", { event: "push", change: "ci", before: A_ }, "A", "true"],
-  ["push: a change of the removed worker-deploy.yml path is not tracked any more",{ event: "push", change: "deploy", before: A_ }, "A", "false"],
+  ["push: any file under .github runs lint and tests",{ event: "push", change: "deploy", before: A_ }, "A", "true"],
   ["pull_request: no origin/master (fail closed)", { event: "pull_request", change: "docs", noOriginMaster: true }, "", "true"],
   ["merge_group: valid base and head, docs only", { event: "merge_group", change: "docs", mgBase: A_, mgHead: H_ }, "A", "false"],
   ["merge_group: valid base and head, worker changed", { event: "merge_group", change: "worker", mgBase: A_, mgHead: H_ }, "A", "true"],
@@ -116,6 +119,7 @@ export function changesCaseFailures(runner, [name, opts, wantBase, wantChanged])
 }
 
 export const changesMutations = [
+  ["the change pathspec excludes the moved workflow tests", (t) => t.replace("':(top).github'", "':(top).github/workflows/ci.yml'")],
   ["the git diff failed branch writes worker_changed=false", (t) => t.replace('echo "git diff failed: treating worker as changed"\n            echo "worker_changed=true"', 'echo "git diff failed: treating worker as changed"\n            echo "worker_changed=false"')],
   ["the no base branch writes worker_changed=false", (t) => t.replace('echo "no base: treating worker as changed"\n            echo "worker_changed=true"', 'echo "no base: treating worker as changed"\n            echo "worker_changed=false"')],
   ["the merge_group head check is replaced by true", (t) => t.replace('if [ "$head" = "$MG_HEAD_SHA" ]; then', "if true; then")],

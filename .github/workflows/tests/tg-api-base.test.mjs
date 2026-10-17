@@ -7,8 +7,8 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-const workerDir = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-const repoDir = resolve(workerDir, "..");
+const repoDir = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+const workerDir = join(repoDir, "worker");
 const workflowsDir = resolve(repoDir, ".github/workflows");
 const NAME = "TG_API_BASE";
 

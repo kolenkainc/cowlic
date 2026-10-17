@@ -11,8 +11,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const workerDir = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-export const ciFile = join(workerDir, "../.github/workflows/ci.yml");
+export const ciFile = resolve(dirname(fileURLToPath(import.meta.url)), "../ci.yml");
 export const readText = (p) => readFileSync(p, "utf8");
 
 const SHA = "0123456789abcdef0123456789abcdef01234567";
