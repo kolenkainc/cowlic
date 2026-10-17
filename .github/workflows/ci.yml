@@ -65,7 +65,7 @@ on:
   # (checks_requested) and waits for the required checks on the gh-readonly-queue/* commit. No path filter and no event
   # condition on those jobs: `changes` always reports, `lint` and `tests` report (or are skipped, which counts as passed,
   # only when `changes` validated worker_changed=false).
-  # The deploy jobs never run on merge_group (their `if:` names push and workflow_dispatch only; asserted by test/workflow).
+  # The deploy jobs never run on merge_group (their `if:` names push and workflow_dispatch only; asserted by .github/workflows/tests).
   merge_group:
     types: [checks_requested]
   # Manual deploy (emergency, re-run, recovery): the head of master only (job-level `if:` on the ref, and the guard
@@ -148,7 +148,7 @@ jobs:
           echo "BASE_SHA=$base" >> "$GITHUB_ENV"
           echo "base_sha=$base" >> "$GITHUB_OUTPUT"
 
-      # worker_changed = any file under worker/ or this workflow (checked by the workflow tests of "Vitest tests",
+      # worker_changed = any file under worker/ or .github/ (checked by the workflow tests of "Vitest tests",
       # #272) differs from the base: lint and tests run. Fail closed: no base or a git failure means true. A manual
       # dispatch sets it to true (lint and tests must pass before a manual deploy too). The deploy decision is NOT made
       # here: `plan` asks whether worker/ differs from what is live. The pathspecs are :(top)-anchored so they do not
@@ -168,7 +168,7 @@ jobs:
             echo "worker_changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if ! git diff --name-only "$BASE_SHA"...HEAD -- ':(top)worker' ':(top).github/workflows/ci.yml' > "$RUNNER_TEMP/changed.txt"; then
+          if ! git diff --name-only "$BASE_SHA"...HEAD -- ':(top)worker' ':(top).github' > "$RUNNER_TEMP/changed.txt"; then
             echo "git diff failed: treating worker as changed"
             echo "worker_changed=true" >> "$GITHUB_OUTPUT"
             exit 0
@@ -387,13 +387,13 @@ jobs:
 
       # Vitest has no switch against skipped tests and no minimum count, so both are checked here on the numeric
       # outputs of the report step (no text parsing): skipped must be 0 (a skipped test is a silently dropped check)
-      # and passed must reach MIN_TESTS, a pinned number just below the real count (828 on 2026-10-17: 199 unit, 524
+      # and passed must reach MIN_TESTS, a pinned number just below the real count (832 on 2026-10-17: 199 unit, 528
       # workflow, 105 smoke) so a few removals do not trip it but a lost file or area does. NOT dynamic: raise it deliberately when tests are added,
       # lower it deliberately when tests are removed on purpose.
       - name: Minimum test count (Vitest)
         if: ${{ steps.vitest.outcome == 'success' }}
         env:
-          MIN_TESTS: "822"
+          MIN_TESTS: "826"
           PASSED: ${{ steps.vitest_report.outputs.passed }}
           SKIPPED: ${{ steps.vitest_report.outputs.skipped }}
         run: |
