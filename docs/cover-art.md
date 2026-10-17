@@ -403,6 +403,11 @@ ingest/.venv/bin/python ingest/bootstrap.py covers --dry-run --max-new N --max-m
   owner) and, if it is right, sets `"approved": true` BY HAND in the file (an editor; the value must be the JSON `true`, not
   `"true"` or `1`). Remove an entry to leave that album out. The file must not be group or world writable, must be owned by the user who runs the apply, and must be no
   more than 14 days old (its `created` date); otherwise the apply refuses and a new dry run is needed.
+- For a local table with stored artist/album names, run `ingest/.venv/bin/python ingest/cover_plan_review.py` after the dry
+  run releases the lock, then open `~/.local/state/cowlic/cover-plan-review.html` locally. It uses the existing parameterless
+  D1 read only, creates a private 0600 file and never approves or modifies the plan. No names are printed or shipped.
+  The plan did not retain candidate album names: the table links the exact planned image and, for album-search matches,
+  its candidate album page instead of inventing names. It loads no remote content automatically. Do not publish this file.
 - The real step:
 
 ```
