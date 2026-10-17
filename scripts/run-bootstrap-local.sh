@@ -218,10 +218,16 @@ finish() { local rc="$1"; write_last_run "$rc"; rm -f "$RESULT"; ship_final; exi
 
 # One shipper call (logs only, job label cowlic-bootstrap, saved offset). Never changes anything: timeout, stdin closed,
 # lock fd not inherited, stderr dropped, result ignored. COWLIC_EXTRA_SECRET (if set) reaches it through the environment.
-ship_call() { # extra shipper flags
+ship_call() ( # own trap scope: timeout creates a separate group, so stop it explicitly
+  set +m
+  ship_pid=""
+  trap 'if [ -n "$ship_pid" ]; then kill -TERM -- "-$ship_pid" 2> /dev/null || true; wait "$ship_pid" 2> /dev/null || true; fi' EXIT
+  trap 'exit 143' TERM
   timeout -k 2 "$SHIP_TIMEOUT_S" "$VENV_PY" "$SHIP" --logs-only --job "$SHIP_JOB" \
-    --log "$LOG" --offset "$LOG_OFFSET" --offset-file "$OFFSET_FILE" "$@" < /dev/null 9>&- 2> /dev/null
-}
+    --log "$LOG" --offset "$LOG_OFFSET" --offset-file "$OFFSET_FILE" "$@" < /dev/null 9>&- 2> /dev/null &
+  ship_pid=$!
+  wait "$ship_pid"
+)
 # Final push of whatever is left (also an unfinished last line); only its first status line is kept, reduced to a
 # harmless character set, and logged. Does nothing unless the session was started. Never changes the exit code.
 ship_final() {
@@ -339,6 +345,7 @@ case "$LONG" in
   1)
     SHIP_ON=1
     (
+      trap 'exit 0' TERM
       warned=0
       while :; do
         n=0
@@ -363,6 +370,7 @@ esac
 # (TERM, KILL after 10 s) and only then lets the lock go. It is stopped by cleanup on every normal end.
 (
   while kill -0 "$WRAPPER_PID" 2> /dev/null; do sleep 1; done
+  [ -z "$TICK_PID" ] || kill -TERM -- "-$TICK_PID" 2> /dev/null
   kill -TERM -- "-$PIPE_PID" 2> /dev/null
   n=0
   while kill -0 -- "-$PIPE_PID" 2> /dev/null && [ "$n" -lt 10 ]; do sleep 1; n=$((n + 1)); done

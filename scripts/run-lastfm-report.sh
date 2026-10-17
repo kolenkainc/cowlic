@@ -74,14 +74,21 @@ rotate_log() {
 
 # One shipper call (logs only, job label cowlic-report, saved offset). Never changes anything: timeout, stdin
 # closed, lock fd not inherited, stderr dropped, result ignored. The user name goes in through the environment.
-ship_call() { # extra shipper flags
+ship_call() ( # own trap scope: timeout creates a separate group, so stop it explicitly
+  set +m
+  ship_pid=""
+  trap 'if [ -n "$ship_pid" ]; then kill -TERM -- "-$ship_pid" 2> /dev/null || true; wait "$ship_pid" 2> /dev/null || true; fi' EXIT
+  trap 'exit 143' TERM
   COWLIC_EXTRA_SECRET="$LASTFM_USER" timeout -k 2 "$SHIP_TIMEOUT_S" "$VENV_PY" "$SHIP" --logs-only --job "$JOB" \
-    --log "$LOG" --offset "$LOG_OFFSET" --offset-file "$OFFSET_FILE" "$@" < /dev/null 9>&- 2> /dev/null
-}
+    --log "$LOG" --offset "$LOG_OFFSET" --offset-file "$OFFSET_FILE" "$@" < /dev/null 9>&- 2> /dev/null &
+  ship_pid=$!
+  wait "$ship_pid"
+)
 
 WRAPPER_PID=$$
 PIPE_PID=""
 TICK_PID=""
+WATCH_PID=""
 INTERRUPTED=0
 stop_group() { # pid: stop the process group led by this job
   [ -n "${1:-}" ] || return 0
@@ -89,7 +96,7 @@ stop_group() { # pid: stop the process group led by this job
   wait "$1" 2> /dev/null
   return 0
 }
-cleanup() { trap - EXIT; stop_group "$TICK_PID"; stop_group "$PIPE_PID"; rm -f "$OFFSET_FILE"; }
+cleanup() { trap - EXIT; stop_group "$WATCH_PID"; stop_group "$TICK_PID"; stop_group "$PIPE_PID"; rm -f "$OFFSET_FILE"; }
 on_signal() { INTERRUPTED=$((128 + $1)); stop_group "$PIPE_PID"; }
 
 if ! mkdir -p "$STATE_DIR" || ! chmod 700 "$STATE_DIR"; then
@@ -135,6 +142,7 @@ PIPE_PID=$!
 # It exits by itself as soon as the wrapper is gone (kill -0 on its pid before every one-second sleep step and
 # before every push), so even a kill -9 of the wrapper, which no trap survives, ends it within about a second.
 (
+  trap 'exit 0' TERM
   warned=0
   while :; do
     n=0
@@ -154,12 +162,22 @@ PIPE_PID=$!
 ) < /dev/null > /dev/null 9>&- &
 TICK_PID=$!
 
+# The ship_call trap stops its separately grouped timeout. A wrapper killed without traps still
+# needs an independent observer to stop that group before it can update the offset after a final flush.
+(
+  while kill -0 "$WRAPPER_PID" 2> /dev/null; do sleep 1; done
+  kill -TERM -- "-$TICK_PID" 2> /dev/null
+) < /dev/null > /dev/null 2>&1 9>&- &
+WATCH_PID=$!
+
 wait "$PIPE_PID"
 rc=$?
 if [ "$INTERRUPTED" != 0 ]; then
   wait "$PIPE_PID" 2> /dev/null
   rc="$INTERRUPTED"
 fi
+stop_group "$WATCH_PID"
+WATCH_PID=""
 stop_group "$TICK_PID"
 TICK_PID=""
 PIPE_PID=""
