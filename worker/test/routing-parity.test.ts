@@ -1,5 +1,4 @@
 // Golden responses recorded BEFORE the Hono dependency/source change (#234).
-import { createHash } from "node:crypto";
 import { expect, it, vi } from "vitest";
 import worker from "../src/index";
 import { HANDLERS } from "../src/handlers";
@@ -36,7 +35,8 @@ it("preserves the pre-Hono status, headers and bytes across the routing matrix",
     const res = await worker.fetch(new Request(`https://worker.example.test${path}`, init), bindings);
     const headers = [...res.headers].filter(([k]) => k !== "date").sort(([a], [b]) => a.localeCompare(b));
     const value = { status: res.status, headers, bytes: Buffer.from(await res.arrayBuffer()).toString("base64") };
-    const hash = createHash("sha256").update(JSON.stringify(value)).digest("hex").slice(0, 16);
+    const hash = Buffer.from(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(value))))
+      .toString("hex").slice(0, 16);
     if (hash in responses) expect(responses[hash]).toEqual(value);
     responses[hash] = value;
     cases[key] = hash;
