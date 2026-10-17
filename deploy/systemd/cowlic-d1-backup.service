@@ -1,0 +1,11 @@
+# Owner-installed user service. Adjust both paths together if the checkout lives elsewhere.
+[Unit]
+Description=Export cowlic D1 metadata to a private local backup
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/personal/kolenkainc/cowlic
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/projects/personal/kolenkainc/cowlic/scripts/run-d1-backup.sh
+UMask=0077
+TimeoutStartSec=15min

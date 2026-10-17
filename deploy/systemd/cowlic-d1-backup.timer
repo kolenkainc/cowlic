@@ -1,0 +1,10 @@
+[Unit]
+Description=Back up cowlic D1 weekly (local time)
+
+[Timer]
+OnCalendar=Sun *-*-* 20:00:00
+Persistent=true
+Unit=cowlic-d1-backup.service
+
+[Install]
+WantedBy=timers.target
