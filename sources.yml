@@ -1,6 +1,6 @@
 # Public Spotify playlists (or albums) that the ingest syncs into the library.
-# Format: a flat list, one `- <url>` per line. Blank lines and whole-line `#` comments are allowed;
-# nothing else (no inline comments, no other YAML). Each URL must be
+# Playlist format: one `- <url>` per line. Blank lines and whole-line `#` comments are allowed;
+# no inline comments. The bounded new_releases section below is parsed separately. Each URL must be
 # https://open.spotify.com/playlist/<22 chars> (or /album/<22 chars>), optionally with ?si=...
 # An invalid line fails the whole run. Private playlists and Liked Songs are not supported.
 # Run: python ingest/ingest.py --sources sources.yml
@@ -8,3 +8,11 @@
 
 # test playlist (12 tracks)
 - https://open.spotify.com/playlist/1HNODBooDQImveVtlDdJL4
+
+# Daily after playlists, using the stored bootstrap ranking (#165, #172, #175).
+# Partial releases resume safely (#238); metrics are shipped by #173.
+new_releases:
+  enabled: true
+  max_artists: 10
+  recheck_days: 7
+  max_new: 20
