@@ -717,6 +717,15 @@ class ApplyPlanTest(SecondSourceBase):
         for name in SENTINELS + ("Quuxnaut",):
             self.assertNotIn(name, text)
 
+    def test_approved_apply_reports_safe_failure_context_without_provider_details(self):
+        self.reviewed_plan()
+        self.fb.upload_error = ingest.IngestError("Telegram API error 429: PRIVATE-CANARY https://private.invalid/token")
+        self.assertEqual(self.apply(), 1)
+        self.assertIn("apply failed (IngestError) [phase=telegram http_status=429]", self.out)
+        for private in SENTINELS + ("PRIVATE-CANARY", "private.invalid"):
+            self.assertNotIn(private, self.out + self.err)
+        self.assertEqual(self.d1.writes, [])
+
 
 class PacedAlbumCallTest(NoNetwork):
     def test_get_album_is_paced_retried_and_stops_on_the_sign_in_text(self):
