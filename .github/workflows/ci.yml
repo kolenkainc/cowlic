@@ -387,13 +387,13 @@ jobs:
 
       # Vitest has no switch against skipped tests and no minimum count, so both are checked here on the numeric
       # outputs of the report step (no text parsing): skipped must be 0 (a skipped test is a silently dropped check)
-      # and passed must reach MIN_TESTS, a pinned number just below the real count (832 on 2026-10-17: 199 unit, 528
+      # and passed must reach MIN_TESTS, a pinned number just below the real count (854 on 2026-10-17: 199 unit, 550
       # workflow, 105 smoke) so a few removals do not trip it but a lost file or area does. NOT dynamic: raise it deliberately when tests are added,
       # lower it deliberately when tests are removed on purpose.
       - name: Minimum test count (Vitest)
         if: ${{ steps.vitest.outcome == 'success' }}
         env:
-          MIN_TESTS: "826"
+          MIN_TESTS: "848"
           PASSED: ${{ steps.vitest_report.outputs.passed }}
           SKIPPED: ${{ steps.vitest_report.outputs.skipped }}
         run: |
@@ -1187,6 +1187,40 @@ jobs:
       # title comes from `plan` through a job output) and passed to wrangler as ONE quoted `--flag=value` argument, so
       # nothing can be split or read as another flag. No secret is ever part of them. The commit that is checked out must
       # be github.sha (the head of master per the guard): the tag is then the SHA that is deployed.
+      # Best effort: never expose raw Wrangler output, and never guess a version from a traffic split.
+      - name: Read previous active version
+        id: previous
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          umask 077
+          previous_json="$RUNNER_TEMP/previous-deployment.json"
+          trap 'rm -f "$previous_json"' EXIT
+          if ! timeout -k 2 30 npx wrangler deployments list --json -c wrangler.ci.toml > "$previous_json" 2> /dev/null; then
+            printf '[]' > "$previous_json"
+          fi
+          node --input-type=module - "$previous_json" 2> /dev/null <<'EOF' || echo "previous version id unavailable"
+          import { appendFileSync, readFileSync, statSync } from "node:fs";
+          let id = "";
+          try {
+            if (statSync(process.argv[2]).size > 1024 * 1024) throw new Error();
+            const deployments = JSON.parse(readFileSync(process.argv[2], "utf8"));
+            if (!Array.isArray(deployments) || !deployments.length) throw new Error();
+            if (deployments.some(d => !d || typeof d.created_on !== "string" || !Number.isFinite(Date.parse(d.created_on)))) throw new Error();
+            deployments.sort((a, b) => Date.parse(b.created_on) - Date.parse(a.created_on));
+            if (deployments.length > 1 && Date.parse(deployments[0].created_on) === Date.parse(deployments[1].created_on)) throw new Error();
+            const versions = deployments[0].versions;
+            if (!Array.isArray(versions) || versions.length !== 1 || versions[0]?.percentage !== 100) throw new Error();
+            const candidate = versions[0].version_id;
+            if (typeof candidate === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(candidate)) id = candidate;
+          } catch {
+            // Missing deployment, API failure or an unknown shape: the deployment still proceeds.
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, "version_id=" + id + "\n");
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY, "- Previous version id: `" + (id || "unknown") + "`\n");
+          EOF
+
       - name: Deploy
         id: deploy
         env:
@@ -1311,6 +1345,7 @@ jobs:
         if: always() && steps.deploy.outcome == 'success' && (steps.version.outcome == 'failure' || steps.health.outcome == 'failure')
         env:
           VERSION_ID: ${{ steps.version.outputs.version_id }}
+          PREVIOUS_VERSION_ID: ${{ steps.previous.outputs.version_id }}
           GIT_SHA: ${{ github.sha }}
         run: |
           {
@@ -1322,7 +1357,11 @@ jobs:
             echo "Roll back by hand (owner, from \`worker/\` on the owner's machine), then check the Symfonium login:"
             echo
             echo '```'
-            echo 'npx wrangler rollback --message "health check failed" -c wrangler.local.toml'
+            if [[ "$PREVIOUS_VERSION_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+              echo "npx wrangler rollback $PREVIOUS_VERSION_ID --message \"health check failed\" -c wrangler.local.toml"
+            else
+              echo 'npx wrangler rollback --message "health check failed" -c wrangler.local.toml'
+            fi
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

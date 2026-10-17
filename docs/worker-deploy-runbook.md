@@ -108,7 +108,9 @@ First look at the run Summary. Nothing is rolled back automatically.
 | QUEUE stuck (a run "Queued" or "Waiting") | Normal cause: a `ship` waits for approval in `production-destructive` and holds the group; or an earlier run is still running (timeouts: plan 10 min, ship 40, waiting for an approval does not count) | Approve or reject the waiting run (section 3), or cancel it: `gh run cancel <run-id> --repo kolenkainc/cowlic`. The queued run then starts. Only one pending run is kept; the replaced (cancelled) run is always the older one and needs no action: the surviving run's `plan` compares `worker/` with the newest successful deployment record of either environment and deploys what is missing [R]. If production still runs old code after a cancelled run, or after a FAILED `ship` (a failed deploy or health check), start a `workflow_dispatch` of CI on master; a dispatch can itself be replaced by a newer push run while pending: dispatch again |
 | Unlabelled pending destructive file in production: the `ship` lint step fails on a file `plan` did not route, on EVERY run | A pending file (listed by `migrations list --remote`) is destructive but `plan` did not see it as added since BASE (for instance it was merged before BASE or before the first run), or it has no label. `production` lints without `--approved` and fails closed, forever [V design 12.4] | If the migration is intended: add the label to the PR that added it (section 3) and re-dispatch; if `plan` still routes `production` (the file is not in the range), apply it by hand (section 6) after reading it and noting a bookmark, then the pending list is empty and the run is green. If it was never meant to be applied: revert it by PR only if it is still inside `BASE..HEAD`; a file already in BASE cannot be deleted (immutability), so it is a dead end (#268). Do not edit a recorded migration [R: this dead end was derived from the workflow code, not seen] |
 
-Finding the previous version id (needed before a manual rollback; the deploy summary does NOT print it, only the new one [V workflow]):
+The step `Read previous active version` runs before deploy and writes `Previous version id` in the summary (#267). It selects the newest timestamp only when that deployment has exactly one version at 100 percent and its id is a UUID. A failed command, unknown JSON shape, timestamp tie or traffic split gives `unknown` and does not block deploy. Raw Wrangler output is never logged. The failure summary includes that validated id in the rollback command when known. The installed Wrangler 4.149.0 source confirms the array shape; the real account response remains unverified until the next deployment run.
+
+If the value is unknown, find the previous version by hand before a rollback:
 
 ```
 npx wrangler deployments list -c wrangler.local.toml
@@ -133,7 +135,7 @@ Order: roll back the Worker first (instant, reversible, touches no data). Restor
 npx wrangler rollback <previous-version-id> --message "<reason>" -c wrangler.local.toml
 ```
 
-- With `<previous-version-id>` omitted it goes to the 100 percent version of the previous DEPLOYMENT (the second newest), which is not always what you want after several deployments: pass the id [V source `fetchDefaultRollbackVersionId`]. The summary text on a failed health check prints the command without an id.
+- With `<previous-version-id>` omitted it goes to the 100 percent version of the previous DEPLOYMENT (the second newest), which is not always what you want after several deployments: pass the id [V source `fetchDefaultRollbackVersionId`]. The failure summary includes the captured previous id when known, otherwise the command still omits it: inspect the deployment history before using that fallback.
 - It prompts twice: for a message (`--message` is only the default offered, press Enter) and "Are you sure you want to deploy this Worker Version to 100% of traffic?" (default yes, press Enter). `-y/--yes` is listed by `npx wrangler rollback --help` but the handler of 4.149.0 never reads it, so it changes nothing; in a non-interactive shell or with `CI` set both prompts take their defaults without asking [V source: `handleRollback`, `confirm2`, `prompt2`; never run in a terminal: [R]].
 - Creates a NEW deployment of the old version for all routes; only the last 100 versions can be targets [V Cloudflare docs, worker-cicd.md 9.1].
 - Secrets are part of a version. If a Worker secret changed since the target version, wrangler lists the changed secrets and asks you to confirm [V source, error code 10220]; whether the rolled-back version then runs with the old or the current value is [R]. After ANY rollback log in from Symfonium.
@@ -289,3 +291,43 @@ invocation_logs = false
 **First push-triggered run.** Merging a change under `worker/` starts the pipeline by itself. Watch: `plan` (the guard sha is the head; the step "Commit title" prints the sanitised title as "commit title: ..."), `ship` (its migration steps: "No migrations to apply" when nothing is pending; its deploy steps: the summary shows the version id, the tag = the first 7 characters of the commit and the message), health check, then a log scan for leaks (section 2 step 5). After the run: `wrangler versions list` shows Tag and Message, the dashboard shows logs, and one `GET /rest/ping?u=x&t=y&s=z&f=json` with fake credentials leaves a stored line without a query string [R, owner check]; a rejected `redact_query_string` would fail the upload before the version is live. To look at the exception event, trigger a handled failure (for example `getSong` for a stopped D1) and read the stored exception [R].
 
 **Regression tests of the workflow.** `.github/workflows/tests/workflow.test.mjs` (Vitest project `workflow`, part of the step "Vitest tests" of the job `tests` in `ci.yml`, which also runs when any `.github/**` file changes; the same file checks the rest of `ci.yml`: triggers, the exact job set (no `ci`), the exact conditions of `lint`, `tests`, `plan` and `release` (every combination of the results of `changes`, `lint` and `tests`), the fail-closed validation step of `changes`, needs, concurrency group and environments of the deploy jobs, permissions, secrets only in `ship`, the order and fingerprints of the steps of `ship`, the step conditions after a failure, the validated `environment` output of `plan` and the BASE step with a stub API) extracts the run blocks "Commit title" and "Deploy" and runs them under `bash -eo pipefail` with stub `gh`, `git` and `npx` against hostile titles and tampered inputs, checks that no run block contains `${{`, that the pins, permissions and concurrency are intact, and mutates the workflow text in memory (no HEAD check, no re-validation, no sanitiser, `${{` in a run block, unquoted `--message`) to prove each mutation is caught. Edit the steps of #267 with it green.
+
+## 12. Weekly private D1 export (#275)
+
+The account is on Free (#331): Time Travel covers seven days. The owner can install a separate weekly export to keep eight snapshots beyond that window. Run the first export and install the timer only in the owner step of #275. An export reads production; it does not restore or mutate it, but [Cloudflare documents that it blocks other database requests while running](https://developers.cloudflare.com/d1/best-practices/import-export-data/#known-limitations). Choose a quiet time. The supplied timer is Sunday 20:00 local time, with catch-up after downtime (`Persistent=true`). Check that a successful export occurs at least weekly; a sleeping machine cannot guarantee that schedule.
+
+From the repository root:
+
+```sh
+scripts/run-d1-backup.sh
+```
+
+The Python wrapper loads `.env` with the existing strict parser, uses only `INGEST_CLOUDFLARE_API_TOKEN` as the Wrangler token, and requires `CLOUDFLARE_ACCOUNT_ID`, the existing venv, installed Worker dependencies and `worker/wrangler.local.toml`. No new token or secret is needed. It calls the installed Wrangler with `d1 export cowlic --remote --skip-confirmation --output ...`, with stdin closed and diagnostics suppressed. The fixed log reports success, byte count and retained count, or a short failure reason. There is no Grafana push: the service journal is sufficient for this weekly operation and does not need another shipping path.
+
+Files live in `${COWLIC_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/cowlic}/backups` (directory 0700, SQL and lock files 0600). Never choose a directory inside the repository. `flock` prevents overlapping backups. A failed, empty or timed-out export removes only its partial file and preserves completed snapshots; retention runs only after a successful export. `--keep 1..52` changes the default eight snapshots. Exit codes: 0 success, 1 export/retention failure, 75 another backup owns the lock, 78 missing/invalid configuration or unsafe state directory; invalid CLI options use argparse's exit 2. A timeout kills the export process group; systemd additionally limits the service to 15 minutes.
+
+The schema in `worker/migrations/0001_init.sql` stores artists, albums and tracks, with no credential columns; migration 0003 adds an artist image file id. The dump includes private library metadata and Telegram file/message ids. Those ids are not bot credentials, but identify private-channel blobs; keep the SQL private and never attach it to a public issue. D1 exports contain no audio, and cannot recover a lost Telegram channel or a revoked bot's access. Reassess this inventory when the schema changes, especially for multi-user support.
+
+Install (owner only; adjust the paths inside the service if the checkout is elsewhere):
+
+```sh
+install -Dm644 deploy/systemd/cowlic-d1-backup.service "$HOME/.config/systemd/user/cowlic-d1-backup.service"
+install -Dm644 deploy/systemd/cowlic-d1-backup.timer "$HOME/.config/systemd/user/cowlic-d1-backup.timer"
+systemctl --user daemon-reload
+systemctl --user enable --now cowlic-d1-backup.timer
+systemctl --user list-timers cowlic-d1-backup.timer
+journalctl --user -u cowlic-d1-backup.service
+```
+
+For an existing timer session, `systemctl --user start cowlic-d1-backup.service` runs it now. No automatic retry or notification is configured. Inspect the journal and the timestamp of the newest completed SQL file; rerun manually after a failure. Do not log SQL contents.
+
+**Restore rehearsal (local only).** From `worker/`, choose a completed private SQL file and an empty scratch persistence directory, then run:
+
+```sh
+npx wrangler d1 execute cowlic --local --persist-to "$HOME/.local/state/cowlic/backup-restore-check" --file "/absolute/private/backup.sql" -c wrangler.local.toml
+npx wrangler d1 execute cowlic --local --persist-to "$HOME/.local/state/cowlic/backup-restore-check" --command "SELECT COUNT(*) AS tracks FROM tracks; PRAGMA integrity_check;" -c wrangler.local.toml
+```
+
+Use a new empty persistence directory for each rehearsal: an existing schema may conflict. Keep `--local`; this procedure never restores production. On 2026-10-17 the pinned Wrangler 4.149.0 exported a synthetic local D1 with the committed 0001 schema and one track, then imported its SQL into a separate local D1: the restored track count was 1 and `SUM(size_bytes)` was 42. No production export was performed. The real export's first restore rehearsal remains an owner check. `d1 export` in this version does not support `--persist-to`; only the local execute/import commands above use it.
+
+Offline wrapper checks: `ingest/.venv/bin/python scripts/test-backup-d1.py` (isolated fake checkout and fake Wrangler, no production calls).

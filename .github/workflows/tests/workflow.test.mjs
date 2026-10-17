@@ -289,7 +289,7 @@ describe("ci.yml reports changes, lint and tests on pull_request, push and merge
     ["ship: Deploy moved before List pending migrations (deploy before migrate)", (t) => moveStepBefore(t, "Deploy", "List pending migrations")],
     ["ship: Apply migrations moved after Deploy", (t) => moveStepBefore(t, "Apply migrations", "Read the deployed version id")],
     ["ship: Time Travel bookmark and Record the bookmark swapped", (t) => swapSteps(t, "Time Travel bookmark", "Record the bookmark")],
-    ["ship: Mask the Worker URL and Deploy swapped", (t) => swapSteps(t, "Mask the Worker URL", "Deploy")],
+    ["ship: Deploy moved before URL masking", (t) => moveStepBefore(t, "Deploy", "Mask the Worker URL")],
     ["ship step run block edited (the health check passes anything)", (t) => t.replace('if (res.status === 200 && sr && sr.status === "failed" && sr.error && sr.error.code === 40) {', "if (true) {")],
     ["ship step run block edited (apply with --force-like flag)", (t) => t.replace("npx wrangler d1 migrations apply cowlic --remote -c wrangler.ci.toml", "npx wrangler d1 migrations apply cowlic --remote -c wrangler.ci.toml --x")],
     ["ship with a new step between migrate and deploy", (t) => t.replace("      - name: Mask the Worker URL\n", "      - name: Extra\n        run: echo hi\n\n      - name: Mask the Worker URL\n")],
