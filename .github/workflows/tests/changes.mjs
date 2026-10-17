@@ -8,7 +8,7 @@ import { runBlock } from "./lib.mjs";
 
 const GIT_ENV = { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
 const F40 = "f".repeat(40);
-const CHANGE_FILES = { worker: "worker/a.txt", docs: "docs/d.txt", ci: ".github/workflows/ci.yml", deploy: ".github/workflows/worker-deploy.yml", workflowTests: ".github/workflows/tests/probe.mjs" };
+const CHANGE_FILES = { worker: "worker/a.txt", docs: "docs/d.txt", ci: ".github/workflows/ci.yml", deploy: ".github/workflows/worker-deploy.yml", workflowTests: ".github/workflows/tests/probe.mjs", rootPackage: "package.json", rootLock: "pnpm-lock.yaml", rootWorkspace: "pnpm-workspace.yaml" };
 
 export function createChangesRunner(text, { tmp }) {
   const dir = mkdtempSync(join(tmp, "chg-"));
@@ -74,6 +74,11 @@ export function createChangesRunner(text, { tmp }) {
 const A_ = ({ A }) => A;
 const H_ = ({ H }) => H;
 export const changesCases = [
+  ...["rootPackage", "rootLock", "rootWorkspace"].flatMap((change) => [
+    [`pull_request: ${change} runs checks`, { event: "pull_request", change }, "A", "true"],
+    [`push: ${change} runs checks`, { event: "push", change, before: A_ }, "A", "true"],
+    [`merge_group: ${change} runs checks`, { event: "merge_group", change, mgBase: A_, mgHead: H_ }, "A", "true"],
+  ]),
   ["pull_request: moved workflow test changed", { event: "pull_request", change: "workflowTests" }, "A", "true"],
   ["push: moved workflow test changed", { event: "push", change: "workflowTests", before: A_ }, "A", "true"],
   ["merge_group: moved workflow test changed", { event: "merge_group", change: "workflowTests", mgBase: A_, mgHead: H_ }, "A", "true"],
@@ -119,6 +124,7 @@ export function changesCaseFailures(runner, [name, opts, wantBase, wantChanged])
 }
 
 export const changesMutations = [
+  ["root workspace inputs excluded from checks", (t) => t.replace(" ':(top)package.json' ':(top)pnpm-lock.yaml' ':(top)pnpm-workspace.yaml'", "")],
   ["the change pathspec excludes the moved workflow tests", (t) => t.replace("':(top).github'", "':(top).github/workflows/ci.yml'")],
   ["the git diff failed branch writes worker_changed=false", (t) => t.replace('echo "git diff failed: treating worker as changed"\n            echo "worker_changed=true"', 'echo "git diff failed: treating worker as changed"\n            echo "worker_changed=false"')],
   ["the no base branch writes worker_changed=false", (t) => t.replace('echo "no base: treating worker as changed"\n            echo "worker_changed=true"', 'echo "no base: treating worker as changed"\n            echo "worker_changed=false"')],
@@ -146,10 +152,10 @@ export function createScopeRunner(text, { tmp }) {
     const cwd = join(dir, `r${id}`);
     mkdirSync(cwd);
     git(cwd, "init", "-q");
-    mkdirSync(join(cwd, "worker"));
-    mkdirSync(join(cwd, "docs"));
-    writeFileSync(join(cwd, "worker/a.txt"), "base\n");
-    writeFileSync(join(cwd, "docs/d.txt"), "base\n");
+    for (const file of Object.values(CHANGE_FILES)) {
+      mkdirSync(dirname(join(cwd, file)), { recursive: true });
+      writeFileSync(join(cwd, file), "base\n");
+    }
     git(cwd, "add", "-A");
     git(cwd, "commit", "-q", "-m", "base");
     const A = git(cwd, "rev-parse", "HEAD");
@@ -159,8 +165,7 @@ export function createScopeRunner(text, { tmp }) {
       git(cwd, "add", "-A");
       git(cwd, "commit", "-q", "-m", "older worker commit");
     }
-    if (change === "worker") writeFileSync(join(cwd, "worker/a.txt"), "changed\n");
-    if (change === "docs") writeFileSync(join(cwd, "docs/d.txt"), "changed\n");
+    if (change in CHANGE_FILES) writeFileSync(join(cwd, CHANGE_FILES[change]), "changed\n");
     git(cwd, "add", "-A");
     git(cwd, "commit", "-q", "--allow-empty", "-m", "head");
     const H = git(cwd, "rev-parse", "HEAD");
@@ -177,6 +182,8 @@ export function createScopeRunner(text, { tmp }) {
 
 // [name, options, expected deploy output, expects a "nothing to deploy" summary]
 export const scopeCases = [
+  ...["rootPackage", "rootLock", "rootWorkspace"].map((change) =>
+    [`push: ${change} changed since BASE deploys`, { event: "push", change, base: A_ }, "true", false]),
   ["push: worker/ changed since BASE deploys", { event: "push", change: "worker", base: A_ }, "true", false],
   ["push: docs only since BASE does not deploy (visible summary)", { event: "push", change: "docs", base: A_ }, "false", true],
   ["push: nothing changed since BASE does not deploy", { event: "push", change: "none", base: A_ }, "false", true],
@@ -198,9 +205,10 @@ export function scopeCaseFailures(runner, [name, opts, wantDeploy, wantSummary])
 }
 
 export const scopeMutations = [
+  ["root workspace inputs excluded from deployment", (t) => t.replace(" -- worker/ package.json pnpm-lock.yaml pnpm-workspace.yaml", " -- worker/")],
   ["a git failure means nothing to deploy", (t) => t.replace('            echo "deploy=true" >> "$GITHUB_OUTPUT"\n            echo "worker/ differs from the last deployment (or the comparison failed): deploying"', '            echo "deploy=false" >> "$GITHUB_OUTPUT"\n            echo "worker/ differs from the last deployment (or the comparison failed): deploying"')],
   ["a dispatch is not forced to deploy", (t) => t.replace('if [ "$EVENT_NAME" = "workflow_dispatch" ]; then\n            echo "deploy=true"', 'if false; then\n            echo "deploy=true"')],
-  ["the comparison looks at the whole tree, not worker/", (t) => t.replace('"$EVENT_SHA" -- worker/ || rc=$?', '"$EVENT_SHA" || rc=$?')],
+  ["the comparison looks at the whole tree, not worker/", (t) => t.replace('"$EVENT_SHA" -- worker/ package.json pnpm-lock.yaml pnpm-workspace.yaml || rc=$?', '"$EVENT_SHA" || rc=$?')],
   ["an equal tree deploys", (t) => t.replace('if [ "$rc" -eq 0 ]; then\n            echo "deploy=false"', 'if [ "$rc" -eq 99 ]; then\n            echo "deploy=false"')],
 ];
 

@@ -6,7 +6,7 @@
 // caught by the static or the dynamic checks, so a weakened check turns a test red.
 import { spawnSync } from "node:child_process";
 import { existsSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   GATE_EXPR, PERMISSIONS, changesStepFailures, ciFailures, ciFile, createRunner, createSandbox, dynamicFailures, hostileTitleFailures, hostileTitles, jobBlock, mutations,
@@ -270,7 +270,7 @@ describe("ci.yml reports changes, lint and tests on pull_request, push and merge
     ["ship: Time Travel bookmark and Record the bookmark swapped", (t) => swapSteps(t, "Time Travel bookmark", "Record the bookmark")],
     ["ship: Deploy moved before URL masking", (t) => moveStepBefore(t, "Deploy", "Mask the Worker URL")],
     ["ship step run block edited (the health check passes anything)", (t) => t.replace('if (res.status === 200 && sr && sr.status === "failed" && sr.error && sr.error.code === 40) {', "if (true) {")],
-    ["ship step run block edited (apply with --force-like flag)", (t) => t.replace("npx wrangler d1 migrations apply cowlic --remote -c wrangler.ci.toml", "npx wrangler d1 migrations apply cowlic --remote -c wrangler.ci.toml --x")],
+    ["ship step run block edited (apply with --force-like flag)", (t) => t.replace("pnpm exec wrangler d1 migrations apply cowlic --remote -c wrangler.ci.toml", "pnpm exec wrangler d1 migrations apply cowlic --remote -c wrangler.ci.toml --x")],
     ["ship with a new step between migrate and deploy", (t) => t.replace("      - name: Mask the Worker URL\n", "      - name: Extra\n        run: echo hi\n\n      - name: Mask the Worker URL\n")],
     ["ship timeout changed", (t) => t.replace("    timeout-minutes: 40\n", "    timeout-minutes: 400\n")],
     ["ship with a secret removed (WORKER_URL not read)", (t) => t.replaceAll("secrets.WORKER_URL", "vars.WORKER_URL")],
@@ -289,7 +289,7 @@ describe("ci.yml reports changes, lint and tests on pull_request, push and merge
     ["secrets used in the tests job", (t) => t.replace("      - name: Migration lint tests\n", "      - name: Migration lint tests\n        env:\n          X: ${{ secrets.WORKER_URL }}\n")],
     ["contents: write on the ship job", (t) => t.replace("    permissions:\n      contents: read\n    defaults:\n      run:\n        shell: bash\n        working-directory: worker\n    steps:\n      # Pins: section 6 audit table (full commit SHAs). Depth 1", "    permissions:\n      contents: write\n    defaults:\n      run:\n        shell: bash\n        working-directory: worker\n    steps:\n      # Pins: section 6 audit table (full commit SHAs). Depth 1")],
     ["ship without its permissions block", (t) => t.replace("    permissions:\n      contents: read\n    defaults:\n      run:\n        shell: bash\n        working-directory: worker\n    steps:\n      # Pins: section 6 audit table (full commit SHAs). Depth 1", "    defaults:\n      run:\n        shell: bash\n        working-directory: worker\n    steps:\n      # Pins: section 6 audit table (full commit SHAs). Depth 1")],
-    ["plain npm ci with install scripts in ship", (t) => t.replace(/(  ship:\n[\s\S]*?)npm ci --ignore-scripts/m, "$1npm ci")],
+    ["pnpm install with lifecycle scripts in ship", (t) => t.replace(/(  ship:\n[\s\S]*?)install --frozen-lockfile --ignore-scripts/m, "$1install --frozen-lockfile")],
     ["a new unreviewed job", (t) => `${t}\n  extra:\n    name: extra\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n`],
     // The release job (#290 part 3).
     ["release job removed", (t) => t.replace(/^ {2}release:\n[\s\S]*$/m, "")],
@@ -587,5 +587,22 @@ describe("separate suite reporting fails closed", () => {
       expect(r.error).toBeUndefined();
       expect(r.status === 0, `passed=${passed}, skipped=${skipped}`).toBe(ok);
     }
+  });
+});
+
+// Bootstrap must be pinned and isolated from credentials; install must consume
+// the shared lock without lifecycle scripts. A manager migration cannot relax it.
+describe("pnpm workspace installation", () => {
+  it.each(["lint", "tests", "ship"])("%s", (id) => {
+    const all = steps(jobBlock(ci, id));
+    const bootstrap = all.find((s) => s.name === "Install pnpm");
+    const manager = JSON.parse(readText(join(dirname(ciFile), "../../package.json"))).packageManager;
+    expect(manager).toMatch(/^pnpm@\d+\.\d+\.\d+$/);
+    expect(bootstrap.run).toContain(`--ignore-scripts --no-audit --no-fund ${manager}`);
+    expect(bootstrap.run).toContain('"$RUNNER_TEMP/cowlic-pnpm/node_modules/.bin" >> "$GITHUB_PATH"');
+    expect(bootstrap.text).not.toMatch(/^ {8}(env|continue-on-error|if):/m);
+    const install = all.find((s) => s.name === "Install dependencies");
+    expect(install.text).toContain("install --frozen-lockfile --ignore-scripts");
+    expect(install.text).not.toMatch(/^ {8}(env|continue-on-error|if):/m);
   });
 });

@@ -1,4 +1,4 @@
-"""Backup wrapper tests with an isolated checkout and a fake npx. No production requests."""
+"""Backup wrapper tests with an isolated checkout and a fake pnpm. No production requests."""
 import fcntl
 import os
 from pathlib import Path
@@ -28,14 +28,14 @@ class BackupTests(unittest.TestCase):
         # The project loader reads this synthetic file, never the real checkout's .env.
         (self.root / ".env").write_text(f"INGEST_CLOUDFLARE_API_TOKEN={TOKEN}\nCLOUDFLARE_API_TOKEN={BROAD}\n"
                                         "CLOUDFLARE_ACCOUNT_ID=FAKE-ACCOUNT\nTG_BOT_TOKEN=FAKE-BOT\n")
-        stub = self.root / "bin/npx"
+        stub = self.root / "bin/pnpm"
         stub.write_text(f'''#!{sys.executable}
 import os,sys
 from pathlib import Path
 assert os.environ['CLOUDFLARE_API_TOKEN'] == {TOKEN!r}
 assert 'INGEST_CLOUDFLARE_API_TOKEN' not in os.environ
 assert 'TG_BOT_TOKEN' not in os.environ
-assert sys.argv[1:7] == ['--no-install','wrangler','d1','export','cowlic','--remote']
+assert sys.argv[1:7] == ['exec','wrangler','d1','export','cowlic','--remote']
 assert sys.argv[-2:] == ['-c','wrangler.local.toml']
 p=Path(sys.argv[sys.argv.index('--output')+1])
 assert p.stat().st_mode & 0o777 == 0o600

@@ -1,7 +1,7 @@
 // Helpers of the workflow tests (#272, #292; was scripts/workflow-check.mjs): no network, no secrets, needs bash.
 // Line-based parse of .github/workflows/ci.yml (no YAML parser; the deploy jobs were worker-deploy.yml until #290
 // part 2), static controls, a runner that executes the
-// run blocks of the steps "Commit title" (plan) and "Deploy" (deploy) under `bash -eo pipefail` with stub gh / git / npx,
+// run blocks of the steps "Commit title" (plan) and "Deploy" (deploy) under `bash -eo pipefail` with stub gh / git / pnpm,
 // and the hostile / tampered cases. Every function returns a list of failure strings (empty = ok), so the same logic
 // serves the real file and the in-memory mutations that must be caught.
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
@@ -16,7 +16,7 @@ export const readText = (p) => readFileSync(p, "utf8");
 
 const SHA = "0123456789abcdef0123456789abcdef01234567";
 
-// Stub gh / git / npx in a temp dir. gh: what the jq filter of the step yields = the first line of the message
+// Stub gh / git / pnpm in a temp dir. gh: what the jq filter of the step yields = the first line of the message
 // (fails when GH_FAIL=1).
 export function createSandbox() {
   const tmp = mkdtempSync(join(tmpdir(), "cowlic-wfcheck-"));
@@ -28,7 +28,7 @@ export function createSandbox() {
   };
   stub("gh", 'if [ "$GH_FAIL" = 1 ]; then exit 1; fi\nhead -n1 "$MSGFILE" | tr -d "\\000"\ntrue');
   stub("git", 'if [ "$1" = rev-parse ] && [ "$2" = HEAD ]; then echo "$FAKE_HEAD"; fi');
-  stub("npx", ': > "$ARGV_OUT"\nfor a in "$@"; do printf \'%s\\n\' "$a" >> "$ARGV_OUT"; done');
+  stub("pnpm", '[ "$1" = exec ] || exit 1\nshift\n: > "$ARGV_OUT"\nfor a in "$@"; do printf \'%s\\n\' "$a" >> "$ARGV_OUT"; done');
   return { tmp, bin };
 }
 
@@ -238,11 +238,11 @@ export function staticFailures(text) {
   for (const s of steps(text)) {
     if (/CLOUDFLARE_API_TOKEN: /.test(s.text) && !(s.run ?? "").includes("wrangler")) f.push(`token in a step without wrangler: ${s.name}`);
   }
-  // The install steps of the jobs WITH secrets: no env, no install scripts (the other jobs use plain `npm ci`).
+  // The install steps of the jobs WITH secrets: no env, no install scripts (the other jobs use frozen pnpm installs).
   for (const id of ["ship"]) {
     for (const s of steps(jobBlock(text, id) ?? "")) {
       if (s.name === "Install dependencies" && /^ {8}env:/m.test(s.text)) f.push(`env on the install step of ${id}`);
-      if (s.name === "Install dependencies" && !s.text.includes("npm ci --ignore-scripts")) f.push(`install without --ignore-scripts in ${id}`);
+      if (s.name === "Install dependencies" && !s.text.includes("install --frozen-lockfile --ignore-scripts")) f.push(`install without --ignore-scripts in ${id}`);
     }
   }
   // Job graph and conditions (ORDER RULE, #287: deploy needs changes, lint and tests; never pull_request or merge_group).
@@ -301,25 +301,25 @@ export const stepHash = (s) => createHash("sha256").update(s.lines.filter((l) =>
 export const SHIP_STEPS = [
   ["actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1", "053260c1b8aec7f005c175da680637136347cebe45481d1c5950cf3871b13eba"],
   ["actions/setup-node@820762786026740c76f36085b0efc47a31fe5020", "7d3627761cfc54ac72506c405e8e9689c2cddd751a6d1b68b8fce84aecc2ab6a"],
-  ["Install dependencies", "edaea737eba331b69143c3e31ece148c9c498d6c383c1abc76be83dda2de8d9b"],
+  ["Install pnpm", "675375bc1208a1bb9398dc9dd2f8f125717cc8a821069d0e3f4907cf8b6b8c92"],
+  ["Install dependencies", "eb6ed19bfd3376b5826b83d726a196ac53d00d60b601837870ee6db09ba2f05e"],
   ["Write runner-local wrangler config", "2f23e587a7d074bbf3fee4f0aa8aa0e0c5c5cc24af090314e83548c4155dfde8"],
-  ["List pending migrations", "ad3b0128ac381d049a02bb63279b7ee9bde821b88b09fc30329bfee7d3897dee"],
+  ["List pending migrations", "a2531dc9bf5b04c080100785711193fd8c33a9469b48120b870ab781ea3c9e72"],
   ["Read the pending migrations", "210fe617a1f9dcda7b3e087e152d1fd16c1f30fd3bb7d3831543982be3ec8982"],
   ["Lint the pending migrations", "3c629141bdea33d3759fd7a1436647bc90906f0a88225fd7741f4376c6c988fb"],
-  ["Time Travel bookmark", "311fabeceefd211e57185b5cac1faf18ed7e21f40cd20aef091b41ee74cb3e31"],
-  ["Record the bookmark", "6eb20efe8e72dc716795d0db54b87f58e87af9fe2e79da0269ae87dc9ef67e7f"],
-  ["Apply migrations", "cb6dc748b1031baa9615a7f9a9064a6dbdaf7f211c460a454af4630d3cbb7c38"],
-  ["Verify nothing is pending", "1eea1bc1f367dda054f4417bb02cc372ffd8c05505d4afe13600e7b40d369b2d"],
+  ["Time Travel bookmark", "705dfba5ff777db19cf1798a5c9257a6dd9caae201d14632d367a2c9dfb3a1cc"],
+  ["Record the bookmark", "54199e630aee536162f19da619eff4b357948dc0d3b6ce03f0c95ecfb1dee2bf"],
+  ["Apply migrations", "d23cc28f71264036803f972eeab4ea2a9dc044a6c5d94a59a5c823c49f329833"],
+  ["Verify nothing is pending", "ee304123644c9ddd4d5a63e670f2cda42e20f09294b19274dcc981b21125fa9e"],
   ["Summary (applied)", "ad90deb0e6c85f92b98b9cc1e7839217c7c8f4f8cca62df61cc857394dc9b869"],
-  ["Summary (migration failed)", "acec1b7d5f778fbe1c02674eed7b403f452647fffeaa0aa87b0ff7c4784d31c2"],
-  // ---- the deploy half starts here
+  ["Summary (migration failed)", "342302a8fb92d109582dfa4e69c042d19a27873b0721491a10a5f011a0b552be"],
   ["Mask the Worker URL", "c8f09d5c3572bef7b1ce6f95543117c2edd8237a53174703d0c92e3e868255ba"],
-  ["Read previous active version", "418c6b33cc459867959713e489180afcfdaf8a72e31fdcc9764d088c3c86fae8"],
-  ["Deploy", "f630aa601eae9f6834fb7cc28ad4dbbb6e658611d5244508172d129fec2ca6af"],
+  ["Read previous active version", "a226d19d6816b190829e88eb218fe3e4ccabcbe60f5692a53c8d136d3860fd7c"],
+  ["Deploy", "9e1cbd6f2142cd5010b28f0daf9b61796dcc24bcfa05fa7d55a73ace2f601cd0"],
   ["Read the deployed version id", "de5233864aec802f8c157c4c5aae9d070489d049beda83988b5d0e38890f3e38"],
   ["Health check", "f2e5399f3fdfeabc739c0ef0bef98c508b18d4b269aa670368e8d25d80415e51"],
   ["Summary", "e27a444b6ac8a8c35e2cd87a940501dc2a5416860447ffb3da463c25fbf788c4"],
-  ["Summary (failure after deploy)", "e0a167e401c19cf91ccce93a4a3ee0a838d99e3acba59ff1721195fbb9a3afbe"],
+  ["Summary (failure after deploy)", "9770fa07feab0efc1a002b19c6bcd0c29734743339f358ab8f5d3bd888162d42"],
 ];
 // The only steps of ship that may run after a failure (`always()`): they write the job summary and nothing else.
 export const SHIP_ALWAYS = ["Summary (migration failed)", "Summary (failure after deploy)"];
@@ -357,7 +357,7 @@ export function shipFailures(text) {
     const ifs = s.lines.filter((l) => /^ {8}if:/.test(l));
     if (ifs.some((l) => /always\(\)|failure\(\)|cancelled\(\)/.test(l)) && !SHIP_ALWAYS.includes(s.name)) f.push(`the step "${s.name}" of ship can run after a failure (always/failure/cancelled in its if)`);
     // (the summaries only print text: a secret, a Cloudflare variable, a `uses:` action or an installer would be new)
-    if (SHIP_ALWAYS.includes(s.name) && (/secrets\.|CLOUDFLARE|WORKER_URL|D1_DATABASE_ID|^ {8}uses:/m.test(s.text) || /^ {10}(npm|npx|node|curl|wget|gh) /m.test(s.run ?? ""))) f.push(`the always() step "${s.name}" runs a tool or reads a secret`);
+    if (SHIP_ALWAYS.includes(s.name) && (/secrets\.|CLOUDFLARE|WORKER_URL|D1_DATABASE_ID|^ {8}uses:/m.test(s.text) || /^ {10}(npm|npx|pnpm|node|curl|wget|gh) /m.test(s.run ?? ""))) f.push(`the always() step "${s.name}" runs a tool or reads a secret`);
   }
   // The four secrets exist in ship, and only here (the file-wide check is in staticFailures).
   for (const n of SHIP_SECRETS) if (!c.includes(`secrets.${n}`)) f.push(`ship does not read the secret ${n}`);
@@ -428,7 +428,7 @@ export function releaseFailures(text) {
   // The job with the write token installs and runs NO tool and uses NO action (no checkout, no dotnet, no NuGet, no
   // GitVersion): the supply-chain exposure of an unlocked package stays in the read-only job `version`.
   if (/^ {6,8}(?:- )?uses:/m.test(c)) f.push("the release job must use no action");
-  if (/dotnet|nuget|gitversion|npm |npx |pip |curl|wget|apt/i.test(c)) f.push("the release job must install and run no tool or package");
+  if (/dotnet|nuget|gitversion|npm |npx |pnpm |pip |curl|wget|apt/i.test(c)) f.push("the release job must install and run no tool or package");
   if (steps(b).length !== 1 || steps(b)[0].name !== "Tag and release") f.push("the release job must have exactly one step: Tag and release");
   // The decision script.
   const run = steps(b).find((s) => s.name === "Tag and release")?.run ?? "";

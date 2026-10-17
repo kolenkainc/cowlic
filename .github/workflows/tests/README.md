@@ -1,17 +1,17 @@
 # Workflow tests
 
-This private Node/Vitest package owns GitHub workflow checks. From this directory:
+This private Node/Vitest package owns GitHub workflow checks. Install from the repository root, then select this package:
 
 ```sh
-npm ci --ignore-scripts
-npm test
+pnpm --filter cowlic-workflow-tests --fail-if-no-match install --frozen-lockfile --ignore-scripts
+pnpm --filter cowlic-workflow-tests --fail-if-no-match test
 ```
 
 Requires Node 22, bash and git. No Worker dependency installation, credentials or production data are needed.
 Temporary repositories and fake gh/Wrangler commands exercise the actual CI scripts. Reads of Worker manifests,
 Wrangler configuration and deployment tooling are explicit inputs to production-configuration checks.
 
-Worker tests stay in `worker/`: `npm ci`, `npm test`, `npx tsc --noEmit`. Its Vitest projects are only unit and smoke.
+Worker tests stay in `worker/`: `pnpm install --frozen-lockfile --ignore-scripts`, `pnpm test`, `pnpm exec tsc --noEmit`. Its Vitest projects are only unit and smoke.
 CI preserves the required `tests` job and existing `Test Report (Vitest)` name, adding `Test Report (Workflows)`.
 The runners have separate XML reports and minimum-count/skip guards (Worker 315; workflow 495).
 Failure, zero collection and `.only` fail Vitest; missing/non-numeric report counts, skips or counts below the floor
@@ -39,5 +39,6 @@ real temporary-git change detection and BASE selection, migration/destructive ap
 fallback, release idempotence and stale-head protection. Do not lower a floor or update a ship fingerprint just to
 make a failure disappear: identify the changed invariant first.
 
-The standalone lockfile reuses the existing Worker graph: all 60 locked package entries retain their versions and
-integrities; only Vitest/Vite and their dependency closure remain. The later pnpm workspace migration is #383.
+The pnpm migration (#383) shares the root lockfile and retains all 150 pre-migration dependency versions/integrities.
+Package manifests and runners remain independent. Current workflow count is 521: workspace path-filter cases,
+bootstrap guards and the extra ship bootstrap step extend the 503-check baseline above. See [workspace setup](../../../docs/js-workspace.md).
