@@ -52,6 +52,16 @@ To repeat only the authenticated HTTP checks:
 python3 scripts/preview-worker.py check
 ```
 
+Read readiness and endpoint flags without exporting or deploying anything:
+
+```sh
+python3 scripts/preview-worker.py status
+```
+
+The HTTP client identifies itself as `cowlic-preview-check/1.0`, rather than a browser or Python's default client.
+Cloudflare error diagnostics expose only an allowlisted reason/numeric code; raw pages and endpoint identifiers
+are never printed. An HTTP check failure keeps readiness false.
+
 Failures return nonzero, leave readiness false and keep raw diagnostics private. After a partially completed init,
 the private manifest identifies resources already created; fix the reported cause and use refresh/deploy. Do not delete
 the manifest to bypass the existing-name guard. A refresh can temporarily make preview unavailable; production is not

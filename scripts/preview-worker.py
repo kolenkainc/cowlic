@@ -332,7 +332,8 @@ class Preview:
                 salt = secrets.token_hex(8)
                 values.update(u=access["username"], s=salt, t=hashlib.md5((access["password"] + salt).encode()).hexdigest())
             req = urllib.request.Request(access["url"] + "/rest/" + method + "?" + urllib.parse.urlencode(values),
-                                         headers={"Range": byte_range} if byte_range else {})
+                                         headers={"User-Agent": "cowlic-preview-check/1.0 (+https://github.com/kolenkainc/cowlic)",
+                                                  **({"Range": byte_range} if byte_range else {})})
             try:
                 with urllib.request.build_opener(NoRedirect()).open(req, timeout=self.timeout(30)) as response:
                     return response.status, response.headers, response.read(2 * 1024 * 1024)
@@ -343,7 +344,14 @@ class Preview:
                     layer = "gateway"
                 reason = headers.get("x-mitmproxy-blocked-reason", "")
                 known_reason = reason if reason in ("ROBOTS_DENIED", "DOMAIN_NOT_ALLOWED", "INTERNAL") else "unspecified"
-                raise PreviewError(f"preview HTTP check failed: {method} HTTP {error.code} layer={layer} reason={known_reason}") from None
+                # Extract only a numeric provider code, never return the error page or its identifiers.
+                with error:
+                    page = error.read(65536).decode("utf-8", errors="replace")
+                code = re.search(r"(?:error code:\s*|error-code\">)(\d{4})\b", page, re.IGNORECASE)
+                provider_code = code.group(1) if code else "unspecified"
+                challenge = headers.get("cf-mitigated") == "challenge"
+                raise PreviewError(f"preview HTTP check failed: {method} HTTP {error.code} layer={layer} "
+                                   f"reason={known_reason} provider_code={provider_code} challenge={challenge}") from None
             except urllib.error.URLError as error:
                 raise PreviewError(f"preview HTTP check failed: {method} transport {type(error.reason).__name__}") from None
 

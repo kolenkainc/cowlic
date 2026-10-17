@@ -240,6 +240,8 @@ class PreviewTests(unittest.TestCase):
         self.initialize()
         ranges = []
         def open_response(request, timeout):
+            self.assertEqual(request.get_header("User-agent"),
+                             "cowlic-preview-check/1.0 (+https://github.com/kolenkainc/cowlic)")
             url = preview.urllib.parse.urlsplit(request.full_url)
             params = preview.urllib.parse.parse_qs(url.query)
             method = url.path.removeprefix("/rest/")
@@ -272,6 +274,29 @@ class PreviewTests(unittest.TestCase):
             self.p.check()
         self.assertEqual(ranges, ["bytes=0-127", "bytes=1024-1151"])
         self.assertIsNone(preview.NoRedirect().redirect_request(None, None, 302, "redirect", None, "https://elsewhere.invalid"))
+
+    def test_http_failure_reports_only_allowlisted_diagnostics(self):
+        self.initialize()
+        for gateway in (False, True):
+            with self.subTest(gateway=gateway):
+                headers = Message()
+                headers["server"] = "cloudflare"
+                headers["cf-ray"] = "PRIVATE-CANARY"
+                if gateway:
+                    headers["x-mitmproxy-blocked-reason"] = "ROBOTS_DENIED"
+                error = preview.urllib.error.HTTPError("https://PRIVATE-CANARY", 403, "PRIVATE-CANARY", headers,
+                                                       io.BytesIO(b"error code: 1010 PRIVATE-CANARY"))
+                opener = unittest.mock.Mock()
+                opener.open.side_effect = error
+                with patch.object(self.p, "api", side_effect=self.api), \
+                     patch.object(preview.urllib.request, "build_opener", return_value=opener), \
+                     self.assertRaises(preview.PreviewError) as caught:
+                    self.p.check()
+                message = str(caught.exception)
+                self.assertNotIn("CANARY", message)
+                self.assertIn("provider_code=1010", message)
+                self.assertIn("layer=gateway" if gateway else "layer=cloudflare", message)
+                self.assertIn("reason=ROBOTS_DENIED" if gateway else "reason=unspecified", message)
 
     def test_command_timeout_is_bounded_and_diagnostics_private(self):
         binary = self.root / "bin"
