@@ -23,4 +23,4 @@ export function stubCaches(): void {
   vi.stubGlobal("caches", { default: { match: async () => undefined, put: async () => {} } });
 }
 
-export type WorkerEnv = Parameters<(typeof import("../src/index"))["default"]["fetch"]>[1];
+export type { Env as WorkerEnv } from "../src/env";
