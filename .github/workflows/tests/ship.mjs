@@ -76,11 +76,14 @@ export function simulateShip(text, { failAt = null, count = "2" }) {
 }
 const DEPLOY_HALF = SHIP_STEPS.map(([n]) => n).slice(SHIP_STEPS.findIndex(([n]) => n === "Mask the Worker URL"));
 const MIGRATE_HALF = SHIP_STEPS.map(([n]) => n).slice(0, SHIP_STEPS.findIndex(([n]) => n === "Mask the Worker URL"));
-export const shipOrderCases = [];
-for (const count of ["0", "2"]) {
-  shipOrderCases.push([`no failure, ${count} pending: every step of both halves runs in order except the two failure summaries and the skipped apply path`, { count }]);
-  for (const name of [...MIGRATE_HALF, ...DEPLOY_HALF]) shipOrderCases.push([`step "${name}" fails, ${count} pending`, { failAt: name, count }]);
-}
+// Pending count only affects Apply migrations. Two success paths cover that branch;
+// inject a failure once at every executable step with pending work. Failure-only
+// summaries cannot fail on the success path and are checked by the failure oracle.
+export const shipOrderCases = [
+  ...["0", "2"].map((count) => [`no failure, ${count} pending`, { count }]),
+  ...SHIP_STEPS.filter(([name]) => !SHIP_ALWAYS.includes(name))
+    .map(([name]) => [`step "${name}" fails`, { failAt: name, count: "2" }]),
+];
 export function shipOrderCaseFailures(text, [name, opts]) {
   const f = [];
   let ran;

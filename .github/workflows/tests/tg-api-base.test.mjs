@@ -32,9 +32,6 @@ describe("TG_API_BASE is never part of the production configuration (#301)", () 
   it.each(workflowFiles)("workflow %s does not mention it", (f) => {
     expect(mentions(readFileSync(join(workflowsDir, f), "utf8"))).toBe(false);
   });
-  it("wrangler.toml does not mention it (no [vars], not in the secret list comment either)", () => {
-    expect(mentions(readFileSync(join(workerDir, "wrangler.toml"), "utf8"))).toBe(false);
-  });
   it("every committed worker/wrangler*.toml does not mention it", () => {
     const tomls = readdirSync(workerDir).filter((f) => /^wrangler.*\.toml$/.test(f));
     expect(tomls).toContain("wrangler.toml");
