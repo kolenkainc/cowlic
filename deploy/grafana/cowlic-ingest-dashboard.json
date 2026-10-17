@@ -199,7 +199,7 @@
       "title": "Tracks per run",
       "description": "Counts of each run: one pushed sample per run, shown with last_over_time over the chart interval so that every run is drawn",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 5 },
       "targets": [
         { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "last_over_time(cowlic_ingest_added{host=~\"$host\"}[$__interval])", "legendFormat": "added", "refId": "A" },
         { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "last_over_time(cowlic_ingest_skipped{host=~\"$host\"}[$__interval])", "legendFormat": "skipped (already present)", "refId": "B" },
@@ -223,11 +223,35 @@
       "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi", "sort": "none" } }
     },
     {
+      "id": 15,
+      "type": "timeseries",
+      "title": "New releases per run",
+      "description": "Counts of each run: one pushed sample per run, shown with last_over_time over the chart interval so that every run is drawn",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 5 },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "last_over_time(cowlic_ingest_new_releases_added{host=~\"$host\"}[$__interval])", "legendFormat": "added", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "last_over_time(cowlic_ingest_new_releases_with_new{host=~\"$host\"}[$__interval])", "legendFormat": "with_new", "refId": "B" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": { "drawStyle": "points", "pointSize": 8, "showPoints": "always", "lineWidth": 1, "spanNulls": false },
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "added" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } } ] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi", "sort": "none" } }
+    },
+    {
       "id": 8,
       "type": "timeseries",
       "title": "Run duration",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 5 },
       "targets": [
         { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "last_over_time(cowlic_ingest_duration_seconds{host=~\"$host\"}[$__interval])", "legendFormat": "{{host}}", "refId": "A" }
       ],

@@ -43,6 +43,7 @@ MAX_LINES = 2000
 KEEP_HEAD = 1000  # when over MAX_LINES: first KEEP_HEAD and last MAX_LINES - KEEP_HEAD - 1 lines
 FAILURE_CLASSES = ("none", "partial", "config", "youtube-sign-in", "crash")
 COUNT_KEYS = ("added", "skipped", "no_match", "too_big", "failed", "not_attempted")
+NEW_RELEASES_KEYS = ("checked", "with_new", "added", "failed")
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")  # credential validation only
 UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 MAX_BODY_BYTES = 1024 * 1024
@@ -236,6 +237,11 @@ def parse_last_run(path: str, started_at: str | None = None) -> dict:
     counts = res.get("counts") if isinstance(res, dict) else None
     if isinstance(counts, dict):
         out["counts"] = {k: _count(counts[k]) for k in COUNT_KEYS if k in counts}
+    if isinstance(res, dict) and "new_releases" in res:
+        releases = res["new_releases"]
+        if not isinstance(releases, dict):
+            raise ShipError("last-run.json has an unexpected value")
+        out["new_releases"] = {k: _count(releases[k]) for k in NEW_RELEASES_KEYS if k in releases}
     return out
 
 
@@ -243,6 +249,8 @@ def summary_line(run: dict) -> str:
     dur = max(0, int((run["finished"] - run["started"]).total_seconds()))
     parts = [f"exit_code={run['exit_code']}", f"failure_class={run['failure_class']}"]
     parts += [f"{k}={run['counts'][k]}" for k in COUNT_KEYS if k in run["counts"]]
+    parts += [f"new_releases_{k}={run['new_releases'][k]}" for k in NEW_RELEASES_KEYS
+              if k in run.get("new_releases", {})]
     parts.append(f"duration_s={dur}")
     return "run_summary " + " ".join(parts)
 
@@ -256,6 +264,8 @@ def metrics_line(run: dict, host: str) -> str:
               "success": 1 if run["exit_code"] == 0 else 0, "exit_code": run["exit_code"],
               "duration_seconds": dur}
     fields.update({k: run["counts"][k] for k in COUNT_KEYS if k in run["counts"]})
+    fields.update({f"new_releases_{k}": run["new_releases"][k] for k in NEW_RELEASES_KEYS
+                   if k in run.get("new_releases", {})})
     for cls in FAILURE_CLASSES[1:]:  # "none" is the absence of the others
         fields["failure_" + cls.replace("-", "_")] = 1 if run["failure_class"] == cls else 0
     return f"cowlic_ingest,job=cowlic-ingest,host={host} " + ",".join(f"{k}={v}i" for k, v in fields.items()) + "\n"
