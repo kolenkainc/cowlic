@@ -387,13 +387,13 @@ jobs:
 
       # Vitest has no switch against skipped tests and no minimum count, so both are checked here on the numeric
       # outputs of the report step (no text parsing): skipped must be 0 (a skipped test is a silently dropped check)
-      # and passed must reach MIN_TESTS, a pinned number just below the real count (852 on 2026-10-17: 199 unit, 548
+      # and passed must reach MIN_TESTS, a pinned number just below the real count (854 on 2026-10-17: 199 unit, 550
       # workflow, 105 smoke) so a few removals do not trip it but a lost file or area does. NOT dynamic: raise it deliberately when tests are added,
       # lower it deliberately when tests are removed on purpose.
       - name: Minimum test count (Vitest)
         if: ${{ steps.vitest.outcome == 'success' }}
         env:
-          MIN_TESTS: "846"
+          MIN_TESTS: "848"
           PASSED: ${{ steps.vitest_report.outputs.passed }}
           SKIPPED: ${{ steps.vitest_report.outputs.skipped }}
         run: |
