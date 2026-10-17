@@ -914,14 +914,15 @@ Added in #172 (contract: [bootstrap-ongoing.md](bootstrap-ongoing.md) section 4)
 `sources.yml` makes a run check, AFTER the playlists (and the other sections), the artists of the stored bootstrap
 ranking (`bootstrap-ranking.json`, computed by the bootstrap command only, never by this run) for releases that are
 not in the library, and ingest their tracks through the same pipeline as a playlist. A file without the section, or
-with `enabled: false`, behaves exactly as before. The committed `sources.yml` keeps it off until the owner turns it on.
+with `enabled: false`, behaves exactly as before. The committed `sources.yml` enables the owner-approved bounded
+check (#165, #175), after the partial-release retry fix (#238) and metrics (#173) landed.
 
 ```yaml
-# new_releases:
-#   enabled: true        # default true
-#   max_artists: 10      # due artists checked per night, 1..1000; default 10
-#   recheck_days: 7      # a checked artist is due again after this many days, 1..365; default 7
-#   max_new: 20          # tracks added by this phase per night, 1..1000; default 20
+new_releases:
+  enabled: true        # false disables the phase; default true
+  max_artists: 10      # due artists checked per night, 1..1000; default 10
+  recheck_days: 7      # a checked artist is due again after this many days, 1..365; default 7
+  max_new: 20          # tracks added by this phase per night, 1..1000; default 20
 ```
 
 Same strictness as the other sections (unknown or repeated keys are errors; `lookback_days` does not exist). The
@@ -935,10 +936,10 @@ calls (search, get_artist, get_artist_albums, get_album) is classed as a refusal
 `partial`), not exit 3. An unexpected exception in the phase is logged by class only, ends the phase and gives exit 1.
 With no stored ranking the phase does nothing and logs one line (there is no fallback to the artists in D1).
 
-Known limitation (#238, blocks enabling the phase in the committed `sources.yml` and #175): a release of which only
-some tracks landed (cut by a cap, a failed track, an interruption) has its album in D1 afterwards, so the next check no
-longer sees it as missing and the remaining tracks are not retried. A cut artist is kept due, which only helps releases
-that were not started.
+Partial releases (#238): an album row does not mean all its tracks landed. A release cut by a cap, failure or
+interruption stays unevaluated and is fetched again when due; stored track IDs are skipped and missing tracks are
+retried under the existing cooldown and caps. An already evaluated release is not repeatedly fetched. Matching
+stored album titles remain eligible even outside the initial age filter, so an older partial release can resume.
 
 Check state lives in `new-releases-state.json` next to `ingest-state.json` (hashed artist keys, dates, release keys).
 A failed artist check, a failed track or an unreadable state file is a failure of the phase (exit 1, class `partial`),
