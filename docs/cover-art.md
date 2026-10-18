@@ -183,7 +183,8 @@ All in `ingest/`:
    title and duration could get its cover stored. Without it a wrong cover would be shared through `covers[al]` and kept forever by the COALESCE [V
    `ingest.py:540-549, 802-806`]. A song that fails the guard simply gets no cover (counted, logged without names).
 2. `fetch_cover` hardening for URLs from the YouTube route [V today it only checks https and size, and `urlopen` follows
-   redirects, `ingest.py:748-757`]: a host allowlist (`yt3.googleusercontent.com`, `lh3.googleusercontent.com`) checked
+   redirects, `ingest.py:748-757`]: an exact host allowlist (`yt3.googleusercontent.com`, `lh3.googleusercontent.com`,
+   `yt3.ggpht.com`, the latter observed on real artist-page thumbnails in #401) checked
    on the first URL AND on every redirect target (or refuse redirects altogether), `Content-Type: image/jpeg`, the JPEG
    magic bytes `FF D8`, the 10 MB cap and https only kept. Failure keeps "WARN cover failed" and no cover. A hostile test
    (redirect to another host, non-JPEG body, oversized body) with a mutation check for each rule.

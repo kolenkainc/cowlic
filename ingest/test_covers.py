@@ -229,8 +229,17 @@ class FetchCoverTest(NoNetwork):
         self.assertEqual(data, JPEG)
         self.assertEqual(op.opened[0][1], 30)
 
-    def test_hosts_are_the_two_documented_ones(self):
-        self.assertEqual(ingest.YTM_COVER_HOSTS, {"yt3.googleusercontent.com", "lh3.googleusercontent.com"})
+    def test_hosts_are_exactly_the_observed_thumbnail_hosts(self):
+        self.assertEqual(ingest.YTM_COVER_HOSTS, {"yt3.googleusercontent.com", "lh3.googleusercontent.com", "yt3.ggpht.com"})
+
+    def test_artist_thumbnail_on_ggpht_uses_the_same_checked_fetch(self):
+        url = "https://yt3.ggpht.com/FAKEARTIST=w800-h800-p-l90-rj"
+        data, op = self.fetch(url=url)
+        self.assertEqual(data, JPEG)
+        self.assertEqual(op.opened, [(url, 30)])
+        self.rejected(url=url.replace("https:", "http:"))
+        self.rejected(url=url, resp=FakeResponse(ctype="text/html"))
+        self.rejected(url=url, resp=FakeResponse(body=b"not a JPEG"))
 
     def test_http_rejected(self):
         self.rejected(url="http://lh3.googleusercontent.com/x=w1")
@@ -239,7 +248,10 @@ class FetchCoverTest(NoNetwork):
         for u in ("https://evil.example/x=w1", "https://lh3.googleusercontent.com.evil.example/x",
                   "https://evil.example/@lh3.googleusercontent.com/x", "https://lh3.googleusercontent.com@evil.example/x",
                   "https://user:p@lh3.googleusercontent.com/x", "https://lh3.googleusercontent.com:8443/x",
-                  "https://lh3.googleusercontent.com:bad/x", "https://i.scdn.co/image/x", "https://localhost/x"):
+                  "https://lh3.googleusercontent.com:bad/x", "https://i.scdn.co/image/x", "https://localhost/x",
+                  "https://yt3.ggpht.com.evil.example/x", "https://evil.yt3.ggpht.com/x",
+                  "https://yt3.ggpht.com@evil.example/x", "https://user:p@yt3.ggpht.com/x",
+                  "https://yt3.ggpht.com:8443/x", "https://yt3.ggpht.com:bad/x"):
             with self.subTest(u=u):
                 self.rejected(url=u)
 
