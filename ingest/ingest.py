@@ -785,7 +785,9 @@ def js_runtime_problem() -> str | None:
 
 # Hosts of the thumbnail URLs the YouTube Music search returns for songs (observed 2026-10-11, see docs/cover-art.md).
 COVER_FROM_MATCH = "cover_from_match"  # song key set by process_track: the cover URL came from the YouTube Music match
-YTM_COVER_HOSTS = frozenset({"lh3.googleusercontent.com", "yt3.googleusercontent.com"})
+# Artist pages also return yt3.ggpht.com (#401, observed on the real remaining artist images).
+# Keep exact hosts: HTTPS, no userinfo/nonstandard port, no redirects and JPEG validation still apply.
+YTM_COVER_HOSTS = frozenset({"lh3.googleusercontent.com", "yt3.googleusercontent.com", "yt3.ggpht.com"})
 COVER_TOTAL_TIMEOUT_S = 60  # wall clock for one cover download: the socket timeout alone lets a slow drip run forever
 COVER_CHUNK = 64 * 1024
 
