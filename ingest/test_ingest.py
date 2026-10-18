@@ -1814,5 +1814,43 @@ class AlbumCoverUpsertTest(unittest.TestCase):
         self.assertNotIn("COALESCE(excluded.cover_file_id", sql)
 
 
+class AlbumYearUpsertTest(unittest.TestCase):
+    """#402: a later track must not erase or replace a verified album release year."""
+
+    def setUp(self):
+        import sqlite3
+        self.con = sqlite3.connect(":memory:")
+        self.addCleanup(self.con.close)
+        self.con.executescript((Path(__file__).resolve().parent.parent / "worker" / "migrations" / "0001_init.sql").read_text())
+
+    def store(self, song_id, year, cover=None):
+        song = dict(SONG, song_id=song_id, year=year)
+        for sql, params in ingest.upsert_statements(song, 1, "f", 1, cover):
+            self.con.execute(sql, params)
+
+    def test_new_track_preserves_a_repaired_year_and_cover(self):
+        self.store("sp1", None, "original-cover")
+        self.con.execute("UPDATE albums SET year = ?", [2004])
+        self.store("sp2", None, "later-cover")
+        self.store("sp2", None, "later-cover")
+        self.assertEqual(self.con.execute("SELECT year, cover_file_id FROM albums").fetchall(), [(2004, "original-cover")])
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM tracks").fetchone(), (2,))
+
+    def test_new_track_does_not_replace_an_existing_release_year(self):
+        self.store("sp1", 2010)
+        self.store("sp2", 2020)
+        self.assertEqual(self.con.execute("SELECT year FROM albums").fetchall(), [(2010,)])
+
+    def test_new_track_can_fill_an_unknown_year(self):
+        self.store("sp1", None)
+        self.store("sp2", 2020)
+        self.assertEqual(self.con.execute("SELECT year FROM albums").fetchall(), [(2020,)])
+
+    def test_missing_and_zero_years_stay_unknown(self):
+        self.store("sp1", None)
+        self.store("sp2", 0)
+        self.assertEqual(self.con.execute("SELECT year FROM albums").fetchall(), [(None,)])
+
+
 if __name__ == "__main__":
     unittest.main()

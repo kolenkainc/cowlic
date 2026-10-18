@@ -14,6 +14,9 @@ enabling the timer) is untested by the author and is done by the owner in #73 an
 - `ingest/ingest.py` reads `.env` itself (the wrapper does not), matches tracks on YouTube Music, downloads,
   uploads to the Telegram channel and writes metadata to D1. Tracks already in D1 are skipped, so re-runs add
   no duplicates.
+- Adding another track to an existing album preserves its stored release year and cover. Incoming metadata fills
+  only missing values; it cannot erase a repaired year or replace it with another edition's year. Unknown years
+  remain unset. Correcting an already stored year is a separate verified metadata repair (#402).
 - A systemd user timer starts the wrapper daily at 21:10 machine LOCAL time (`deploy/systemd/`).
 - Observability is logs only, no notifications (decision #72): you read the log and `last-run.json`. Optionally
   the redacted log of each run is also pushed to your Grafana Cloud Loki (see
