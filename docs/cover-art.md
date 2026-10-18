@@ -434,3 +434,37 @@ check was designed, not measured). That is roughly 40 of 184 albums, with a wide
 design: recordings by another artist and releases that YouTube Music does not list under the stored name or only as a
 compilation. For those the safe path is a cover chosen by the owner and a manual D1 update. The dry run prints the real
 numbers; the owner decides after looking at them.
+
+### Bounded fallback research (#395)
+
+`ingest/artwork_probe.py` is a read-only feasibility command, separate from ingest.
+It accepts a private JSON array of one to five objects with `album`, `artist`,
+`title` and optional positive integer `duration_s`. Use actual unresolved rows;
+never commit or paste this input, raw responses or images into GitHub.
+
+Run from `ingest/` with the existing venv:
+
+```sh
+.venv/bin/python artwork_probe.py /private/path/input.json /private/path/new-output-directory
+```
+
+The new output directory is private (0700, files 0600); existing output paths are
+refused. Standard output contains aggregate counts and refusal classes only.
+No credentials, database, Telegram or production provider configuration is used.
+The command issues at most 25 requests for at most five albums, spaced by at least
+1.5 seconds and bounded by a three-minute request budget. It stops the entire run
+on HTTP 429/503 or network unavailability, without retries. It checks at most three
+search results and two matching release pages per album. Search limits make this
+a feasibility sample, never proof that absent albums have no artwork.
+
+Release identity reuses the strict album, artist, stored track, duration and
+recording-variant guards. CAA is queried only after corroboration. JSON and JPEG
+responses are bounded; HTTPS and exact hosts are required. Redirects, including
+legitimate Archive redirects, are refused. A redirect outcome establishes that a
+safe image delivery path remains unproven; it does not justify weakening the
+production image allowlist. Even a verified result does not authorize applying
+images or replacing the existing owner-approved plan. No new dependency is added.
+
+Primary API requirements: [MusicBrainz API](https://musicbrainz.org/doc/MusicBrainz_API)
+(noncommercial use is free, meaningful User-Agent, maximum one call per second)
+and [CAA API](https://musicbrainz.org/doc/Cover_Art_Archive/API).
