@@ -568,6 +568,21 @@ describe("ci.yml: the validated outputs of the job version", () => {
 // The required tests job must gate each independently installed suite, including
 // numeric report validation: a missing count must never look like zero skips.
 describe("separate suite reporting fails closed", () => {
+  it("migration lint tests run from the CI package and remain part of its default command", () => {
+    const all = steps(jobBlock(ci, "tests"));
+    const run = all.find((s) => s.name === "Migration lint tests");
+    expect(run.text).toContain("        working-directory: .github/workflows/tests");
+    expect(run.text).not.toMatch(/^ {8}(continue-on-error|if):/m);
+    expect(run.run).toContain("node --test");
+    expect(run.run).toContain('"$RUNNER_TEMP/lint-tests.xml" migrations/lint-migrations.test.mjs');
+    const pkg = JSON.parse(readText(join(dirname(ciFile), "tests/package.json")));
+    expect(pkg.scripts["test:migrations"]).toBe("node --test migrations/lint-migrations.test.mjs");
+    expect(pkg.scripts.test).toBe("pnpm run test:migrations && pnpm run test:workflows");
+    expect(pkg.scripts["test:workflows"]).toBe("vitest run");
+    const workflow = all.find((s) => s.name === "Workflow tests");
+    expect(workflow.run).toContain("pnpm test:workflows --reporter=default --reporter=junit");
+  });
+
   it.each([
     ["Vitest", "vitest", "vitest_report", "315"],
     ["Workflows", "workflow_tests", "workflow_report", "522"],

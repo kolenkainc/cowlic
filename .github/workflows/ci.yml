@@ -325,8 +325,9 @@ jobs:
       # (and so the required check `tests`) whether or not the report can be published (fork PRs have a read-only token).
       - name: Migration lint tests
         id: lint_tests
+        working-directory: .github/workflows/tests
         run: |
-          node --test --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination="$RUNNER_TEMP/lint-tests.xml" scripts/lint-migrations.test.mjs
+          node --test --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination="$RUNNER_TEMP/lint-tests.xml" migrations/lint-migrations.test.mjs
 
       # #289: publishes the JUnit XML as an extra check run "Test Report" (NOT a required check, never read by the
       # deploy gate). Pinned by full SHA (docs/worker-cicd.md section 6 audit). Runs after a failed test step too
@@ -386,7 +387,7 @@ jobs:
         id: workflow_tests
         working-directory: .github/workflows/tests
         run: |
-          pnpm test --reporter=default --reporter=junit --outputFile.junit="$RUNNER_TEMP/workflow-tests.xml"
+          pnpm test:workflows --reporter=default --reporter=junit --outputFile.junit="$RUNNER_TEMP/workflow-tests.xml"
 
       # Same pinned action and options as "Test Report" above, its own check run (the minimum below is per runner).
       - name: Test Report (Workflows)

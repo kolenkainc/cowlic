@@ -1,4 +1,4 @@
-// Tests for lint-migrations.mjs. Run from worker/: node --test scripts/
+// Tests for the Worker's migration linter. Run from the CI package: pnpm test:migrations.
 // No dependency: node:test only. Mutation checks copy the script to a scratch dir outside the repo.
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -7,11 +7,12 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync } from 'nod
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { lintSql } from './lint-migrations.mjs';
+import { lintSql } from '../../../../worker/scripts/lint-migrations.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const SCRIPT = path.join(here, 'lint-migrations.mjs');
-const MIGRATIONS = path.join(here, '..', 'migrations');
+const worker = path.resolve(here, '../../../../worker');
+const SCRIPT = path.join(worker, 'scripts', 'lint-migrations.mjs');
+const MIGRATIONS = path.join(worker, 'migrations');
 
 const rulesOf = (sql) => lintSql(sql).map((f) => f.rule);
 const hasRule = (sql, rule) => rulesOf(sql).includes(rule);
