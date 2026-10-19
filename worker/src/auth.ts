@@ -1,7 +1,6 @@
-export interface AuthEnv {
-  SUBSONIC_USER: string;
-  SUBSONIC_PASSWORD: string;
-}
+import type { Env } from "./env";
+
+export type AuthEnv = Pick<Env, "SUBSONIC_USER" | "SUBSONIC_PASSWORD">;
 
 function safeEqual(a: string, b: string): boolean {
   const enc = new TextEncoder();

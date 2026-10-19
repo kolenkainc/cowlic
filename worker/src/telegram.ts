@@ -1,10 +1,6 @@
-export interface TgEnv {
-  TG_BOT_TOKEN: string;
-  // TEST-ONLY override of the Bot API base URL (the smoke tests point it at a local stub). Never set in wrangler.toml,
-  // a Worker secret or the deploy workflow: unset means https://api.telegram.org. Validated by telegramApiBase().
-  // An https override sends the bot token (URL path) to ANY host: only the owner may set it.
-  TG_API_BASE?: string;
-}
+import type { Env } from "./env";
+
+export type TgEnv = Pick<Env, "TG_BOT_TOKEN" | "TG_API_BASE">;
 
 const DEFAULT_API_BASE = "https://api.telegram.org";
 const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(["127.0.0.1", "localhost", "[::1]"]);
