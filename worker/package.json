@@ -6,7 +6,9 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "pnpm run test:migrations && pnpm run test:app",
+    "test:migrations": "node --test scripts/lint-migrations.test.mjs",
+    "test:app": "vitest run"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261006.1",

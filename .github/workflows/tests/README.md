@@ -11,11 +11,9 @@ Requires Node 22, bash and git. No Worker dependency installation, credentials o
 Temporary repositories and fake gh/Wrangler commands exercise the actual CI scripts. Reads of Worker manifests,
 Wrangler configuration and deployment tooling are explicit inputs to production-configuration checks.
 
-The default `test` command runs both suites and stops on a failure. Select one from this directory with
-`pnpm test:migrations` (69 node:test checks under `migrations/`) or `pnpm test:workflows` (Vitest workflow checks).
-Migration tests import the real linter from `worker/scripts/lint-migrations.mjs` and read Worker SQL fixtures;
-the executable linter stays with the Worker and has no package dependencies. The nested migration suite is run
-explicitly by Node and is outside Vitest's root-only `*.test.mjs` discovery, so it runs once.
+This package's `pnpm test` runs only workflow checks through Vitest. Migration-linter tests live beside the linter
+in `worker/scripts/` and belong to the Worker package: run `pnpm test:migrations` from `worker/`. Worker `pnpm test`
+runs those 69 Node checks followed by its application suite; CI selects the suites separately for their reports.
 
 The shared workflow sandbox contains tens of thousands of temporary git entries (65,374 in a local #416 run).
 Its `afterAll` awaits asynchronous recursive removal with a finite 30-second limit for that hook. Removal errors
@@ -53,4 +51,4 @@ make a failure disappear: identify the changed invariant first.
 The pnpm migration (#383) shares the root lockfile and retains all 150 pre-migration dependency versions/integrities.
 Package manifests and runners remain independent. Current workflow count is 531: workspace path-filter cases,
 bootstrap guards, preview tooling path filters, the extra ship bootstrap step and migration-suite package wiring
-extend the 503-check baseline above. The package also owns the separate 69-check migration suite. See [workspace setup](../../../docs/js-workspace.md).
+extend the 503-check baseline above. The separate 69-check migration suite belongs to Worker. See [workspace setup](../../../docs/js-workspace.md).

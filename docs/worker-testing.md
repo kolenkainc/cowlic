@@ -1,6 +1,6 @@
 # Worker tests
 
-First [bootstrap pnpm and install the workspace](js-workspace.md). Run from `worker/` with `pnpm test`. For a quick application-only run, use `pnpm exec vitest run --project unit`;
+First [bootstrap pnpm and install the workspace](js-workspace.md). Run from `worker/` with `pnpm test`: it runs migration-linter tests, then the application suite, stopping on failure. Select one with `pnpm test:migrations` (69 Node checks in `scripts/lint-migrations.test.mjs`) or `pnpm test:app` (Vitest unit/smoke). For a quick application-only run, use `pnpm exec vitest run --project unit`;
 for the Hono-specific suite, use `pnpm exec vitest run --project unit test/hono.test.ts`.
 
 ## Environment types
@@ -66,7 +66,7 @@ HEAD/GET streaming. Each test gets a new app with its own request state.
   local Telegram stub. It checks platform behavior that Node unit tests cannot establish.
 - Workflow tests have their own package under `.github/workflows/tests/`: install from the root with `pnpm install --frozen-lockfile --ignore-scripts`
   and run `pnpm --filter cowlic-workflow-tests --fail-if-no-match test`. They do not run through Worker configuration; see its [README](../.github/workflows/tests/README.md).
-  This command also runs the migration-linter tests now owned by that CI package; the linter executable stays in `worker/scripts/`.
+  This package runs workflow tests only; migration-linter tests belong to Worker alongside the linter in `worker/scripts/`.
 
 No test requires production credentials or real library data. Real authenticated client playback is the owner's
 separate acceptance in #380; it is not inferred from these tests or the unauthenticated deployment health check.
