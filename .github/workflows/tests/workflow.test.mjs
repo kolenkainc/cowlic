@@ -583,7 +583,7 @@ describe("separate suite reporting fails closed", () => {
   });
 
   it.each([
-    ["Vitest", "vitest", "vitest_report", "315"],
+    ["Vitest", "vitest", "vitest_report", "430"],
     ["Workflows", "workflow_tests", "workflow_report", "522"],
   ])("%s", (label, testId, reportId, floor) => {
     const all = steps(jobBlock(ci, "tests"));

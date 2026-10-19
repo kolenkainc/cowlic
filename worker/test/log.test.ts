@@ -43,7 +43,7 @@ const env = {
   DB: {
     prepare: () => ({
       bind: () => ({
-        first: async () => {
+        raw: async () => {
           if (dbMode === "throw") throw new TypeError(`D1 failure near u=${USER}&t=${TOKEN}&s=${SALT}`);
           if (dbMode === "badname") {
             // An error class name carrying newline, quotes, unicode, credentials and 100+ characters.
@@ -51,7 +51,7 @@ const env = {
             e.name = `Bad\n"Nameé ${USER} ${TOKEN} ` + "A".repeat(100);
             throw e;
           }
-          return { id: TRACK_ID, tg_file_id: FILE_ID, content_type: "audio/mpeg", suffix: "mp3" };
+          return [[FILE_ID, "audio/mpeg"]];
         },
       }),
     }),

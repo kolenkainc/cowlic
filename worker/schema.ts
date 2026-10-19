@@ -1,4 +1,4 @@
-// Migration authoring only. The Worker continues to use its existing D1 queries.
+// Shared schema for typed Worker queries and Drizzle Kit migration authoring.
 import { sql } from "drizzle-orm";
 import { index, integer, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core";
 

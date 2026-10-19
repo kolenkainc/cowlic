@@ -345,7 +345,7 @@ jobs:
       - name: Minimum test count
         if: ${{ steps.lint_tests.outcome == 'success' }}
         env:
-          MIN_TESTS: "12"
+          MIN_TESTS: "20"
           PASSED: ${{ steps.test_report.outputs.passed }}
         run: |
           case "$PASSED" in
@@ -446,7 +446,7 @@ jobs:
       - name: Minimum test count (Vitest)
         if: ${{ steps.vitest.outcome == 'success' }}
         env:
-          MIN_TESTS: "315"
+          MIN_TESTS: "430"
           PASSED: ${{ steps.vitest_report.outputs.passed }}
           SKIPPED: ${{ steps.vitest_report.outputs.skipped }}
         run: |

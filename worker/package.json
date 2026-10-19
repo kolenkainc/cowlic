@@ -10,18 +10,20 @@
     "test:app": "vitest run",
     "test:migrations": "node --test test/migrations/migrations.test.mjs",
     "migrations:generate": "drizzle-kit generate",
-    "migrations:check": "node scripts/check-migrations.mjs"
+    "migrations:check": "node scripts/check-migrations.mjs && pnpm run migrations:lint",
+    "migrations:lint": "node scripts/migration-lint.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261006.1",
     "drizzle-kit": "0.31.11",
-    "drizzle-orm": "0.45.4",
+    "drizzle-migration-lint": "0.4.0",
     "typescript": "^7.0.2",
     "vite": "8.3.1",
     "vitest": "5.0.2",
     "wrangler": "^4.0.0"
   },
   "dependencies": {
+    "drizzle-orm": "0.45.4",
     "hono": "4.13.12"
   }
 }

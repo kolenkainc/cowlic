@@ -1,0 +1,1 @@
+ALTER TABLE `artists` RENAME COLUMN "image_file_id" TO "portrait_file_id";

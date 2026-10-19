@@ -112,7 +112,7 @@ const envWith = (extra: Record<string, unknown>) =>
     DB: {
       prepare: () => ({
         bind: () => ({
-          first: async () => ({ id: "t1", tg_file_id: FILE_ID, cover_file_id: FILE_ID, content_type: "audio/mpeg", suffix: "mp3" }),
+          raw: async () => [[FILE_ID, "audio/mpeg"]],
         }),
       }),
     },

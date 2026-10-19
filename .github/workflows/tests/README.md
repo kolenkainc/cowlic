@@ -21,8 +21,8 @@ still fail the suite; successful assertions alone do not make teardown successfu
 
 Worker tests stay in `worker/`: `pnpm install --frozen-lockfile --ignore-scripts`, `pnpm test`, `pnpm exec tsc --noEmit`. Its Vitest projects are only unit and smoke.
 CI preserves the required `tests` job and existing `Test Report (Vitest)` name, adding `Test Report (Workflows)`.
-The runners have separate XML reports and minimum-count/skip guards (Worker 315; workflow 522); migration rehearsals
-retain their own Node JUnit report and minimum of 12 passed checks.
+The runners have separate XML reports and minimum-count/skip guards (Worker 430; workflow 522); migration rehearsals
+retain their own Node JUnit report and minimum of 20 passed checks.
 Failure, zero collection and `.only` fail Vitest; missing/non-numeric report counts, skips or counts below the floor
 fail the required job. The counts are deliberately pinned, never calculated from the current discovery result.
 
