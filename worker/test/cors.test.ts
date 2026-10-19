@@ -13,7 +13,7 @@ const env = {
   SUBSONIC_USER: USER,
   SUBSONIC_PASSWORD: PASSWORD,
   TG_BOT_TOKEN: "987654:FAKE",
-  DB: { prepare: () => ({ bind: () => ({ first: async () => ({ id: "t1", tg_file_id: "FILE", content_type: "audio/mpeg" }) }) }) },
+  DB: { prepare: () => ({ bind: () => ({ raw: async () => [["FILE", "audio/mpeg"]] }) }) },
 } as unknown as WorkerEnv;
 
 const ORIGIN = "https://feishin.vercel.app";

@@ -11,12 +11,12 @@ const ORIGIN = "https://feishin.vercel.app";
 const METHOD = ":name{[A-Za-z0-9]+(?:\\.view)?$}";
 
 function bindings() {
-  const first = vi.fn(async () => ({ tg_file_id: "synthetic-file", content_type: "audio/mpeg" }));
-  const statement = { first, bind: (..._args: unknown[]) => statement };
+  const raw = vi.fn(async () => [["synthetic-file", "audio/mpeg"]]);
+  const statement = { raw, bind: (..._args: unknown[]) => statement };
   const prepare = vi.fn(() => statement);
   const env = { SUBSONIC_USER: "hono-unit", SUBSONIC_PASSWORD: "synthetic-password",
     TG_BOT_TOKEN: "synthetic-bot", DB: { prepare } } as unknown as WorkerEnv;
-  return { env, first, prepare };
+  return { env, raw, prepare };
 }
 
 describe("Hono request and middleware contract", () => {
@@ -71,7 +71,7 @@ describe("Hono request and middleware contract", () => {
 
   it("rethrows a Hono HTTPException unchanged and logs it once without its message", async () => {
     const error = new HTTPException(418, { message: "PRIVATE credential-bearing upstream message" });
-    db.first.mockRejectedValue(error);
+    db.raw.mockRejectedValue(error);
     await expect(app.request(`/rest/stream?${AUTH}&id=synthetic`, {}, db.env)).rejects.toBe(error);
     expect(console.error).toHaveBeenCalledTimes(1);
     expect(JSON.parse(vi.mocked(console.error).mock.calls[0][0])).toEqual({
@@ -81,7 +81,7 @@ describe("Hono request and middleware contract", () => {
 
   it("also logs and rethrows values outside Hono's Error-only error handler", async () => {
     const error = { private: "must never reach logs" };
-    db.first.mockRejectedValue(error);
+    db.raw.mockRejectedValue(error);
     await expect(app.request(`/rest/stream?${AUTH}&id=synthetic`, {}, db.env)).rejects.toBe(error);
     expect(console.error).toHaveBeenCalledTimes(1);
     expect(JSON.parse(vi.mocked(console.error).mock.calls[0][0])).toEqual({

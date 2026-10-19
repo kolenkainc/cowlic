@@ -1,6 +1,6 @@
 # Worker tests
 
-First [bootstrap pnpm and install the workspace](js-workspace.md). Run from `worker/` with `pnpm test`: it runs migration-linter tests, then the application suite, stopping on failure. Select one with `pnpm test:migrations` (69 Node checks in `scripts/lint-migrations.test.mjs`) or `pnpm test:app` (Vitest unit/smoke). For a quick application-only run, use `pnpm exec vitest run --project unit`;
+First [bootstrap pnpm and install the workspace](js-workspace.md). Run from `worker/` with `pnpm test`: it runs disposable-D1 migration rehearsals, then the application suite, stopping on failure. Select one with `pnpm test:migrations` (26 Node checks in `test/migrations/migrations.test.mjs`) or `pnpm test:app` (Vitest unit/smoke/query-parity). For a quick application-only run, use `pnpm exec vitest run --project unit`;
 for the Hono-specific suite, use `pnpm exec vitest run --project unit test/hono.test.ts`.
 
 ## Environment types
@@ -66,7 +66,18 @@ HEAD/GET streaming. Each test gets a new app with its own request state.
   local Telegram stub. It checks platform behavior that Node unit tests cannot establish.
 - Workflow tests have their own package under `.github/workflows/tests/`: install from the root with `pnpm install --frozen-lockfile --ignore-scripts`
   and run `pnpm --filter cowlic-workflow-tests --fail-if-no-match test`. They do not run through Worker configuration; see its [README](../.github/workflows/tests/README.md).
-  This package runs workflow tests only; migration-linter tests belong to Worker alongside the linter in `worker/scripts/`.
+  This package runs workflow tests only; disposable-D1 migration rehearsals belong to Worker under `worker/test/migrations/`; see [migration authoring](migration-authoring.md).
 
 No test requires production credentials or real library data. Real authenticated client playback is the owner's
 separate acceptance in #380; it is not inferred from these tests or the unauthenticated deployment health check.
+
+
+The `queries` Vitest project compares all deterministic library operations with a frozen
+pre-ORM implementation (`test/queries/baseline-library.ts`, master #420) against real
+local current/legacy D1, 4,081 synthetic tracks, tied names, empty albums, nullable
+values/primary keys, wildcard literals and hostile IDs. It compares API bodies,
+actual round trips, sampled D1 `rows_read` and index sets from `EXPLAIN QUERY PLAN`.
+Sampling happens after the handler, separately from the handler's round-trip count.
+Random ordering is checked for bounded, unique results rather than deterministic IDs.
+The pre-Hono routing golden snapshot is unchanged; D1 stubs only adapt object rows
+to the ORM driver's raw-array interface.

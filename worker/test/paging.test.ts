@@ -9,7 +9,7 @@ const stub = {
   prepare: () => {
     const st = {
       bind: (...a: unknown[]) => (binds.push(a), st),
-      all: async () => ({ results: [] }),
+      raw: async () => [],
       first: async () => null,
     };
     return st;

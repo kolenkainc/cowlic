@@ -19,15 +19,26 @@ it("preserves the pre-Hono status, headers and bytes across the routing matrix",
     return new Response(new Uint8Array([1, 2, 3]), { status: range ? 206 : 200,
       headers: range ? { "content-range": "bytes 0-2/10", "content-length": "3" } : { "content-length": "3" } });
   });
-  const statement = {
-    bind: (..._args: unknown[]) => statement,
-    all: async () => ({ results: [] }),
-    first: async () => ({ id: "synthetic", tg_file_id: "synthetic-file", cover_file_id: "synthetic-cover",
-      image_file_id: "synthetic-image", content_type: "audio/mpeg", suffix: "mp3", title: "Synthetic",
-      album_id: "synthetic-album", name: "Synthetic", size_bytes: 3, duration_s: 1 }),
+  // Drizzle uses D1 raw arrays, so retain the original golden fixture's values
+  // in each selected projection. List queries still return no rows. The golden
+  // response snapshot is deliberately unchanged.
+  const prepare = (sql: string) => {
+    const statement = {
+      bind: (..._args: unknown[]) => statement,
+      raw: async () => {
+        if (sql.startsWith('select "tg_file_id", "content_type"')) return [["synthetic-file", "audio/mpeg"]];
+        if (sql.startsWith('select "cover_file_id"')) return [["synthetic-cover"]];
+        if (sql.startsWith('select "artists"."image_file_id"')) return [["synthetic-image"]];
+        if (sql.startsWith('select "id", "name", "artists"."image_file_id"')) return [["synthetic", "Synthetic", "synthetic-image"]];
+        if (sql.includes('where "albums"."id" = ?')) return [["synthetic", "Synthetic", undefined, "synthetic-cover", undefined, undefined, undefined, undefined]];
+        if (sql.includes('where "tracks"."id" = ?')) return [["synthetic", "Synthetic", "synthetic-album", undefined, undefined, undefined, undefined, undefined, undefined, 1, "mp3", "audio/mpeg", 3, "synthetic-cover"]];
+        return [];
+      },
+    };
+    return statement;
   };
   const env = { SUBSONIC_USER: "synthetic-user", SUBSONIC_PASSWORD: "synthetic-password",
-    TG_BOT_TOKEN: "synthetic-bot", DB: { prepare: () => statement } } as unknown as WorkerEnv;
+    TG_BOT_TOKEN: "synthetic-bot", DB: { prepare } } as unknown as WorkerEnv;
   const credentials = `u=synthetic-user&t=${md5Hex("synthetic-password" + "salt")}&s=salt`;
   const responses: Record<string, unknown> = {};
   const cases: Record<string, string> = {};

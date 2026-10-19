@@ -1,3 +1,4 @@
+import { libraryQueries } from "./queries";
 import type { Env } from "./env";
 import { coverFileId, getAlbum, getAlbumList2, getArtist, getArtists, getSong, search3 } from "./library";
 import { fail, ok } from "./subsonic";
@@ -33,23 +34,11 @@ export const HANDLERS: Readonly<Record<string, Endpoint>> = Object.freeze({
   download: ({ request, params, env, upstreamError }) => stream(request, params, env, upstreamError),
 });
 
-interface TrackRow {
-  id: string;
-  title: string;
-  album_id: string;
-  track_no: number | null;
-  duration_s: number | null;
-  suffix: string;
-  content_type: string;
-  size_bytes: number;
-  tg_file_id: string;
-}
-
 async function stream(request: Request, params: URLSearchParams, env: Env, upstreamError: () => void): Promise<Response> {
   const id = params.get("id");
   if (!id) return fail(params, 10, "Required parameter is missing: id");
 
-  const track = await env.DB.prepare("SELECT * FROM tracks WHERE id = ?").bind(id).first<TrackRow>();
+  const track = await libraryQueries(env.DB).streamFile(id);
   if (!track) return fail(params, 70, "Song not found");
 
   const res = await proxyTelegramFile(request, track.tg_file_id, track.content_type, env);

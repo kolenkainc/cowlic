@@ -28,10 +28,10 @@ pnpm test
 required `changes`, `lint`, `tests` contexts. From `worker/`, `pnpm exec wrangler ...` uses the installed, locked
 Wrangler; it does not download a missing tool like an npx fallback. Existing production-change rules still apply.
 
-Worker's default `test` runs its Node migration-linter tests followed by its Vitest application tests, stopping
-on failure. Select one with `pnpm --filter cowlic-worker --fail-if-no-match test:migrations` or `test:app`.
-The migration tests live beside the linter in `worker/scripts/`; the independent workflow package runs only its
-Vitest workflow suite. CI selects each suite separately to retain its own JUnit report and count guard.
+The CI package's default `test` runs only workflow tests. The Worker default `test` runs disposable-D1
+migration rehearsals (`test:migrations`) before Vitest application tests (`test:app`). CI selects the suites
+separately for their reports. Drizzle generation/history commands and the authoring/approval contract are in
+[migration authoring](migration-authoring.md).
 
 For only workflow tooling in a clean checkout:
 
