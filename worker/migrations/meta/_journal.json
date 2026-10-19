@@ -1,0 +1,13 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1792426546436,
+      "tag": "0003_artist_images",
+      "breakpoints": true
+    }
+  ]
+}

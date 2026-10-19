@@ -11,11 +11,9 @@ Requires Node 22, bash and git. No Worker dependency installation, credentials o
 Temporary repositories and fake gh/Wrangler commands exercise the actual CI scripts. Reads of Worker manifests,
 Wrangler configuration and deployment tooling are explicit inputs to production-configuration checks.
 
-The default `test` command runs both suites and stops on a failure. Select one from this directory with
-`pnpm test:migrations` (69 node:test checks under `migrations/`) or `pnpm test:workflows` (Vitest workflow checks).
-Migration tests import the real linter from `worker/scripts/lint-migrations.mjs` and read Worker SQL fixtures;
-the executable linter stays with the Worker and has no package dependencies. The nested migration suite is run
-explicitly by Node and is outside Vitest's root-only `*.test.mjs` discovery, so it runs once.
+The default `test` command runs Vitest workflow checks. Migration tooling and disposable-D1 result tests
+belong to the Worker package (`pnpm --filter cowlic-worker test:migrations`); see
+[the authoring contract](../../../docs/migration-authoring.md). The CI package does not install Drizzle or Wrangler.
 
 The shared workflow sandbox contains tens of thousands of temporary git entries (65,374 in a local #416 run).
 Its `afterAll` awaits asynchronous recursive removal with a finite 30-second limit for that hook. Removal errors
@@ -23,8 +21,8 @@ still fail the suite; successful assertions alone do not make teardown successfu
 
 Worker tests stay in `worker/`: `pnpm install --frozen-lockfile --ignore-scripts`, `pnpm test`, `pnpm exec tsc --noEmit`. Its Vitest projects are only unit and smoke.
 CI preserves the required `tests` job and existing `Test Report (Vitest)` name, adding `Test Report (Workflows)`.
-The runners have separate XML reports and minimum-count/skip guards (Worker 315; workflow 522); migration lint
-retains its own Node JUnit report and minimum of 60 passed checks against 69 real tests.
+The runners have separate XML reports and minimum-count/skip guards (Worker 315; workflow 522); migration rehearsals
+retain their own Node JUnit report and minimum of 12 passed checks.
 Failure, zero collection and `.only` fail Vitest; missing/non-numeric report counts, skips or counts below the floor
 fail the required job. The counts are deliberately pinned, never calculated from the current discovery result.
 

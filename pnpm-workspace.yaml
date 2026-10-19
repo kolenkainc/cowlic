@@ -9,3 +9,13 @@ ignoreScripts: true
 verifyDepsBeforeRun: error
 packageManagerStrictVersion: true
 managePackageManagerVersions: false
+
+# Drizzle Kit's legacy loader otherwise pulls vulnerable esbuild 0.18.
+overrides:
+  '@esbuild-kit/core-utils>esbuild': 0.25.12
+
+# Kit imports ORM at runtime but omits its peer declaration; keep hoist:false.
+packageExtensions:
+  'drizzle-kit@0.31.11':
+    peerDependencies:
+      drizzle-orm: 0.45.4

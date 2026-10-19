@@ -306,7 +306,7 @@ export const SHIP_STEPS = [
   ["Write runner-local wrangler config", "2f23e587a7d074bbf3fee4f0aa8aa0e0c5c5cc24af090314e83548c4155dfde8"],
   ["List pending migrations", "a2531dc9bf5b04c080100785711193fd8c33a9469b48120b870ab781ea3c9e72"],
   ["Read the pending migrations", "210fe617a1f9dcda7b3e087e152d1fd16c1f30fd3bb7d3831543982be3ec8982"],
-  ["Lint the pending migrations", "3c629141bdea33d3759fd7a1436647bc90906f0a88225fd7741f4376c6c988fb"],
+  ["Review the pending migrations", "b8694c78d736a55ff9aa1ed9212f0fa74844a61d9c5773472c20c39d6a955617"],
   ["Time Travel bookmark", "705dfba5ff777db19cf1798a5c9257a6dd9caae201d14632d367a2c9dfb3a1cc"],
   ["Record the bookmark", "54199e630aee536162f19da619eff4b357948dc0d3b6ce03f0c95ecfb1dee2bf"],
   ["Apply migrations", "d23cc28f71264036803f972eeab4ea2a9dc044a6c5d94a59a5c823c49f329833"],

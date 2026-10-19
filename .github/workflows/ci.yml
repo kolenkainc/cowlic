@@ -3,7 +3,7 @@
 # folded worker-deploy.yml in, part 3 added the release stage, #312 merged migrate and deploy into `ship`).
 #
 # Stages (jobs): changes (what changed, with a fail-closed validation of its outputs), lint (typecheck, migrations),
-# tests (migration lint tests and Vitest, with reports), version (GitVersion, read-only), then plan -> ship (the D1
+# tests (D1 migration rehearsals and Vitest, with reports), version (GitVersion, read-only), then plan -> ship (the D1
 # migrations and then the Worker deploy in ONE job, #201, #202, #312), then release (tag and GitHub Release, the only
 # job with contents: write). Check contexts (the job names; the UI shows "<workflow> / <job>"): `changes`, `lint`,
 # `tests`, `version`, `plan`, `ship`, `release`, plus the report check runs "Test Report" and "Test Report (Vitest)".
@@ -256,7 +256,7 @@ jobs:
           BASE_SHA: ${{ needs.changes.outputs.base_sha }}
         run: |
           [ -n "$BASE_SHA" ] || { echo "no base commit"; exit 1; }
-          changed=$(git diff --relative --name-status --diff-filter=MRD "$BASE_SHA"...HEAD -- migrations/)
+          changed=$(git diff --relative --name-status --diff-filter=MRDT "$BASE_SHA"...HEAD -- 'migrations/*.sql')
           if [ -n "$changed" ]; then
             echo "Existing migration files must not be modified, renamed or deleted (add a new migration):"
             echo "$changed"
@@ -264,24 +264,11 @@ jobs:
           fi
           echo "no applied migration changed"
 
-      # Lint the migrations ADDED since the base, passed explicitly. The PR label destructive-migration-approved
-      # (boolean computed here, never spliced into the script) turns destructive findings into notices.
-      # #292: merge_group has no pull_request payload, so APPROVED is false there and a destructive finding fails
-      # the queue run (fail closed, by choice); the PR run already showed the finding and the label.
-      - name: Lint new migrations
-        env:
-          BASE_SHA: ${{ needs.changes.outputs.base_sha }}
-          APPROVED: ${{ contains(github.event.pull_request.labels.*.name, 'destructive-migration-approved') }}
+      # Drizzle generates SQL; Kit checks history and no-op schema agreement.
+      # Migration authorization is enforced independently by plan and ship.
+      - name: Check migration history
         run: |
-          [ -n "$BASE_SHA" ] || { echo "no base commit"; exit 1; }
-          mapfile -d '' -t added < <(git diff --relative --name-only -z --diff-filter=A "$BASE_SHA"...HEAD -- 'migrations/*.sql')
-          if [ "${#added[@]}" -eq 0 ]; then
-            echo "no new migrations to lint"
-            exit 0
-          fi
-          args=()
-          if [ "$APPROVED" = "true" ]; then args+=(--approved); fi
-          node scripts/lint-migrations.mjs "${args[@]}" "${added[@]}"
+          pnpm run migrations:check
 
   # Stage 3: tests. The only job with checks: write (the report action creates its check runs), narrowest scope:
   # this job, no other. No pull-requests: write (PR comments are off). The token goes to no step but the reports.
@@ -318,16 +305,16 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile --ignore-scripts
 
-      # #286 / #289: the linter gates destructive D1 migrations, and its own tests were wired nowhere. Runs exactly
+      # #421: real disposable D1 migration rehearsals replace SQL-parser tests. Runs exactly
       # one file (deliberate: another *.test.mjs is not picked up silently). Two reporters: spec to stdout (the
       # human-readable log) and junit to a file under RUNNER_TEMP (read by the "Test Report" step below, never
       # committed or uploaded). The node exit code is the verdict of THIS step: a failing test fails the job `tests`
       # (and so the required check `tests`) whether or not the report can be published (fork PRs have a read-only token).
-      - name: Migration lint tests
+      - name: Migration rehearsal tests
         id: lint_tests
-        working-directory: .github/workflows/tests
+        working-directory: worker
         run: |
-          node --test --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination="$RUNNER_TEMP/lint-tests.xml" migrations/lint-migrations.test.mjs
+          node --test --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination="$RUNNER_TEMP/lint-tests.xml" test/migrations/migrations.test.mjs
 
       # #289: publishes the JUnit XML as an extra check run "Test Report" (NOT a required check, never read by the
       # deploy gate). Pinned by full SHA (docs/worker-cicd.md section 6 audit). Runs after a failed test step too
@@ -358,7 +345,7 @@ jobs:
       - name: Minimum test count
         if: ${{ steps.lint_tests.outcome == 'success' }}
         env:
-          MIN_TESTS: "60"
+          MIN_TESTS: "12"
           PASSED: ${{ steps.test_report.outputs.passed }}
         run: |
           case "$PASSED" in
@@ -675,12 +662,12 @@ jobs:
       # that did not leaves it in `production`; reading only `production` would not advance BASE after a destructive
       # run and the next run would redo its classification and its approval. Both listings are merged and sorted by
       # creation time (newest first), the first one whose latest status is `success` wins. If one listing cannot be
-      # read it is skipped with a warning: an older BASE only means more work is considered new (re-lint, re-approval),
+      # read it is skipped with a warning: an older BASE only means more work is considered new (review gate, re-approval),
       # never less. Why not github.event.before or the previous master head: a replaced pending run or a failed run
       # would drop its migrations from the next run's range, and a destructive one could then no longer be routed to
       # the approval environment.
       # BASE is advisory: anyone with write access can create deployment records. The authority is the job `ship`
-      # (pending list of the remote DB, re-lint without --approved in `production`, environment approval).
+      # (pending list of the remote DB, review gate without --approved in `production`, environment approval).
       # Fallback when there is no successful deployment yet (the first run) or the API fails: push -> the `before`
       # commit of the event, workflow_dispatch -> the parent of the commit. BASE must exist and be an ancestor of the
       # commit (force pushes are blocked on master), otherwise the job fails closed.
@@ -810,7 +797,7 @@ jobs:
           BASE_SHA: ${{ steps.base.outputs.base }}
           EVENT_SHA: ${{ github.sha }}
         run: |
-          changed=$(git diff --name-status --diff-filter=MRDT "$BASE_SHA" "$EVENT_SHA" -- worker/migrations/)
+          changed=$(git diff --name-status --diff-filter=MRDT "$BASE_SHA" "$EVENT_SHA" -- 'worker/migrations/*.sql')
           if [ -n "$changed" ]; then
             echo "::error::existing migration files must not be modified, renamed or deleted (add a new migration)"
             echo "$changed"
@@ -818,14 +805,10 @@ jobs:
           fi
           echo "no applied migration changed since BASE"
 
-      # Lint exactly the migrations ADDED in BASE..sha, one file per run so that the findings of each can be told
-      # apart. Result per file: exit 0 -> fine (warnings such as ADD COLUMN are fine); exit 1 and exit 0 again with
-      # --approved -> only destructive findings (routed, below); anything else (a missing IF NOT EXISTS, a parse
-      # error, exit 2) -> the run fails. A destructive file needs the label destructive-migration-approved on the
-      # merged PR whose commit ADDED that file (a label on an unrelated PR in the range does not count); the label only
-      # selects the route, the authorisation is the owner's approval of the environment `production-destructive`.
-      # Names are matched against an allowlist before they are used or printed; the label is read from the API
-      # response with jq (never spliced into a script). Any API failure counts as "no label" (fail closed).
+      # No SQL parser or "safe" guess: every new/unknown SQL file needs the
+      # existing PR label and the owner's production-destructive approval.
+      # Only the exact immutable pre-Drizzle baseline is exempt. Invalid input
+      # fails closed, including --approved. API/label failures stop the plan.
       - name: Classify the new migrations
         id: classify
         if: steps.guard.outputs.deploy == 'true'
@@ -844,16 +827,16 @@ jobs:
               exit 1
             fi
             rc=0
-            node worker/scripts/lint-migrations.mjs "$f" || rc=$?
+            node worker/scripts/migration-review.mjs "$f" || rc=$?
             if [ "$rc" -eq 0 ]; then
               continue
             fi
-            if [ "$rc" -eq 1 ] && node worker/scripts/lint-migrations.mjs --approved "$f" > /dev/null; then
+            if [ "$rc" -eq 1 ] && node worker/scripts/migration-review.mjs --approved "$f" > /dev/null; then
               echo "destructive migration: $f (needs the label and the owner's approval)"
               destructive+=("$f")
               continue
             fi
-            echo "::error::migration $f fails the lint with a finding that no approval can waive (exit $rc)"
+            echo "::error::migration $f fails migration review input validation (exit $rc)"
             exit 1
           done
           environment="production"
@@ -888,7 +871,7 @@ jobs:
               for f in "${destructive[@]}"; do echo "  - \`$f\`"; done
             fi
             echo "- \`ship\` runs in the environment \`$environment\`"
-            echo "- The classification is advisory: \`ship\` lists the pending migrations of the remote DB and re-lints them"
+            echo "- The classification is advisory: \`ship\` lists the pending migrations of the remote DB and checks their approval route again"
           } >> "$GITHUB_STEP_SUMMARY"
           echo "ship environment: $environment"
 
@@ -943,8 +926,8 @@ jobs:
   # BASE does not move and the next run compares with the older commit again; recovery is a workflow_dispatch.
   # MIGRATIONS. The job always runs when a deploy is planned, also when `plan` saw no new migration file: the pending
   # list of the remote DB is the authority (a hand-applied migration is not pending, a merged-but-never-applied one
-  # is), and "nothing pending" is a green no-op. Pending files are re-linted explicitly: WITHOUT --approved in
-  # `production` (a destructive file that `plan` did not route fails closed), with --approved only in
+  # is), and "nothing pending" is a green no-op. Pending files are checked explicitly: WITHOUT --approved in
+  # `production` (any new/unknown file that `plan` did not route fails closed), with --approved only in
   # `production-destructive`. A Time Travel bookmark is read BEFORE applying and written to the summary with the
   # restore command; if it cannot be read nothing is applied. wrangler 4.149.0 applies migration after migration (each
   # file plus the insert into d1_migrations as one query) and stops at the first error: the step fails and so does the
@@ -1082,11 +1065,10 @@ jobs:
           }
           EOF
 
-      # Defence in depth and the real gate: the pending files are linted explicitly. `production` runs the lint
-      # WITHOUT --approved, so any destructive statement (or a missing IF NOT EXISTS) fails the job before anything is
-      # applied. Only the environment `production-destructive` (reached after the owner's approval) adds --approved.
-      # Warnings (ADD COLUMN, as in 0003) do not fail the lint and are not destructive.
-      - name: Lint the pending migrations
+      # The actual remote pending list is authoritative. Exact historical files
+      # pass; every new/unknown file needs the protected environment's approval.
+      # This cannot classify unrecognized SQL as safe. Invalid paths always fail.
+      - name: Review the pending migrations
         if: steps.pending.outputs.count != '0'
         env:
           TARGET_ENV: ${{ needs.plan.outputs.environment }}
@@ -1100,8 +1082,8 @@ jobs:
           for n in $PENDING; do
             files+=("migrations/$n")
           done
-          if ! node scripts/lint-migrations.mjs "${args[@]}" "${files[@]}"; then
-            echo "::error::lint of the pending migrations failed: nothing is applied"
+          if ! node scripts/migration-review.mjs "${args[@]}" "${files[@]}"; then
+            echo "::error::review of the pending migrations failed: nothing is applied"
             exit 1
           fi
 

@@ -6,10 +6,16 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "pnpm run test:migrations && pnpm run test:app",
+    "test:app": "vitest run",
+    "test:migrations": "node --test test/migrations/migrations.test.mjs",
+    "migrations:generate": "drizzle-kit generate",
+    "migrations:check": "node scripts/check-migrations.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261006.1",
+    "drizzle-kit": "0.31.11",
+    "drizzle-orm": "0.45.4",
     "typescript": "^7.0.2",
     "vite": "8.3.1",
     "vitest": "5.0.2",

@@ -5,7 +5,7 @@
 // The mutation tests keep the repo's mutation-check practice: each in-memory mutation of the workflow text must be
 // caught by the static or the dynamic checks, so a weakened check turns a test red.
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -240,7 +240,7 @@ describe("ci.yml reports changes, lint and tests on pull_request, push and merge
     // Secrets only in migrate and deploy (review of #306): not at workflow level, not in any other job, in any form.
     ["workflow-level env with a secret", (t) => t.replace("\nconcurrency:\n", "\nenv:\n  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}\n\nconcurrency:\n")],
     ["workflow-level env with toJSON(secrets)", (t) => t.replace("\nconcurrency:\n", "\nenv:\n  ALL: ${{ toJSON(secrets) }}\n\nconcurrency:\n")],
-    ["secrets index form in the tests job", (t) => t.replace("      - name: Migration lint tests\n", "      - name: Migration lint tests\n        env:\n          X: ${{ secrets['WORKER_URL'] }}\n")],
+    ["secrets index form in the tests job", (t) => t.replace("      - name: Migration rehearsal tests\n", "      - name: Migration rehearsal tests\n        env:\n          X: ${{ secrets['WORKER_URL'] }}\n")],
     ["toJSON(secrets) in the lint job", (t) => t.replace("      - name: Typecheck\n", "      - name: Typecheck\n        env:\n          X: ${{ toJSON(secrets) }}\n")],
     ["a secret in the validation step of changes", (t) => t.replace("          OUT_BASE_SHA: ${{ steps.base.outputs.base_sha }}\n", "          OUT_BASE_SHA: ${{ steps.base.outputs.base_sha }}\n          X: ${{ secrets.WORKER_URL }}\n")],
     // The outputs of `changes` and the deploy decision of `plan`.
@@ -267,7 +267,7 @@ describe("ci.yml reports changes, lint and tests on pull_request, push and merge
     ["ship step Time Travel bookmark removed", (t) => dropStep(t, "Time Travel bookmark")],
     ["ship step Verify nothing is pending removed", (t) => dropStep(t, "Verify nothing is pending")],
     ["ship step Health check removed", (t) => dropStep(t, "Health check")],
-    ["ship step Lint the pending migrations removed", (t) => dropStep(t, "Lint the pending migrations")],
+    ["ship step Review the pending migrations removed", (t) => dropStep(t, "Review the pending migrations")],
     ["ship: Deploy moved before List pending migrations (deploy before migrate)", (t) => moveStepBefore(t, "Deploy", "List pending migrations")],
     ["ship: Apply migrations moved after Deploy", (t) => moveStepBefore(t, "Apply migrations", "Read the deployed version id")],
     ["ship: Time Travel bookmark and Record the bookmark swapped", (t) => swapSteps(t, "Time Travel bookmark", "Record the bookmark")],
@@ -289,7 +289,7 @@ describe("ci.yml reports changes, lint and tests on pull_request, push and merge
     ["plan with an environment", (t) => t.replace("  plan:\n    name: plan\n", "  plan:\n    name: plan\n    environment: production\n")],
     ["a cancellable job in the deploy group", (t) => t.replace("  lint:\n    name: lint\n", "  lint:\n    name: lint\n    concurrency:\n      group: worker-deploy\n      cancel-in-progress: true\n")],
     ["secrets used in plan (outside an environment)", (t) => t.replace("      - name: Commit title\n        id: title\n", "      - name: Commit title\n        id: title\n        env:\n          X: ${{ secrets.CLOUDFLARE_API_TOKEN }}\n")],
-    ["secrets used in the tests job", (t) => t.replace("      - name: Migration lint tests\n", "      - name: Migration lint tests\n        env:\n          X: ${{ secrets.WORKER_URL }}\n")],
+    ["secrets used in the tests job", (t) => t.replace("      - name: Migration rehearsal tests\n", "      - name: Migration rehearsal tests\n        env:\n          X: ${{ secrets.WORKER_URL }}\n")],
     ["contents: write on the ship job", (t) => t.replace("    permissions:\n      contents: read\n    defaults:\n      run:\n        shell: bash\n        working-directory: worker\n    steps:\n      # Pins: section 6 audit table (full commit SHAs). Depth 1", "    permissions:\n      contents: write\n    defaults:\n      run:\n        shell: bash\n        working-directory: worker\n    steps:\n      # Pins: section 6 audit table (full commit SHAs). Depth 1")],
     ["ship without its permissions block", (t) => t.replace("    permissions:\n      contents: read\n    defaults:\n      run:\n        shell: bash\n        working-directory: worker\n    steps:\n      # Pins: section 6 audit table (full commit SHAs). Depth 1", "    defaults:\n      run:\n        shell: bash\n        working-directory: worker\n    steps:\n      # Pins: section 6 audit table (full commit SHAs). Depth 1")],
     ["pnpm install with lifecycle scripts in ship", (t) => t.replace(/(  ship:\n[\s\S]*?)install --frozen-lockfile --ignore-scripts/m, "$1install --frozen-lockfile")],
@@ -568,19 +568,18 @@ describe("ci.yml: the validated outputs of the job version", () => {
 // The required tests job must gate each independently installed suite, including
 // numeric report validation: a missing count must never look like zero skips.
 describe("separate suite reporting fails closed", () => {
-  it("migration lint tests run from the CI package and remain part of its default command", () => {
+  it("D1 migration rehearsals belong to Worker and remain in its default command", () => {
     const all = steps(jobBlock(ci, "tests"));
-    const run = all.find((s) => s.name === "Migration lint tests");
-    expect(run.text).toContain("        working-directory: .github/workflows/tests");
+    const run = all.find((s) => s.name === "Migration rehearsal tests");
+    expect(run.text).toContain("        working-directory: worker");
     expect(run.text).not.toMatch(/^ {8}(continue-on-error|if):/m);
     expect(run.run).toContain("node --test");
-    expect(run.run).toContain('"$RUNNER_TEMP/lint-tests.xml" migrations/lint-migrations.test.mjs');
-    const pkg = JSON.parse(readText(join(dirname(ciFile), "tests/package.json")));
-    expect(pkg.scripts["test:migrations"]).toBe("node --test migrations/lint-migrations.test.mjs");
-    expect(pkg.scripts.test).toBe("pnpm run test:migrations && pnpm run test:workflows");
-    expect(pkg.scripts["test:workflows"]).toBe("vitest run");
-    const workflow = all.find((s) => s.name === "Workflow tests");
-    expect(workflow.run).toContain("pnpm test:workflows --reporter=default --reporter=junit");
+    expect(run.run).toContain('"$RUNNER_TEMP/lint-tests.xml" test/migrations/migrations.test.mjs');
+    const pkg = JSON.parse(readText(join(dirname(ciFile), "../../worker/package.json")));
+    expect(pkg.scripts["test:migrations"]).toBe("node --test test/migrations/migrations.test.mjs");
+    expect(pkg.scripts.test).toBe("pnpm run test:migrations && pnpm run test:app");
+    expect(pkg.scripts["test:app"]).toBe("vitest run");
+    expect(steps(jobBlock(ci, "lint")).find((s) => s.name === "Check migration history").run.trim()).toBe("pnpm run migrations:check");
   });
 
   it.each([
@@ -622,5 +621,78 @@ describe("pnpm workspace installation", () => {
     const install = all.find((s) => s.name === "Install dependencies");
     expect(install.text).toContain("install --frozen-lockfile --ignore-scripts");
     expect(install.text).not.toMatch(/^ {8}(env|continue-on-error|if):/m);
+  });
+});
+
+
+describe("new migration authorization uses the actual plan script", () => {
+  it.each([
+    ["no migration", false, false, false, "production"],
+    ["additive SQL with label", true, true, false, "production-destructive"],
+    ["additive SQL without label", true, false, false, null],
+    ["label API unavailable", true, true, true, null],
+  ])("%s", (_name, added, labelled, apiFailure, expected) => {
+    const dir = join(sandbox.tmp, `migration-route-${added}-${labelled}-${apiFailure}`);
+    mkdirSync(join(dir, "worker/scripts"), { recursive: true });
+    mkdirSync(join(dir, "worker/migrations"));
+    mkdirSync(join(dir, "bin"));
+    const root = join(dirname(ciFile), "../..");
+    cpSync(join(root, "worker/scripts/migration-review.mjs"), join(dir, "worker/scripts/migration-review.mjs"));
+    cpSync(join(root, "worker/migration-baseline.json"), join(dir, "worker/migration-baseline.json"));
+    const env = { PATH: `${join(dir, "bin")}:${dirname(process.execPath)}:/usr/bin:/bin`,
+      GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_AUTHOR_NAME: "test", GIT_AUTHOR_EMAIL: "test@example.invalid", GIT_COMMITTER_NAME: "test", GIT_COMMITTER_EMAIL: "test@example.invalid" };
+    const git = (...args) => {
+      const r = spawnSync("git", args, { cwd: dir, env, encoding: "utf8" });
+      expect(r.status, r.stderr).toBe(0);
+      return r.stdout.trim();
+    };
+    git("init", "-q"); git("add", "."); git("commit", "-qm", "baseline");
+    const base = git("rev-parse", "HEAD");
+    if (added) {
+      writeFileSync(join(dir, "worker/migrations/0004_additive.sql"), "ALTER TABLE artists ADD COLUMN note TEXT;");
+      git("add", "."); git("commit", "-qm", "add migration");
+    }
+    const head = git("rev-parse", "HEAD");
+    const pulls = [{ merged_at: "2026-10-19T00:00:00Z", merge_commit_sha: head, labels: labelled ? [{ name: "destructive-migration-approved" }] : [] }];
+    writeFileSync(join(dir, "bin/gh"), apiFailure ? "#!/bin/bash\nexit 1\n" : `#!/bin/bash\nprintf '%s' '${JSON.stringify(pulls)}'\n`);
+    chmodSync(join(dir, "bin/gh"), 0o755);
+    const output = join(dir, "out"); writeFileSync(output, "");
+    const summary = join(dir, "summary"); writeFileSync(summary, "");
+    const step = steps(jobBlock(ci, "plan")).find((s) => s.name === "Classify the new migrations");
+    const result = spawnSync("bash", ["-eo", "pipefail", "-c", step.run], { cwd: dir, env: { ...env, BASE_SHA: base, EVENT_SHA: head, REPO: "test/test", RUNNER_TEMP: dir, GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: summary }, encoding: "utf8" });
+    if (expected === null) {
+      expect(result.status).not.toBe(0);
+      expect(readFileSync(output, "utf8")).not.toContain("environment=");
+    } else {
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      expect(readFileSync(output, "utf8")).toContain(`environment=${expected}`);
+    }
+  });
+});
+
+
+describe("SQL immutability remains independent from mutable Drizzle metadata", () => {
+  it.each(["metadata", "SQL", "SQL type"])("%s", (change) => {
+    const dir = join(sandbox.tmp, `migration-immutable-${change.replaceAll(" ", "-")}`);
+    mkdirSync(join(dir, "worker/migrations/meta"), { recursive: true });
+    const sql = join(dir, "worker/migrations/0003_existing.sql");
+    const meta = join(dir, "worker/migrations/meta/_journal.json");
+    writeFileSync(sql, "SELECT 1;\n"); writeFileSync(meta, "{}\n");
+    const env = { PATH: "/usr/bin:/bin", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_AUTHOR_NAME: "test", GIT_AUTHOR_EMAIL: "test@example.invalid", GIT_COMMITTER_NAME: "test", GIT_COMMITTER_EMAIL: "test@example.invalid" };
+    const git = (...args) => {
+      const r = spawnSync("git", args, { cwd: dir, env, encoding: "utf8" });
+      expect(r.status, r.stderr).toBe(0); return r.stdout.trim();
+    };
+    git("init", "-q"); git("add", "."); git("commit", "-qm", "baseline");
+    const base = git("rev-parse", "HEAD");
+    if (change === "metadata") writeFileSync(meta, '{"entries":[]}\n');
+    else if (change === "SQL") writeFileSync(sql, "SELECT 2;\n");
+    else { unlinkSync(sql); symlinkSync("meta/_journal.json", sql); }
+    git("add", "."); git("commit", "-qm", "change");
+    for (const job of ["lint", "plan"]) {
+      const script = steps(jobBlock(ci, job)).find((s) => s.name === "Migrations are immutable").run;
+      const r = spawnSync("bash", ["-eo", "pipefail", "-c", script], { cwd: job === "lint" ? join(dir, "worker") : dir, env: { ...env, BASE_SHA: base, EVENT_SHA: git("rev-parse", "HEAD") }, encoding: "utf8" });
+      expect(r.status === 0, r.stdout + r.stderr).toBe(change === "metadata");
+    }
   });
 });
