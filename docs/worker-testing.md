@@ -3,6 +3,28 @@
 First [bootstrap pnpm and install the workspace](js-workspace.md). Run from `worker/` with `pnpm test`. For a quick application-only run, use `pnpm exec vitest run --project unit`;
 for the Hono-specific suite, use `pnpm exec vitest run --project unit test/hono.test.ts`.
 
+## Environment types
+
+[`worker/src/env.ts`](../worker/src/env.ts) is the complete contract for Worker bindings and secrets. It provides
+autocomplete and documentation for Hono `c.env`, handler parameters typed as `Env`, `WorkerEntrypoint.env`, and
+`import { env } from "cloudflare:workers"`. Authentication and Telegram helpers derive their narrower types from it.
+
+```ts
+import { env } from 'cloudflare:workers'
+
+// Native Worker code: `env.` completes DB, SUBSONIC_USER, SUBSONIC_PASSWORD, TG_BOT_TOKEN, TG_API_BASE.
+const db = env.DB
+// Hono already uses Bindings: Env in src/index.ts, so `c.env.` has the same completions.
+```
+
+When adding a binding, update this contract and the Wrangler configuration or secret provisioning together.
+Types describe configured values; they neither provision secrets nor validate runtime configuration. `TG_API_BASE`
+remains an optional **test-only** override and must not be configured in production. No secret values belong in types.
+
+Run `pnpm typecheck` from the root. In addition to application code, it compiles `test/env.typecheck.ts`, which checks
+the supported access paths, optional fields, narrow helper contracts and rejection of unknown keys. This compile-only
+fixture is not a Vitest runtime suite.
+
 ## Hono routing and middleware
 
 `createApp()` in `src/index.ts` returns a fresh production Hono application. The default export is an instance of
