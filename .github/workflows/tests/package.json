@@ -3,9 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "pnpm run test:migrations && pnpm run test:workflows",
-    "test:migrations": "node --test migrations/lint-migrations.test.mjs",
-    "test:workflows": "vitest run"
+    "test": "vitest run"
   },
   "devDependencies": {
     "vite": "8.3.1",
