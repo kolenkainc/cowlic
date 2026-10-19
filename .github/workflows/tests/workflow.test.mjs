@@ -5,7 +5,8 @@
 // The mutation tests keep the repo's mutation-check practice: each in-memory mutation of the workflow text must be
 // caught by the static or the dynamic checks, so a weakened check turns a test red.
 import { spawnSync } from "node:child_process";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -44,9 +45,11 @@ beforeAll(() => {
   sandbox = createSandbox();
   runner = createRunner(original, sandbox);
 });
-afterAll(() => {
-  if (sandbox) rmSync(sandbox.tmp, { recursive: true, force: true });
-});
+afterAll(async () => {
+  // Real git fixtures leave tens of thousands of entries. Await removal without blocking the event loop;
+  // give only this cleanup hook the same finite budget as a workflow test on a slow runner.
+  if (sandbox) await rm(sandbox.tmp, { recursive: true, force: true });
+}, 30_000);
 
 describe("ci.yml deploy jobs: parser and static controls", () => {
   it("parser sees the steps (guards against a vacuous run)", () => {
