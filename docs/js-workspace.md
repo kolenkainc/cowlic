@@ -28,6 +28,11 @@ pnpm test
 required `changes`, `lint`, `tests` contexts. From `worker/`, `pnpm exec wrangler ...` uses the installed, locked
 Wrangler; it does not download a missing tool like an npx fallback. Existing production-change rules still apply.
 
+The CI package's default `test` runs its Node migration-linter tests followed by its Vitest workflow tests, stopping
+on failure. For one suite, use `pnpm --filter cowlic-workflow-tests --fail-if-no-match test:migrations` or
+`test:workflows`. CI selects each suite separately to retain its own JUnit report and count guard. The linter itself
+stays in `worker/scripts`; these tests need its source and SQL fixtures, but no Worker dependencies.
+
 For only workflow tooling in a clean checkout:
 
 ```sh
