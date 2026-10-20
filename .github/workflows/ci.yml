@@ -235,16 +235,18 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 22
-          package-manager-cache: false # no cache at all (section 6)
-
       # Frozen workspace install: no lifecycle scripts or secrets.
       - name: Install pnpm
         run: |
           npm install --prefix "$RUNNER_TEMP/cowlic-pnpm" --ignore-scripts --no-audit --no-fund pnpm@10.34.7
           echo "$RUNNER_TEMP/cowlic-pnpm/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+          package-manager-cache: false
 
       - name: Install dependencies
         run: pnpm --filter cowlic-worker --fail-if-no-match install --frozen-lockfile --ignore-scripts
@@ -317,16 +319,18 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 22
-          package-manager-cache: false # no cache at all (section 6)
-
       # Frozen workspace install: native binaries come from locked optional packages; no install scripts.
       - name: Install pnpm
         run: |
           npm install --prefix "$RUNNER_TEMP/cowlic-pnpm" --ignore-scripts --no-audit --no-fund pnpm@10.34.7
           echo "$RUNNER_TEMP/cowlic-pnpm/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+          package-manager-cache: false
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile --ignore-scripts
