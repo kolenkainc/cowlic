@@ -610,6 +610,25 @@ describe("separate suite reporting fails closed", () => {
 // Bootstrap must be pinned and isolated from credentials; install must consume
 // the shared lock without lifecycle scripts. A manager migration cannot relax it.
 describe("pnpm workspace installation", () => {
+  it.each(["lint", "tests"])("%s restores the lockfile-keyed store after pnpm bootstrap and before install", (id) => {
+    const all = steps(jobBlock(ci, id));
+    const bootstrap = all.findIndex((s) => s.name === "Install pnpm");
+    const cache = all.findIndex((s) => /uses: actions\/setup-node@/.test(s.text));
+    const install = all.findIndex((s) => s.name === "Install dependencies");
+    expect(bootstrap).toBeGreaterThanOrEqual(0);
+    expect(cache).toBeGreaterThan(bootstrap);
+    expect(install).toBeGreaterThan(cache);
+    expect(all[cache].text).toMatch(/^          cache: pnpm$/m);
+    expect(all[cache].text).toMatch(/^          cache-dependency-path: pnpm-lock.yaml$/m);
+    expect(all[install].text).not.toMatch(/^ {8}if:/m);
+  });
+  it.each(["plan", "ship"])("%s keeps deployment tooling outside dependency caches", (id) => {
+    const block = jobBlock(ci, id);
+    expect(block).not.toMatch(/uses: actions\/cache|^          cache:/m);
+    const setup = steps(block).filter((s) => /uses: actions\/setup-node@/.test(s.text));
+    expect(setup).toHaveLength(1);
+    expect(setup[0].text).toMatch(/^          package-manager-cache: false/m);
+  });
   it.each(["lint", "tests", "ship"])("%s", (id) => {
     const all = steps(jobBlock(ci, id));
     const bootstrap = all.find((s) => s.name === "Install pnpm");
