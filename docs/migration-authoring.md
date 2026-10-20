@@ -158,3 +158,23 @@ References: [Drizzle generation](https://orm.drizzle.team/docs/drizzle-kit-gener
 [D1 migrations](https://developers.cloudflare.com/d1/reference/migrations/),
 [D1 supported PRAGMAs](https://developers.cloudflare.com/d1/sql-api/sql-statements/),
 [esbuild advisory](https://github.com/evanw/esbuild/security/advisories/GHSA-67mh-4wv8-2f99).
+
+## GitHub Code scanning reports (#423)
+
+CI sets `MIGRATION_LINT_SARIF` on the existing strict `migrations:check` command.
+The wrapper uses the locked library SARIF reporter on the same findings, with
+checkout-relative SQL paths, URI encoding, original lines and suppressions.
+Diagnostics mark the invocation unsuccessful and preserve exit 2; findings still
+exit 1. Earlier history/waiver failures may produce no report, so only an existing
+report is uploaded. No second analysis or `npx latest` is used.
+
+The SHA-pinned official uploader runs even after lint failure, without changing
+the required red verdict. Only `lint` gets owner-requested `security-events: write`;
+no deploy environment/secrets or repository-content write permission is added.
+PR/branch runs publish category `drizzle-migrations`. Merge-queue runs enforce lint
+but skip ephemeral-ref uploads. Fork PRs use ordinary pull_request and its restricted
+token, without pull_request_target or privileged follow-up. Upload errors remain
+failures. Find reports in GitHub **Security → Code scanning**, tool
+`drizzle-migration-lint`. Empty valid reports update prior analysis without fake
+alerts. To generate locally, set `MIGRATION_LINT_SARIF` to an output file when
+running `pnpm migrations:check`.

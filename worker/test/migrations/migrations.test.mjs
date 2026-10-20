@@ -9,7 +9,7 @@ import { join, resolve } from "node:path";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { checkMigrationSet } from "../../scripts/migration-lint.mjs";
+import { checkMigrationSet, migrationSarif } from "../../scripts/migration-lint.mjs";
 import { requiresReview } from "../../scripts/migration-review.mjs";
 
 const run = promisify(execFile);
@@ -226,6 +226,15 @@ test("published SQLite linter rejects a generated column drop at warning severit
   const result = await checkMigrationSet(join(fixture.dir, "migrations"));
   assert.equal(result.code, 1);
   assert.ok(result.result.findings.some((f) => f.rule === "drop-column" && !f.suppressed));
+  const report = join(fixture.dir, "findings.sarif");
+  await assert.rejects(run(process.execPath, [join(worker, "scripts/migration-lint.mjs"), join(fixture.dir, "migrations")], {
+    env: { ...env, MIGRATION_LINT_SARIF: report },
+  }), (error) => error.code === 1);
+  const sarif = JSON.parse(readFileSync(report, "utf8"));
+  assert.equal(sarif.version, "2.1.0");
+  assert.ok(sarif.runs[0].results.some((f) => f.ruleId === "drop-column" && f.level === "warning"));
+  assert.equal(sarif.runs[0].invocations[0].executionSuccessful, true);
+  assert.equal(sarif.runs[0].invocations[0].exitCode, 1);
 });
 test("published SQLite linter rejects the pinned Kit's actual rename artifact", async () => {
   // Frozen interactive Kit0.31.11 rename output; no prompt/automatic rename guess in CI.
@@ -247,6 +256,38 @@ test("missing-snapshot diagnostics fail closed even when upstream CLI would exit
   const result = await checkMigrationSet(join(fixture.dir, "migrations"));
   assert.equal(result.code, 2);
   assert.ok(result.result.diagnostics.some((d) => d.code === "missing-snapshot"));
+  const report = join(fixture.dir, "incomplete.sarif");
+  await assert.rejects(run(process.execPath, [join(worker, "scripts/migration-lint.mjs"), join(fixture.dir, "migrations")], {
+    env: { ...env, MIGRATION_LINT_SARIF: report },
+  }), (error) => error.code === 2);
+  const invocation = JSON.parse(readFileSync(report, "utf8")).runs[0].invocations[0];
+  assert.equal(invocation.executionSuccessful, false);
+  assert.ok(invocation.toolExecutionNotifications.some((n) => n.descriptor.id === "missing-snapshot" && n.level === "error"));
+});
+
+test("SARIF paths target checkout SQL and retain suppression/line information", () => {
+  const finding = {
+    rule: "drop-column", severity: "warn", message: "Column removed", suggestion: "Review rollout",
+    file: "0004 space#name.sql", line: 7, migration: "0004", suppressed: true,
+    docsUrl: "https://example.com/drop-column",
+  };
+  const result = { findings: [finding], diagnostics: [], summary: {} };
+  const sarif = JSON.parse(migrationSarif(result, 0, join(worker, "migrations")));
+  const row = sarif.runs[0].results[0];
+  assert.equal(row.locations[0].physicalLocation.artifactLocation.uri, "worker/migrations/0004%20space%23name.sql");
+  assert.equal(row.locations[0].physicalLocation.region.startLine, 7);
+  assert.deepEqual(row.suppressions, [{ kind: "inSource" }]);
+  assert.equal(result.findings[0].file, finding.file);
+});
+
+test("a clean strict CLI emits empty SARIF without changing its successful verdict", async () => {
+  const report = join(tmp, "clean.sarif");
+  await run(process.execPath, [join(worker, "scripts/migration-lint.mjs")], {
+    env: { ...env, MIGRATION_LINT_SARIF: report },
+  });
+  const sarif = JSON.parse(readFileSync(report, "utf8"));
+  assert.deepEqual(sarif.runs[0].results, []);
+  assert.equal(sarif.runs[0].invocations[0].executionSuccessful, true);
 });
 test("waivers require named rules and a reason, never waive production authorization", async () => {
   const fixture = await lintFixture("lint-waiver", dropImage);

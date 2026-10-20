@@ -1,8 +1,29 @@
 // Delegate SQL/snapshot analysis to the pinned library. This adapter only makes
 // artifact diagnostics and explicit, justified rule waivers fail closed.
-import { computeExitCode, lint, parseDirectives, readMigrationSet } from "drizzle-migration-lint";
-import { resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { computeExitCode, lint, parseDirectives, readMigrationSet, REPORTERS } from "drizzle-migration-lint";
+import { writeFileSync } from "node:fs";
+import { relative, resolve, sep } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+export function migrationSarif(result, code, dir) {
+  const root = fileURLToPath(new URL("../../", import.meta.url));
+  const report = JSON.parse(REPORTERS.sarif({ ...result, findings: result.findings.map((finding) => {
+    // Upstream paths are relative to the migration directory, not the checkout.
+    const path = resolve(dir, finding.file);
+    const fromRoot = relative(root, path);
+    const uri = fromRoot.startsWith(`..${sep}`) || fromRoot === ".."
+      ? pathToFileURL(path).href : fromRoot.split(sep).map(encodeURIComponent).join("/");
+    return { ...finding, file: uri };
+  }) }));
+  report.runs[0].invocations = [{
+    executionSuccessful: code !== 2,
+    exitCode: code,
+    toolExecutionNotifications: result.diagnostics.map((d) => ({
+      descriptor: { id: d.code }, level: "error", message: { text: d.message },
+    })),
+  }];
+  return JSON.stringify(report, null, 2) + "\n";
+}
 
 export async function checkMigrationSet(dir) {
   const set = readMigrationSet(dir, { dialect: "sqlite" });
@@ -29,6 +50,9 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     if (process.argv.length > 3) throw new Error("expected at most one migration directory");
     const dir = process.argv[2] ?? fileURLToPath(new URL("../migrations", import.meta.url));
     const { result, code } = await checkMigrationSet(dir);
+    if (process.env.MIGRATION_LINT_SARIF) {
+      writeFileSync(process.env.MIGRATION_LINT_SARIF, migrationSarif(result, code, dir));
+    }
     console.log("migration-lint: " + JSON.stringify(result));
     process.exitCode = code;
   } catch (error) {

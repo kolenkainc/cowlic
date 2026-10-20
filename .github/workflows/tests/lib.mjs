@@ -76,7 +76,7 @@ export const PERMISSIONS = {
     top: { contents: "read" },
     jobs: {
       changes: null,
-      lint: null,
+      lint: { contents: "read", "security-events": "write" },
       tests: { contents: "read", checks: "write" },
       version: null,
       plan: { contents: "read", "pull-requests": "read", deployments: "read" },
