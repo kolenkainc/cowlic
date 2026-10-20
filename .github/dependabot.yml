@@ -1,0 +1,55 @@
+version: 2
+updates:
+  # One shared lockfile: the root entry includes every pnpm workspace package.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Europe/Belgrade
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      javascript-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    # packageManager and the CI bootstrap must be updated together deliberately.
+    ignore:
+      - dependency-name: pnpm
+
+  - package-ecosystem: pip
+    directory: /ingest
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Europe/Belgrade
+    open-pull-requests-limit: 3
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      python-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # Keep one PR per Action so its SHA, inputs and audit-table row can be reviewed.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Europe/Belgrade
+    open-pull-requests-limit: 3
+    cooldown:
+      default-days: 14
+    commit-message:
+      prefix: ci
