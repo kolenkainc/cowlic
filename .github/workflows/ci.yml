@@ -221,6 +221,10 @@ jobs:
     if: ${{ needs.changes.outputs.worker_changed == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Owner-requested Code scanning reports (#423); no contents/checks write.
+    permissions:
+      contents: read
+      security-events: write
     defaults:
       run:
         shell: bash
@@ -267,8 +271,30 @@ jobs:
       # Drizzle generates SQL; Kit checks history and no-op schema agreement.
       # Migration authorization is enforced independently by plan and ship.
       - name: Check migration history
+        id: migration_check
+        env:
+          MIGRATION_LINT_SARIF: ${{ runner.temp }}/migration-lint.sarif
         run: |
           pnpm run migrations:check
+
+      # Findings keep the job red; earlier failures may produce no report.
+      - name: Locate migration SARIF
+        id: migration_report
+        if: ${{ !cancelled() && (steps.migration_check.outcome == 'success' || steps.migration_check.outcome == 'failure') }}
+        env:
+          MIGRATION_LINT_SARIF: ${{ runner.temp }}/migration-lint.sarif
+        run: |
+          if [ -f "$MIGRATION_LINT_SARIF" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Queue runs enforce lint without publishing ephemeral-ref analyses.
+      - name: Upload migration SARIF
+        if: ${{ !cancelled() && steps.migration_report.outputs.exists == 'true' && github.event_name != 'merge_group' }}
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          sarif_file: ${{ runner.temp }}/migration-lint.sarif
+          category: drizzle-migrations
 
   # Stage 3: tests. The only job with checks: write (the report action creates its check runs), narrowest scope:
   # this job, no other. No pull-requests: write (PR comments are off). The token goes to no step but the reports.

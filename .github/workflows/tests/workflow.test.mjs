@@ -207,7 +207,7 @@ describe("ci.yml reports changes, lint and tests on pull_request, push and merge
     ["lint with an event condition (skipped on merge_group, which counts as passed)", (t) => t.replace("  lint:\n    name: lint\n    needs: changes\n    if: ${{ needs.changes.outputs.worker_changed == 'true' }}\n", "  lint:\n    name: lint\n    needs: changes\n    if: ${{ needs.changes.outputs.worker_changed == 'true' && github.event_name != 'merge_group' }}\n")],
     ["lint with continue-on-error (a red lint stays green)", (t) => t.replace("  lint:\n    name: lint\n", "  lint:\n    name: lint\n    continue-on-error: true\n")],
     ["tests with continue-on-error (a red tests stays green)", (t) => t.replace("  tests:\n    name: tests\n", "  tests:\n    name: tests\n    continue-on-error: true\n")],
-    ["lint with a second if", (t) => t.replace("    if: ${{ needs.changes.outputs.worker_changed == 'true' }}\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n    defaults:", "    if: ${{ needs.changes.outputs.worker_changed == 'true' }}\n    if: ${{ true }}\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n    defaults:")],
+    ["lint with a second if", (t) => t.replace(/^(  lint:\n    name: lint\n    needs: changes\n    if: [^\n]+\n)/m, "$1    if: ${{ true }}\n")],
     ["lint without needs on changes", (t) => t.replace("  lint:\n    name: lint\n    needs: changes\n", "  lint:\n    name: lint\n")],
     ["tests also needs lint (a failed lint would make tests skipped)", (t) => t.replace("  tests:\n    name: tests\n    needs: changes\n", "  tests:\n    name: tests\n    needs: [changes, lint]\n")],
     // The explicit result conditions of plan (#307): each weakening must be caught (statically and by the exhaustive test).
