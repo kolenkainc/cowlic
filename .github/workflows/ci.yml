@@ -353,7 +353,7 @@ jobs:
         id: test_report
         if: ${{ !cancelled() && (steps.lint_tests.outcome == 'success' || steps.lint_tests.outcome == 'failure') }}
         continue-on-error: ${{ github.event.pull_request.head.repo.fork == true }}
-        uses: mikepenz/action-junit-report@a9170d5795813c01ab4901ffb045b52bab4ab09d # v6.5.0
+        uses: mikepenz/action-junit-report@b7b80d7ac5b1da46d6aaff9fb57ad50d8453bcb3 # v6.6.0
         with:
           report_paths: ${{ runner.temp }}/lint-tests.xml
           check_name: Test Report
@@ -407,7 +407,7 @@ jobs:
         id: workflow_report
         if: ${{ !cancelled() && (steps.workflow_tests.outcome == 'success' || steps.workflow_tests.outcome == 'failure') }}
         continue-on-error: ${{ github.event.pull_request.head.repo.fork == true }}
-        uses: mikepenz/action-junit-report@a9170d5795813c01ab4901ffb045b52bab4ab09d # v6.5.0
+        uses: mikepenz/action-junit-report@b7b80d7ac5b1da46d6aaff9fb57ad50d8453bcb3 # v6.6.0
         with:
           report_paths: ${{ runner.temp }}/workflow-tests.xml
           check_name: Test Report (Workflows)
@@ -455,7 +455,7 @@ jobs:
         id: vitest_report
         if: ${{ !cancelled() && (steps.vitest.outcome == 'success' || steps.vitest.outcome == 'failure') }}
         continue-on-error: ${{ github.event.pull_request.head.repo.fork == true }}
-        uses: mikepenz/action-junit-report@a9170d5795813c01ab4901ffb045b52bab4ab09d # v6.5.0
+        uses: mikepenz/action-junit-report@b7b80d7ac5b1da46d6aaff9fb57ad50d8453bcb3 # v6.6.0
         with:
           report_paths: ${{ runner.temp }}/vitest.xml
           check_name: Test Report (Vitest)
