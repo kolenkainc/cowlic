@@ -8,7 +8,7 @@ import { runBlock } from "./lib.mjs";
 
 const GIT_ENV = { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
 const F40 = "f".repeat(40);
-const CHANGE_FILES = { worker: "worker/a.txt", docs: "docs/d.txt", ci: ".github/workflows/ci.yml", deploy: ".github/workflows/worker-deploy.yml", workflowTests: ".github/workflows/tests/probe.mjs", rootPackage: "package.json", rootLock: "pnpm-lock.yaml", rootWorkspace: "pnpm-workspace.yaml", previewTool: "scripts/preview-worker.py", previewTests: "scripts/test-preview-worker.py" };
+const CHANGE_FILES = { worker: "worker/a.txt", docs: "docs/d.txt", ci: ".github/workflows/ci.yml", deploy: ".github/workflows/worker-deploy.yml", workflowTests: "tests/workflows/probe.mjs", rootPackage: "package.json", rootLock: "pnpm-lock.yaml", rootWorkspace: "pnpm-workspace.yaml", previewTool: "scripts/preview-worker.py", previewTests: "scripts/test-preview-worker.py" };
 
 export function createChangesRunner(text, { tmp }) {
   const dir = mkdtempSync(join(tmp, "chg-"));
@@ -126,7 +126,7 @@ export function changesCaseFailures(runner, [name, opts, wantBase, wantChanged])
 export const changesMutations = [
   ["preview tooling excluded from checks", (t) => t.replace(" ':(top)scripts/preview-worker.py' ':(top)scripts/test-preview-worker.py'", "")],
   ["root workspace inputs excluded from checks", (t) => t.replace(" ':(top)package.json' ':(top)pnpm-lock.yaml' ':(top)pnpm-workspace.yaml'", "")],
-  ["the change pathspec excludes the moved workflow tests", (t) => t.replace("':(top).github'", "':(top).github/workflows/ci.yml'")],
+  ["the change pathspec excludes the moved workflow tests", (t) => t.replace(" ':(top)tests/workflows'", "")],
   ["the git diff failed branch writes worker_changed=false", (t) => t.replace('echo "git diff failed: treating worker as changed"\n            echo "worker_changed=true"', 'echo "git diff failed: treating worker as changed"\n            echo "worker_changed=false"')],
   ["the no base branch writes worker_changed=false", (t) => t.replace('echo "no base: treating worker as changed"\n            echo "worker_changed=true"', 'echo "no base: treating worker as changed"\n            echo "worker_changed=false"')],
   ["the merge_group head check is replaced by true", (t) => t.replace('if [ "$head" = "$MG_HEAD_SHA" ]; then', "if true; then")],

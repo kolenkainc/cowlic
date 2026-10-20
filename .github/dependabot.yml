@@ -3,6 +3,8 @@ updates:
   # One shared lockfile: the root entry includes every pnpm workspace package.
   - package-ecosystem: npm
     directory: /
+    # npm metadata belongs outside the protected workflow/config tree.
+    exclude-paths: [".github/**"]
     schedule:
       interval: weekly
       day: monday

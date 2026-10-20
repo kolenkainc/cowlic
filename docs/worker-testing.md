@@ -64,8 +64,8 @@ HEAD/GET streaming. Each test gets a new app with its own request state.
 - The other `unit` files test library logic, authentication matrices, CORS, logs and Telegram using controlled fakes.
 - The `smoke` project runs the real Worker in workerd with a real local D1, migrated/legacy synthetic schemas and a
   local Telegram stub. It checks platform behavior that Node unit tests cannot establish.
-- Workflow tests have their own package under `.github/workflows/tests/`: install from the root with `pnpm install --frozen-lockfile --ignore-scripts`
-  and run `pnpm --filter cowlic-workflow-tests --fail-if-no-match test`. They do not run through Worker configuration; see its [README](../.github/workflows/tests/README.md).
+- Workflow tests have their own package under `tests/workflows/`: install from the root with `pnpm install --frozen-lockfile --ignore-scripts`
+  and run `pnpm --filter cowlic-workflow-tests --fail-if-no-match test`. They do not run through Worker configuration; see its [README](../tests/workflows/README.md).
   This package runs workflow tests only; disposable-D1 migration rehearsals belong to Worker under `worker/test/migrations/`; see [migration authoring](migration-authoring.md).
 
 No test requires production credentials or real library data. Real authenticated client playback is the owner's
