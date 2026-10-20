@@ -13,7 +13,7 @@ Wrangler configuration and deployment tooling are explicit inputs to production-
 
 The default `test` command runs Vitest workflow checks. Migration tooling and disposable-D1 result tests
 belong to the Worker package (`pnpm --filter cowlic-worker test:migrations`); see
-[the authoring contract](../../../docs/migration-authoring.md). The CI package does not install Drizzle or Wrangler.
+[the authoring contract](../../docs/migration-authoring.md). The CI package does not install Drizzle or Wrangler.
 
 The shared workflow sandbox contains tens of thousands of temporary git entries (65,374 in a local #416 run).
 Its `afterAll` awaits asynchronous recursive removal with a finite 30-second limit for that hook. Removal errors
@@ -51,4 +51,4 @@ make a failure disappear: identify the changed invariant first.
 The pnpm migration (#383) shares the root lockfile and retains all 150 pre-migration dependency versions/integrities.
 Package manifests and runners remain independent. Current workflow count is 531: workspace path-filter cases,
 bootstrap guards, preview tooling path filters, the extra ship bootstrap step and migration-suite package wiring
-extend the 503-check baseline above. The package also owns the separate 69-check migration suite. See [workspace setup](../../../docs/js-workspace.md).
+extend the 503-check baseline above. The package also owns the separate 69-check migration suite. See [workspace setup](../../docs/js-workspace.md).

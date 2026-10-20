@@ -13,7 +13,7 @@ CI bootstraps that same version into a fresh runner-temp prefix and adds its bin
 global pnpm cannot determine the build. No new GitHub Action or cache is introduced.
 
 The private root package owns commands and one `pnpm-lock.yaml`. Explicit members are `worker/` and
-`.github/workflows/tests/` (the hidden directory must be named explicitly). Each keeps its own manifest and Vitest
+`tests/workflows/` (the CI-test package stays outside the protected .github tree). Each keeps its own manifest and Vitest
 configuration. The root has no application/tool dependencies; hoisting and automatic peer installation are off.
 Do not add a tool at the root to conceal a missing package dependency.
 

@@ -32,3 +32,15 @@ Settings → Advanced Security. Update logs are under Insights → Dependency gr
 
 References: [configuration options](https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference),
 [supported ecosystems](https://docs.github.com/en/code-security/reference/supply-chain-security/supported-ecosystems-and-repositories).
+
+## CI-test package location
+
+The ordinary npm CI-test package lives at `tests/workflows`, outside `.github`.
+GitHub rejected the first grouped npm PR with HTTP 400 `invalid or unauthorized
+changes` while its manifest was inside `.github/workflows/tests`, matching upstream
+[permission reports](https://github.com/dependabot/dependabot-core/issues/15237).
+The root updater discovered and resolved the entire workspace before that rejection.
+Moving this package preserves package separation and avoids requiring workflow-write
+privileges for an npm dependency PR. The npm updater excludes `.github/**`; actual
+workflow YAML remains managed by the separate `github-actions` entry. CI explicitly
+recognizes `tests/workflows` changes. Dependencies and test cases are retained.
