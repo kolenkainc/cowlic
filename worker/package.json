@@ -14,16 +14,16 @@
     "migrations:lint": "node scripts/migration-lint.mjs"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20261006.1",
+    "@cloudflare/workers-types": "^5.20261026.1",
     "drizzle-kit": "0.31.11",
-    "drizzle-migration-lint": "0.4.0",
+    "drizzle-migration-lint": "0.5.0",
     "typescript": "^7.0.2",
-    "vite": "8.3.1",
-    "vitest": "5.0.2",
-    "wrangler": "^4.0.0"
+    "vite": "8.3.5",
+    "vitest": "5.0.5",
+    "wrangler": "^4.152.0"
   },
   "dependencies": {
     "drizzle-orm": "0.45.4",
-    "hono": "4.13.12"
+    "hono": "4.13.14"
   }
 }
